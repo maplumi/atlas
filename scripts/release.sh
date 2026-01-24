@@ -22,7 +22,7 @@ echo "Installing cargo-release"
 cargo install cargo-release --force
 
 echo "Running cargo release $bump (will create tag and changelog)"
-# --no-publish prevents crates.io publish; --execute makes changes and push
-cargo release $bump --no-publish --yes
+# --no-publish prevents crates.io publish; --execute applies changes; --no-confirm disables prompts
+cargo release --no-publish --execute --no-confirm "$bump"
 
 echo "Release prep complete"
