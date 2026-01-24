@@ -13,6 +13,6 @@ gpu = { path = "../../gpu" }
 layers = { path = "../../layers" }
 compute = { path = "../../compute" }
 
-[bin]
+[[bin]]
 name = "viewer_native"
 path = "src/main.rs"
