@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/foundation",
+    "crates/runtime",
+    "crates/scene",
+    "crates/streaming",
+    "crates/formats",
+    "crates/gpu",
+    "crates/layers",
+    "crates/compute",
+    "crates/apps/viewer_web",
+    "crates/apps/viewer_native",
+    "crates/tools"
+]

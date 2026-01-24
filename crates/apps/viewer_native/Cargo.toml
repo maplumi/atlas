@@ -1,0 +1,18 @@
+[package]
+name = "viewer_native"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+foundation = { path = "../../foundation" }
+runtime = { path = "../../runtime" }
+scene = { path = "../../scene" }
+streaming = { path = "../../streaming" }
+formats = { path = "../../formats" }
+gpu = { path = "../../gpu" }
+layers = { path = "../../layers" }
+compute = { path = "../../compute" }
+
+[bin]
+name = "viewer_native"
+path = "src/main.rs"
