@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Simple pre-commit hook for the atlas workspace.
+# To enable locally run:
+#   git config core.hooksPath .githooks
+# This script runs `cargo fmt` (check) and `cargo clippy` and will abort the commit on failure.
+
+echo "Running pre-commit checks: cargo fmt (check) and cargo clippy"
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "cargo not found in PATH; skipping hook"
+  exit 0
+fi
+
+echo "Checking formatting..."
+if ! cargo fmt --all -- --check; then
+  echo "Formatting check failed. Run 'cargo fmt --workspace' to fix formatting." >&2
+  exit 1
+fi
+
+echo "Running clippy (warnings won't block commit)..."
+cargo clippy --workspace --all-targets || true
+
+echo "Pre-commit checks passed."
+exit 0

@@ -1,8 +1,8 @@
-pub mod layer;
-pub mod raster;
-pub mod vector;
-pub mod terrain;
-pub mod objects;
 pub mod labels;
+pub mod layer;
+pub mod objects;
+pub mod raster;
+pub mod terrain;
+pub mod vector;
 
 pub use layer::*;

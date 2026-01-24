@@ -1,4 +1,4 @@
-pub mod quadtree;
 pub mod bvh;
+pub mod quadtree;
 
 pub use quadtree::*;

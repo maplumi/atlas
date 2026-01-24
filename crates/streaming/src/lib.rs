@@ -1,7 +1,7 @@
 pub mod cache;
-pub mod residency;
-pub mod request;
-pub mod pipeline;
 pub mod io;
+pub mod pipeline;
+pub mod request;
+pub mod residency;
 
 pub use cache::*;

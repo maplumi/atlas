@@ -1,5 +1,5 @@
 pub mod spatial;
-pub mod temporal;
 pub mod statistics;
+pub mod temporal;
 
 pub use spatial::*;

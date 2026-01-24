@@ -45,3 +45,45 @@ spatial and temporal data authoritative, repeatable, and scientifically defensib
 processing, double-precision spatial math, explicit CRS transforms, and reproducible programs
 make Atlas suitable for large-scale analysis, streaming datasets, and programmatic cartography.
 
+Developer setup
+---------------
+
+Follow these steps to get your development environment ready and to use the repo tooling:
+
+- Enable the repo hooks (run once per clone):
+
+```bash
+./scripts/install-hooks.sh
+# Or: git config core.hooksPath .githooks
+```
+
+- Use the helper commands while developing:
+
+```bash
+# Format everything
+cargo fmt --workspace
+
+# Lint (clippy) and treat warnings as errors
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Quick compile check
+cargo check --workspace
+
+# Run tests for the whole workspace
+cargo test --workspace
+```
+
+- Creating a release (semantic versioning required):
+
+	- Tag the commit using a `vMAJOR.MINOR.PATCH` style tag, e.g. `v1.2.3`.
+
+```bash
+# create a semver tag
+git tag v1.2.3
+git push origin v1.2.3
+```
+
+	- Pushing a semver tag will trigger the release workflow which builds release artifacts and
+		creates a GitHub Release with an `atlas-<tag>.tar.gz` asset.
+
+

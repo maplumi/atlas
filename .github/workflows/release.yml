@@ -1,0 +1,136 @@
+name: Release atlas asset
+
+on:
+  push:
+    branches: [ master ]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: 'Which part to bump: major, minor, patch'
+        required: false
+        default: patch
+
+permissions:
+  contents: write
+  packages: write
+  issues: write
+
+jobs:
+  prep-release:
+    name: Prepare release (cargo-release)
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.get_tag.outputs.tag }}
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Run release helper (cargo-release)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: |
+          ./scripts/release.sh "${{ github.event.inputs.bump || 'patch' }}"
+
+      - name: Get created tag
+        id: get_tag
+        run: |
+          tag=$(git describe --tags --abbrev=0)
+          echo "Tag: $tag"
+          echo "::set-output name=tag::$tag"
+
+      - name: Create GitHub release (if not already)
+        id: create_release
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ steps.get_tag.outputs.tag }}
+          release_name: atlas-${{ steps.get_tag.outputs.tag }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-and-upload:
+    name: Build artifacts and upload per-platform
+    needs: prep-release
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [linux]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+
+      - name: Build release artifacts (matrix)
+        run: |
+          set -e
+          mkdir -p artifacts
+          cargo build --release
+          # Copy metadata for each crate
+          mkdir -p artifacts/metadata
+          for d in crates/*; do
+            if [ -d "$d" ]; then
+              name=$(basename "$d")
+              mkdir -p artifacts/metadata/$name
+              if [ -f "$d/README.md" ]; then cp "$d/README.md" artifacts/metadata/$name/README.md; fi
+              if [ -f "$d/LICENSE" ]; then cp "$d/LICENSE" artifacts/metadata/$name/LICENSE; fi
+            fi
+          done
+          # Copy top-level README and LICENSE if present
+          [ -f README.md ] && cp README.md artifacts/metadata/README.md || true
+          [ -f LICENSE ] && cp LICENSE artifacts/metadata/LICENSE || true
+
+          # Package each binary found in target/release
+          tag=${{ needs.prep-release.outputs.tag }}
+          for f in target/release/*; do
+            if [ -x "$f" ] && [ ! -d "$f" ]; then
+              bin=$(basename "$f")
+              mkdir -p artifacts/$bin
+              cp "$f" artifacts/$bin/
+              # include metadata folder
+              cp -r artifacts/metadata artifacts/$bin/ || true
+              tar -C artifacts -czf ${bin}-${tag}-linux.tar.gz $bin
+            fi
+          done
+
+          # Package docs
+          if [ -d docs ]; then
+            tar -czf docs-${tag}.tar.gz docs
+          fi
+
+          # Generate top-level index.json
+          echo '{"artifacts": [' > index.json
+          first=true
+          for a in *.tar.gz; do
+            if [ "$first" = true ]; then first=false; else echo ',' >> index.json; fi
+            echo "{\"name\": \"$a\"}" >> index.json
+          done
+          echo ']}' >> index.json
+
+      - name: Upload artifacts to release
+        env:
+          UPLOAD_URL: ${{ needs.prep-release.outputs.upload_url }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          for f in *.tar.gz index.json; do
+            if [ -f "$f" ]; then
+              echo "Uploading $f"
+              curl -s -X POST -H "Authorization: token ${GITHUB_TOKEN}" -H "Content-Type: application/gzip" --data-binary @"$f" "${UPLOAD_URL}?name=$f"
+            fi
+          done

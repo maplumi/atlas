@@ -1,0 +1,13 @@
+# cargo-release configuration
+tag-name = "v{{version}}"
+push = true
+push-remote = "origin"
+generate-changelog = true
+changelog-file = "CHANGELOG.md"
+allow-branch = ["master"]
+sign-commit = false
+sign-tag = false
+
+[package]
+# Do not publish to crates.io from CI; releases only update tags/changelog
+publish = false

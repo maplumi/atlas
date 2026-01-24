@@ -1,13 +1,13 @@
-pub mod ids;
 pub mod arena;
-pub mod handles;
 pub mod bounds;
-pub mod time;
+pub mod handles;
+pub mod ids;
 pub mod math;
+pub mod time;
 
 // Foundation crate: small, well-tested primitives only.
-pub use ids::*;
 pub use arena::*;
-pub use handles::*;
 pub use bounds::*;
+pub use handles::*;
+pub use ids::*;
 pub use time::*;

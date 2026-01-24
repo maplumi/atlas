@@ -3,5 +3,7 @@
 pub struct Id(u64);
 
 impl Id {
-    pub fn new(n: u64) -> Self { Id(n) }
+    pub fn new(n: u64) -> Self {
+        Id(n)
+    }
 }
