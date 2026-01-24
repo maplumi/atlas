@@ -3,7 +3,7 @@
 pub struct Handle(u32, u32); // (index, generation)
 
 impl Handle {
-    pub fn new(index: u32, gen: u32) -> Self {
-        Handle(index, gen)
+    pub fn new(index: u32, generation: u32) -> Self {
+        Handle(index, generation)
     }
 }

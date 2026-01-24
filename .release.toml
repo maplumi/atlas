@@ -7,6 +7,7 @@ changelog-file = "CHANGELOG.md"
 allow-branch = ["master"]
 sign-commit = false
 sign-tag = false
+shared-version = true
 
 [package]
 # Do not publish to crates.io from CI; releases only update tags/changelog

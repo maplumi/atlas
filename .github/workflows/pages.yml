@@ -16,6 +16,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Sync releases into docs
+        run: |
+          mkdir -p docs
+          cp CHANGELOG.md docs/releases.md
+
       - name: Upload docs folder artifact
         uses: actions/upload-pages-artifact@v1
         with:
