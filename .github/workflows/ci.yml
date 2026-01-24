@@ -16,9 +16,14 @@ jobs:
       - name: Setup Rust toolchain
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.93.0
           profile: minimal
           components: rustfmt, clippy
+
+      - name: Verify Rust toolchain
+        run: |
+          rustc --version
+          rustc --version | grep -q "1.93.0"
 
       - name: Verify formatting
         run: cargo fmt --all -- --check

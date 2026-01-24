@@ -21,8 +21,13 @@ jobs:
       - name: Setup Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.93.0
           components: rustfmt, clippy
+
+      - name: Verify Rust toolchain
+        run: |
+          rustc --version
+          rustc --version | grep -q "1.93.0"
 
       - name: Determine changed crates
         id: changed

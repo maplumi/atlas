@@ -50,6 +50,8 @@ Developer setup
 
 Follow these steps to get your development environment ready and to use the repo tooling:
 
+- Rust is pinned via `rust-toolchain.toml` (currently 1.93.0). Use `rustup show` to confirm you are on the pinned toolchain.
+
 - Enable the repo hooks (run once per clone):
 
 ```bash
@@ -85,5 +87,4 @@ git push origin v1.2.3
 
 	- Pushing a semver tag will trigger the release workflow which builds release artifacts and
 		creates a GitHub Release with an `atlas-<tag>.tar.gz` asset.
-
 

@@ -31,7 +31,12 @@ jobs:
       - name: Setup Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.93.0
+
+      - name: Verify Rust toolchain
+        run: |
+          rustc --version
+          rustc --version | grep -q "1.93.0"
 
       - name: Run release helper (cargo-release)
         env:
@@ -74,7 +79,12 @@ jobs:
       - name: Setup Rust
         uses: actions-rs/toolchain@v1
         with:
-          toolchain: stable
+          toolchain: 1.93.0
+
+      - name: Verify Rust toolchain
+        run: |
+          rustc --version
+          rustc --version | grep -q "1.93.0"
 
       - name: Build release artifacts (matrix)
         run: |
