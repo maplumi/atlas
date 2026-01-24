@@ -19,66 +19,30 @@ jobs:
           fetch-depth: 0
 
       - name: Setup Rust
-        uses: actions-rs/toolchain@v1
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Filter changes
+        id: filter
+        uses: dorny/paths-filter@v3
         with:
-          toolchain: 1.93.0
-          components: rustfmt, clippy
+          filters: |
+            code:
+              - Cargo.toml
+              - Cargo.lock
+              - crates/**
+              - docs/**
+              - README.md
 
-      - name: Verify Rust toolchain
-        run: |
-          rustc --version
-          rustc --version | grep -q "1.93.0"
-
-      - name: Determine changed crates
-        id: changed
-        run: |
-          git fetch origin master:refs/remotes/origin/master || true
-          BASE=origin/master
-          if [ -n "${{ github.event.pull_request.base.sha // }}" ]; then
-            BASE=${{ github.event.pull_request.base.sha }}
-          fi
-          echo "Comparing against $BASE"
-          files=$(git diff --name-only $BASE...HEAD || git diff --name-only $BASE..HEAD || true)
-          echo "Changed files:"$files
-          # If top-level files or workspace Cargo files changed, run full workspace
-          if echo "$files" | grep -E '^Cargo.toml|^Cargo.lock|^crates/[^/]+/Cargo.toml' >/dev/null; then
-            crates=$(echo "$files" | awk -F/ '/^crates\//{print $2}' | sort -u | tr '\n' ' ')
-          else
-            crates=""
-          fi
-          if echo "$files" | grep -E '^docs/|^README.md|^Cargo.toml|^Cargo.lock' >/dev/null; then
-            echo "::set-output name=all::true"
-          else
-            echo "::set-output name=all::false"
-          fi
-          echo "::set-output name=crates::${crates}"
-
-      - name: Show changed crates
-        run: |
-          echo "all=${{ steps.changed.outputs.all }}"
-          echo "crates='${{ steps.changed.outputs.crates }}'"
+      - name: Show change filter
+        run: echo "code=${{ steps.filter.outputs.code }}"
 
       - name: Run workspace checks when necessary
-        if: steps.changed.outputs.all == 'true' || steps.changed.outputs.crates == ''
+        if: steps.filter.outputs.code == 'true'
         run: |
           cargo fmt --all -- --check
           cargo clippy --workspace --all-targets --all-features -- -D warnings
           cargo check --workspace --all-targets
           cargo test --workspace --all-features --no-fail-fast
-
-      - name: Run checks for changed crates only
-        if: steps.changed.outputs.all == 'false' && steps.changed.outputs.crates != ''
-        run: |
-          crates="${{ steps.changed.outputs.crates }}"
-          echo "Crates to test: $crates"
-          for c in $crates; do
-            if [ -f crates/$c/Cargo.toml ]; then
-              echo "Testing crate: $c"
-              cargo fmt -p $c -- --check || (echo "Run 'cargo fmt -p $c' to fix formatting" && exit 1)
-              cargo clippy -p $c --all-targets -- -D warnings
-              cargo check -p $c --all-targets
-              cargo test -p $c --no-fail-fast
-            else
-              echo "Skipping $c (no Cargo.toml found)"
-            fi
-          done

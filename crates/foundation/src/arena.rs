@@ -15,3 +15,9 @@ impl<T> Arena<T> {
         self.items.get(idx)
     }
 }
+
+impl<T> Default for Arena<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}

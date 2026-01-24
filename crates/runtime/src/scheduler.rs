@@ -4,3 +4,9 @@ impl Scheduler {
         Scheduler
     }
 }
+
+impl Default for Scheduler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
