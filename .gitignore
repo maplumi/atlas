@@ -1,0 +1,25 @@
+# Compiled artifacts
+/target/
+
+# wasm-pack / wasm build artifacts
+/pkg/
+*.wasm
+*.wasm.gz
+*.wat
+
+# Node / frontend
+/node_modules/
+/dist/
+
+# Editor directories and system files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Misc
+*.swp
+.env
