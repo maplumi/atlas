@@ -16,6 +16,9 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
 
@@ -29,7 +32,8 @@ jobs:
       - name: Sync releases into docs
         run: |
           mkdir -p docs
-          cp CHANGELOG.md docs/releases.md
+          mkdir -p docs/src
+          cp CHANGELOG.md docs/src/releases.md
 
       - name: Build mdBook
         run: |

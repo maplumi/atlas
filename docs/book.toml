@@ -1,8 +1,11 @@
 [book]
-# Use the existing docs/ folder directly as the mdBook source so we don't have to
-# reshuffle files into docs/src/.
-src = "."
+# Standard mdBook layout.
+src = "src"
 title = "Atlas"
 
 [build]
 build-dir = "book"
+
+[output.html]
+# This repo is deployed as a *project* site: https://<user>.github.io/atlas/
+site-url = "/atlas/"
