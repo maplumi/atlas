@@ -596,7 +596,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         ctx.depth_view = create_depth_view(&ctx.device, &ctx.config);
     }
 
-    pub fn render_mesh(ctx: &WgpuContext, view_proj: [[f32; 4]; 4]) -> Result<(), JsValue> {
+    pub fn render_mesh(
+        ctx: &WgpuContext,
+        view_proj: [[f32; 4]; 4],
+        show_graticule: bool,
+    ) -> Result<(), JsValue> {
         let frame = ctx
             .surface
             .get_current_texture()
@@ -680,6 +684,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             rpass.draw_indexed(0..ctx.index_count, 0, 0..1);
         }
 
+        // Pass 3 (optional): graticule overlay (depthless, alpha blended).
+        if show_graticule {
+            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
+                label: Some("atlas-graticule-pass"),
+                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: ::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            rpass.set_pipeline(&ctx.graticule_pipeline);
+            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            rpass.set_vertex_buffer(0, ctx.graticule_vertex_buffer.slice(..));
+            rpass.draw(0..ctx.graticule_vertex_count, 0..1);
+        }
+
         ctx.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
         Ok(())
@@ -701,7 +730,11 @@ mod imp {
 
     pub fn resize_wgpu(_ctx: &mut WgpuContext, _width: u32, _height: u32) {}
 
-    pub fn render_mesh(_ctx: &WgpuContext, _view_proj: [[f32; 4]; 4]) -> Result<(), JsValue> {
+    pub fn render_mesh(
+        _ctx: &WgpuContext,
+        _view_proj: [[f32; 4]; 4],
+        _show_graticule: bool,
+    ) -> Result<(), JsValue> {
         Err(JsValue::from_str(
             "wgpu rendering is only available on wasm32 targets",
         ))

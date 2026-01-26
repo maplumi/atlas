@@ -33,6 +33,7 @@ pub struct ViewerState {
     pub canvas_width: f64,
     pub canvas_height: f64,
     pub wgpu: Option<WgpuContext>,
+    pub show_graticule: bool,
     pub frame_index: u64,
     pub dt_s: f64,
     pub time_s: f64,
@@ -46,6 +47,7 @@ thread_local! {
         canvas_width: 1280.0,
         canvas_height: 720.0,
         wgpu: None,
+        show_graticule: false,
         frame_index: 0,
         dt_s: 1.0 / 60.0,
         time_s: 0.0,
@@ -171,7 +173,7 @@ fn render_scene() -> Result<(), JsValue> {
         let state = state_ref.borrow();
         if let Some(ctx) = &state.wgpu {
             let view_proj = camera_view_proj(state.camera, state.canvas_width, state.canvas_height);
-            let _ = render_mesh(ctx, view_proj);
+            let _ = render_mesh(ctx, view_proj, state.show_graticule);
         }
     });
     Ok(())
@@ -274,6 +276,15 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
         state.borrow_mut().dataset = dataset.to_string();
     });
     Ok(())
+}
+
+#[wasm_bindgen]
+pub fn set_graticule_enabled(enabled: bool) -> Result<(), JsValue> {
+    STATE.with(|state| {
+        state.borrow_mut().show_graticule = enabled;
+    });
+    // Render immediately so the toggle feels responsive.
+    render_scene()
 }
 
 #[wasm_bindgen]

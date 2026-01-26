@@ -82,6 +82,13 @@
           </select>
         </div>
         <div class="section">
+          <h3>Overlays</h3>
+          <label class="checkbox">
+            <input id="toggle-graticule" type="checkbox" />
+            <span>Show graticule</span>
+          </label>
+        </div>
+        <div class="section">
           <h3>Status</h3>
           <div id="status-text" style="font-size:12px; color:#cbd5e1;">Ready</div>
         </div>
@@ -128,6 +135,7 @@
 
       function wireUi(wasm) {
         const dataset = document.getElementById("dataset");
+        const toggleGraticule = document.getElementById("toggle-graticule");
         const canvas = document.getElementById("atlas-canvas-3d");
 
         canvas.addEventListener("contextmenu", (e) => e.preventDefault());
@@ -203,6 +211,15 @@
           const value = e.target.value;
           wasm.set_dataset(value);
           setStatus(`Dataset: ${value}`);
+        });
+
+        toggleGraticule.addEventListener("change", (e) => {
+          const enabled = !!e.target.checked;
+          try {
+            wasm.set_graticule_enabled(enabled);
+          } catch (err) {
+            console.error("set_graticule_enabled failed", err);
+          }
         });
 
         setStatus("Controls: LMB drag=orbit, RMB/Shift+drag=pan, wheel=zoom, R=reset");

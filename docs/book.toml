@@ -1,0 +1,8 @@
+[book]
+# Use the existing docs/ folder directly as the mdBook source so we don't have to
+# reshuffle files into docs/src/.
+src = "."
+title = "Atlas"
+
+[build]
+build-dir = "book"
