@@ -32,6 +32,25 @@
         flex-direction: column;
         gap: 16px;
       }
+      .tabs {
+        display: flex;
+        gap: 8px;
+      }
+      .tab-btn {
+        flex: 1;
+        padding: 8px 10px;
+        border: 1px solid #1f2a44;
+        background: #111827;
+        color: #e5e7eb;
+        border-radius: 8px;
+        cursor: pointer;
+        font-weight: 600;
+      }
+      .tab-btn.active {
+        background: #2563eb;
+        border-color: #3b82f6;
+      }
+      .tab-page.hidden { display: none; }
       #atlas-canvas-3d {
         width: 100%;
         height: 100%;
@@ -66,28 +85,49 @@
       button.active { background: #2563eb; border-color: #3b82f6; }
       select { width: 100%; padding: 6px; border-radius: 6px; border: 1px solid #1f2a44; background: #0f172a; color: #e5e7eb; }
       .checkbox { display: flex; gap: 8px; align-items: center; }
+      .row { display: flex; align-items: center; gap: 10px; }
+      input[type="range"] { width: 100%; }
+      .value { font-variant-numeric: tabular-nums; color: #cbd5e1; font-size: 12px; }
     </style>
   </head>
   <body>
     <div id="app">
       <div id="side-panel">
-        <div class="section">
-          <h3>Datasets</h3>
-          <label for="dataset">Choose dataset</label>
-          <select id="dataset">
-            <option value="" selected>Loading…</option>
-          </select>
+        <div class="tabs">
+          <button id="tab-general-btn" class="tab-btn active" type="button">General</button>
+          <button id="tab-layers-btn" class="tab-btn" type="button">Layers</button>
         </div>
-        <div class="section">
-          <h3>Overlays</h3>
-          <label class="checkbox">
-            <input id="toggle-graticule" type="checkbox" />
-            <span>Show graticule</span>
-          </label>
+
+        <div id="tab-general" class="tab-page">
+          <div class="section">
+            <h3>Datasets</h3>
+            <label for="dataset">Choose dataset</label>
+            <select id="dataset">
+              <option value="" selected>Loading…</option>
+            </select>
+          </div>
+          <div class="section">
+            <h3>Overlays</h3>
+            <label class="checkbox">
+              <input id="toggle-graticule" type="checkbox" />
+              <span>Show graticule</span>
+            </label>
+          </div>
+          <div class="section">
+            <h3>Status</h3>
+            <div id="status-text" style="font-size:12px; color:#cbd5e1;">Ready</div>
+          </div>
         </div>
-        <div class="section">
-          <h3>Status</h3>
-          <div id="status-text" style="font-size:12px; color:#cbd5e1;">Ready</div>
+
+        <div id="tab-layers" class="tab-page hidden">
+          <div class="section">
+            <h3>Points</h3>
+            <label for="city-size">City marker size</label>
+            <div class="row">
+              <input id="city-size" type="range" min="0.005" max="0.08" step="0.001" value="0.02" />
+              <span id="city-size-value" class="value">0.020</span>
+            </div>
+          </div>
         </div>
       </div>
       <canvas id="atlas-canvas-3d" width="1280" height="720"></canvas>
@@ -182,9 +222,27 @@
       }
 
       function wireUi(wasm) {
+        const tabGeneralBtn = document.getElementById("tab-general-btn");
+        const tabLayersBtn = document.getElementById("tab-layers-btn");
+        const tabGeneral = document.getElementById("tab-general");
+        const tabLayers = document.getElementById("tab-layers");
+
         const dataset = document.getElementById("dataset");
         const toggleGraticule = document.getElementById("toggle-graticule");
+        const citySize = document.getElementById("city-size");
+        const citySizeValue = document.getElementById("city-size-value");
         const canvas = document.getElementById("atlas-canvas-3d");
+
+        function setTab(which) {
+          const general = which === "general";
+          tabGeneralBtn.classList.toggle("active", general);
+          tabLayersBtn.classList.toggle("active", !general);
+          tabGeneral.classList.toggle("hidden", !general);
+          tabLayers.classList.toggle("hidden", general);
+        }
+
+        tabGeneralBtn.addEventListener("click", () => setTab("general"));
+        tabLayersBtn.addEventListener("click", () => setTab("layers"));
 
         canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -270,6 +328,20 @@
             console.error("set_graticule_enabled failed", err);
           }
         });
+
+        function applyCitySize() {
+          const v = Number(citySize.value);
+          citySizeValue.textContent = v.toFixed(3);
+          try {
+            wasm.set_city_marker_size(v);
+          } catch (err) {
+            console.error("set_city_marker_size failed", err);
+          }
+        }
+
+        citySize.addEventListener("input", applyCitySize);
+        // Apply once at startup to sync wasm state.
+        applyCitySize();
 
         setStatus("Controls: LMB drag=orbit, RMB/Shift+drag=pan, wheel=zoom, R=reset");
       }

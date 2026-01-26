@@ -17,6 +17,7 @@ mod imp {
         pub stars_count: u32,
         pub pipeline: ::wgpu::RenderPipeline,
         pub graticule_pipeline: ::wgpu::RenderPipeline,
+        pub cities_pipeline: ::wgpu::RenderPipeline,
         pub uniform_buffer: ::wgpu::Buffer,
         pub uniform_bind_group: ::wgpu::BindGroup,
         pub depth_view: ::wgpu::TextureView,
@@ -25,6 +26,8 @@ mod imp {
         pub index_count: u32,
         pub graticule_vertex_buffer: ::wgpu::Buffer,
         pub graticule_vertex_count: u32,
+        pub cities_vertex_buffer: ::wgpu::Buffer,
+        pub cities_vertex_count: u32,
     }
 
     const GLOBE_SHADER: &str = r#"
@@ -129,6 +132,32 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+    const CITIES_SHADER: &str = r#"
+struct Globals {
+    view_proj: mat4x4<f32>,
+    light_dir: vec3<f32>,
+    _pad: f32,
+};
+
+@group(0) @binding(0)
+var<storage, read> globals: Globals;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+};
+
+@vertex
+fn vs_main(@location(0) position: vec3<f32>) -> VsOut {
+    return VsOut(globals.view_proj * vec4<f32>(position, 1.0));
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    // Bright city markers.
+    return vec4<f32>(1.0, 0.25, 0.25, 0.95);
+}
+"#;
+
     #[repr(C)]
     #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
     struct Vertex {
@@ -140,6 +169,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
     struct LineVertex {
         position: [f32; 3],
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct CityVertex {
+        pub position: [f32; 3],
+        pub _pad: f32,
     }
 
     #[repr(C)]
@@ -357,6 +393,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(STARS_SHADER)),
         });
 
+        let cities_shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
+            label: Some("atlas-cities-shader"),
+            source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(CITIES_SHADER)),
+        });
+
         let uniform_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
             label: Some("atlas-globals"),
             size: std::mem::size_of::<Globals>() as u64,
@@ -538,6 +579,54 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             cache: None,
         });
 
+        let cities_pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+            label: Some("atlas-cities-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: ::wgpu::VertexState {
+                module: &cities_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[::wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<CityVertex>() as ::wgpu::BufferAddress,
+                    step_mode: ::wgpu::VertexStepMode::Vertex,
+                    attributes: &[::wgpu::VertexAttribute {
+                        format: ::wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    }],
+                }],
+            },
+            fragment: Some(::wgpu::FragmentState {
+                module: &cities_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(::wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: ::wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: ::wgpu::PrimitiveState {
+                topology: ::wgpu::PrimitiveTopology::PointList,
+                strip_index_format: None,
+                front_face: ::wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: ::wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(::wgpu::DepthStencilState {
+                format: ::wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: false,
+                depth_compare: ::wgpu::CompareFunction::LessEqual,
+                stencil: ::wgpu::StencilState::default(),
+                bias: ::wgpu::DepthBiasState::default(),
+            }),
+            multisample: ::wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         let (vertices, indices) = generate_sphere_mesh(64, 128);
         let vertex_buffer = device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
             label: Some("atlas-globe-vertices"),
@@ -559,6 +648,15 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 usage: ::wgpu::BufferUsages::VERTEX,
             });
 
+        let cities_vertex_buffer = device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
+            label: Some("atlas-cities-vertices"),
+            contents: bytemuck::bytes_of(&CityVertex {
+                position: [0.0, 0.0, 0.0],
+                _pad: 0.0,
+            }),
+            usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+        });
+
         // Initialize uniforms so the first render doesn't read uninitialized memory.
         let globals = Globals {
             view_proj: [[0.0; 4]; 4],
@@ -578,6 +676,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             stars_count: 1200,
             pipeline,
             graticule_pipeline,
+            cities_pipeline,
             uniform_buffer,
             uniform_bind_group,
             depth_view,
@@ -586,7 +685,25 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             index_count: indices.len() as u32,
             graticule_vertex_buffer,
             graticule_vertex_count: graticule_vertices.len() as u32,
+            cities_vertex_buffer,
+            cities_vertex_count: 0,
         })
+    }
+
+    pub fn set_cities_points(ctx: &mut WgpuContext, points: &[CityVertex]) {
+        if points.is_empty() {
+            ctx.cities_vertex_count = 0;
+            return;
+        }
+
+        ctx.cities_vertex_buffer =
+            ctx.device
+                .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
+                    label: Some("atlas-cities-vertices"),
+                    contents: bytemuck::cast_slice(points),
+                    usage: ::wgpu::BufferUsages::VERTEX,
+                });
+        ctx.cities_vertex_count = points.len() as u32;
     }
 
     pub fn resize_wgpu(ctx: &mut WgpuContext, width: u32, height: u32) {
@@ -600,6 +717,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         ctx: &WgpuContext,
         view_proj: [[f32; 4]; 4],
         show_graticule: bool,
+        show_cities: bool,
     ) -> Result<(), JsValue> {
         let frame = ctx
             .surface
@@ -709,6 +827,38 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             rpass.draw(0..ctx.graticule_vertex_count, 0..1);
         }
 
+        // Pass 4 (optional): city markers (depth-tested points).
+        if show_cities && ctx.cities_vertex_count > 0 {
+            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
+                label: Some("atlas-cities-pass"),
+                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: ::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(::wgpu::RenderPassDepthStencilAttachment {
+                    view: &ctx.depth_view,
+                    depth_ops: Some(::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            rpass.set_pipeline(&ctx.cities_pipeline);
+            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            rpass.set_vertex_buffer(0, ctx.cities_vertex_buffer.slice(..));
+            rpass.draw(0..ctx.cities_vertex_count, 0..1);
+        }
+
         ctx.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
         Ok(())
@@ -730,10 +880,20 @@ mod imp {
 
     pub fn resize_wgpu(_ctx: &mut WgpuContext, _width: u32, _height: u32) {}
 
+    #[derive(Debug, Copy, Clone)]
+    #[allow(dead_code)]
+    pub struct CityVertex {
+        pub position: [f32; 3],
+        pub _pad: f32,
+    }
+
+    pub fn set_cities_points(_ctx: &mut WgpuContext, _points: &[CityVertex]) {}
+
     pub fn render_mesh(
         _ctx: &WgpuContext,
         _view_proj: [[f32; 4]; 4],
         _show_graticule: bool,
+        _show_cities: bool,
     ) -> Result<(), JsValue> {
         Err(JsValue::from_str(
             "wgpu rendering is only available on wasm32 targets",
@@ -741,4 +901,6 @@ mod imp {
     }
 }
 
-pub use imp::{WgpuContext, init_wgpu_from_canvas_id, render_mesh, resize_wgpu};
+pub use imp::{
+    CityVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh, resize_wgpu, set_cities_points,
+};

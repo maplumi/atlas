@@ -6,7 +6,26 @@ use wasm_bindgen_futures::spawn_local;
 
 use formats::SceneManifest;
 mod wgpu;
-use wgpu::{WgpuContext, init_wgpu_from_canvas_id, render_mesh, resize_wgpu};
+use wgpu::{
+    CityVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh, resize_wgpu, set_cities_points,
+};
+
+#[derive(Debug, serde::Deserialize)]
+struct GeoJsonFeatureCollection {
+    features: Vec<GeoJsonFeature>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GeoJsonFeature {
+    geometry: GeoJsonGeometry,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GeoJsonGeometry {
+    #[serde(rename = "type")]
+    _ty: String,
+    coordinates: [f64; 2],
+}
 
 #[derive(Debug, Copy, Clone)]
 pub struct CameraState {
@@ -34,6 +53,9 @@ pub struct ViewerState {
     pub canvas_height: f64,
     pub wgpu: Option<WgpuContext>,
     pub show_graticule: bool,
+    pub city_marker_size: f32,
+    pub cities_centers: Option<Vec<[f32; 3]>>,
+    pub pending_cities: Option<Vec<CityVertex>>,
     pub frame_index: u64,
     pub dt_s: f64,
     pub time_s: f64,
@@ -48,12 +70,85 @@ thread_local! {
         canvas_height: 720.0,
         wgpu: None,
         show_graticule: false,
+        city_marker_size: 0.02,
+        cities_centers: None,
+        pending_cities: None,
         frame_index: 0,
         dt_s: 1.0 / 60.0,
         time_s: 0.0,
         time_end_s: 10.0,
         camera: CameraState::default(),
     });
+}
+
+fn build_city_vertices(centers: &[[f32; 3]], size: f32) -> Vec<CityVertex> {
+    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+
+    fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+
+    fn norm(a: [f32; 3]) -> f32 {
+        dot(a, a).sqrt()
+    }
+
+    fn normalize(a: [f32; 3]) -> [f32; 3] {
+        let n = norm(a);
+        if n <= 0.0 {
+            [0.0, 0.0, 0.0]
+        } else {
+            [a[0] / n, a[1] / n, a[2] / n]
+        }
+    }
+
+    fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+    }
+
+    fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
+        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+    }
+
+    fn mul(a: [f32; 3], s: f32) -> [f32; 3] {
+        [a[0] * s, a[1] * s, a[2] * s]
+    }
+
+    // Two triangles (6 vertices) per city.
+    let mut out = Vec::with_capacity(centers.len() * 6);
+    for &p in centers {
+        let n = normalize(p);
+        let up = if n[1].abs() > 0.95 {
+            [1.0, 0.0, 0.0]
+        } else {
+            [0.0, 1.0, 0.0]
+        };
+        let tangent = normalize(cross(up, n));
+        let bitangent = normalize(cross(n, tangent));
+
+        let t = mul(tangent, size);
+        let b = mul(bitangent, size);
+
+        // True quad corners in the tangent plane.
+        let p0 = add(add(p, t), b);
+        let p1 = add(sub(p, t), b);
+        let p2 = sub(sub(p, t), b);
+        let p3 = sub(add(p, t), b);
+
+        // Two triangles: p0-p1-p2 and p0-p2-p3
+        for v in [p0, p1, p2, p0, p2, p3] {
+            out.push(CityVertex {
+                position: v,
+                _pad: 0.0,
+            });
+        }
+    }
+    out
 }
 
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
@@ -173,7 +268,8 @@ fn render_scene() -> Result<(), JsValue> {
         let state = state_ref.borrow();
         if let Some(ctx) = &state.wgpu {
             let view_proj = camera_view_proj(state.camera, state.canvas_width, state.canvas_height);
-            let _ = render_mesh(ctx, view_proj, state.show_graticule);
+            let show_cities = state.dataset == "cities";
+            let _ = render_mesh(ctx, view_proj, state.show_graticule, show_cities);
         }
     });
     Ok(())
@@ -272,10 +368,75 @@ pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
+    let dataset = dataset.to_string();
+    let should_load_cities = dataset == "cities";
+
     STATE.with(|state| {
-        state.borrow_mut().dataset = dataset.to_string();
+        state.borrow_mut().dataset = dataset;
     });
+
+    if should_load_cities {
+        spawn_local(async move {
+            let centers = match fetch_cities_centers().await {
+                Ok(c) => c,
+                Err(err) => {
+                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                        "Failed to fetch cities: {:?}",
+                        err
+                    )));
+                    return;
+                }
+            };
+
+            let points = STATE.with(|state| {
+                let mut s = state.borrow_mut();
+                s.cities_centers = Some(centers);
+                build_city_vertices(
+                    s.cities_centers.as_deref().unwrap_or_default(),
+                    s.city_marker_size,
+                )
+            });
+
+            STATE.with(|state| {
+                let mut s = state.borrow_mut();
+                if let Some(ctx) = &mut s.wgpu {
+                    set_cities_points(ctx, &points);
+                    s.pending_cities = None;
+                } else {
+                    s.pending_cities = Some(points);
+                }
+            });
+
+            let _ = render_scene();
+        });
+    }
+
+    // Render immediately so selection changes are responsive.
+    render_scene()?;
     Ok(())
+}
+
+#[wasm_bindgen]
+pub fn set_city_marker_size(size: f64) -> Result<(), JsValue> {
+    // Size is in world-space units on the unit sphere.
+    let size = (size as f32).clamp(0.001, 0.25);
+
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.city_marker_size = size;
+
+        if let Some(centers) = s.cities_centers.as_deref() {
+            let verts = build_city_vertices(centers, s.city_marker_size);
+            if let Some(ctx) = &mut s.wgpu {
+                set_cities_points(ctx, &verts);
+                s.pending_cities = None;
+            } else {
+                s.pending_cities = Some(verts);
+            }
+        }
+    });
+
+    render_scene()
 }
 
 #[wasm_bindgen]
@@ -347,7 +508,14 @@ async fn init_wgpu_inner() -> Result<(), JsValue> {
 
     STATE.with(|state| {
         let mut s = state.borrow_mut();
+        let pending = s.pending_cities.take();
         s.wgpu = Some(ctx);
+
+        if let Some(points) = pending
+            && let Some(ctx) = &mut s.wgpu
+        {
+            set_cities_points(ctx, &points);
+        }
     });
 
     render_scene()
@@ -363,4 +531,43 @@ async fn fetch_manifest(url: &str) -> Result<SceneManifest, JsValue> {
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     serde_json::from_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+async fn fetch_cities_centers() -> Result<Vec<[f32; 3]>, JsValue> {
+    // Use a relative URL so it works under Trunk dev server and GitHub Pages.
+    let resp = Request::get("assets/chunks/cities.json")
+        .send()
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let fc: GeoJsonFeatureCollection =
+        serde_json::from_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let mut out = Vec::with_capacity(fc.features.len());
+    for f in fc.features {
+        let [lon_deg, lat_deg] = f.geometry.coordinates;
+        let lon = (lon_deg as f32).to_radians();
+        let lat = (lat_deg as f32).to_radians();
+
+        // Match the globe's coordinate convention.
+        let cos_lat = lat.cos();
+        let sin_lat = lat.sin();
+        let cos_lon = lon.cos();
+        let sin_lon = lon.sin();
+        let mut p = [cos_lat * cos_lon, sin_lat, cos_lat * sin_lon];
+
+        // Lift slightly off the surface to reduce z-fighting.
+        let k = 1.01;
+        p[0] *= k;
+        p[1] *= k;
+        p[2] *= k;
+
+        out.push(p);
+    }
+
+    Ok(out)
 }
