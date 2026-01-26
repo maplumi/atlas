@@ -1,0 +1,89 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Atlas Docs</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #020617;
+        --panel: #0b132b;
+        --border: #1f2a44;
+        --text: #e2e8f0;
+        --muted: #94a3b8;
+        --link: #93c5fd;
+      }
+      html, body {
+        height: 100%;
+        margin: 0;
+        background: var(--bg);
+        color: var(--text);
+        font-family: system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Noto Sans,
+          "Helvetica Neue", Arial, "Apple Color Emoji", "Segoe UI Emoji";
+      }
+      .wrap {
+        max-width: 980px;
+        margin: 0 auto;
+        padding: 48px 20px;
+      }
+      .card {
+        background: linear-gradient(180deg, rgba(15, 23, 42, 0.95), rgba(11, 19, 43, 0.95));
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 18px 18px;
+      }
+      h1 {
+        margin: 0 0 8px 0;
+        font-size: 26px;
+        letter-spacing: 0.2px;
+      }
+      p {
+        margin: 0 0 14px 0;
+        color: var(--muted);
+        line-height: 1.45;
+      }
+      ul {
+        margin: 0;
+        padding-left: 18px;
+      }
+      li {
+        margin: 10px 0;
+      }
+      a {
+        color: var(--link);
+        text-decoration: none;
+      }
+      a:hover { text-decoration: underline; }
+      .note {
+        margin-top: 14px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      code {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono",
+          "Courier New", monospace;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="wrap">
+      <div class="card">
+        <h1>Atlas Docs</h1>
+        <p>
+          This is the documentation landing page deployed via GitHub Pages.
+          The docs in this repo are currently maintained as Markdown files.
+        </p>
+        <ul>
+          <li><a href="index.md">Docs index (Markdown)</a></li>
+          <li><a href="mvp-plan.md">MVP plan</a></li>
+          <li><a href="releases.md">Release notes (synced from CHANGELOG)</a></li>
+        </ul>
+        <p class="note">
+          If you want a fully rendered HTML docs site, we can switch the workflow to build an
+          <code>mdbook</code> and deploy its <code>book/</code> output.
+        </p>
+      </div>
+    </div>
+  </body>
+</html>

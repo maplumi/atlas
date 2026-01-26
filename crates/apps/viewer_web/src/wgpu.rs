@@ -13,6 +13,8 @@ mod imp {
         pub queue: ::wgpu::Queue,
         pub config: ::wgpu::SurfaceConfiguration,
         pub _canvas: web_sys::HtmlCanvasElement,
+        pub stars_pipeline: ::wgpu::RenderPipeline,
+        pub stars_count: u32,
         pub pipeline: ::wgpu::RenderPipeline,
         pub graticule_pipeline: ::wgpu::RenderPipeline,
         pub uniform_buffer: ::wgpu::Buffer,
@@ -80,6 +82,50 @@ fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
 fn fs_main() -> @location(0) vec4<f32> {
     // Light blue overlay lines.
     return vec4<f32>(0.65, 0.85, 1.0, 1.0);
+}
+"#;
+
+    const STARS_SHADER: &str = r#"
+fn hash_u32(x_in: u32) -> u32 {
+    // 32-bit integer mix (non-linear) to avoid visible correlation patterns.
+    var x = x_in;
+    x ^= x >> 16u;
+    x *= 0x7feb352du;
+    x ^= x >> 15u;
+    x *= 0x846ca68bu;
+    x ^= x >> 16u;
+    return x;
+}
+
+fn hash01(x: u32) -> f32 {
+    return f32(hash_u32(x)) / 4294967295.0;
+}
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) a: f32,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
+    // Deterministic pseudo-random star positions in clip space.
+    // Use different salts per component to avoid structure.
+    let rx = hash01(vid ^ 0x68bc21ebu);
+    let ry = hash01(vid ^ 0x02e5be93u);
+    let rb = hash01(vid ^ 0x9e3779b9u);
+
+    let x = rx * 2.0 - 1.0;
+    let y = ry * 2.0 - 1.0;
+    // Slightly vary brightness; keep faint stars common.
+    // Keep overall brightness conservative to avoid a "snow" look.
+    let a = 0.03 + 0.22 * rb * rb;
+
+    return VsOut(vec4<f32>(x, y, 0.9999, 1.0), a);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return vec4<f32>(1.0, 1.0, 1.0, in.a);
 }
 "#;
 
@@ -306,6 +352,11 @@ fn fs_main() -> @location(0) vec4<f32> {
             source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(GRATICULE_SHADER)),
         });
 
+        let stars_shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
+            label: Some("atlas-stars-shader"),
+            source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(STARS_SHADER)),
+        });
+
         let uniform_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
             label: Some("atlas-globals"),
             size: std::mem::size_of::<Globals>() as u64,
@@ -341,6 +392,48 @@ fn fs_main() -> @location(0) vec4<f32> {
             label: Some("atlas-globe-pipeline-layout"),
             bind_group_layouts: &[&uniform_bind_group_layout],
             immediate_size: 0,
+        });
+
+        let stars_pipeline_layout =
+            device.create_pipeline_layout(&::wgpu::PipelineLayoutDescriptor {
+                label: Some("atlas-stars-pipeline-layout"),
+                bind_group_layouts: &[],
+                immediate_size: 0,
+            });
+
+        // Starfield background: generated procedurally via vertex_index.
+        let stars_pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+            label: Some("atlas-stars-pipeline"),
+            layout: Some(&stars_pipeline_layout),
+            vertex: ::wgpu::VertexState {
+                module: &stars_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(::wgpu::FragmentState {
+                module: &stars_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(::wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: ::wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: ::wgpu::PrimitiveState {
+                topology: ::wgpu::PrimitiveTopology::PointList,
+                strip_index_format: None,
+                front_face: ::wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: ::wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: ::wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
         });
 
         let pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
@@ -481,6 +574,8 @@ fn fs_main() -> @location(0) vec4<f32> {
             queue,
             config,
             _canvas: canvas_elem,
+            stars_pipeline,
+            stars_count: 1200,
             pipeline,
             graticule_pipeline,
             uniform_buffer,
@@ -524,20 +619,44 @@ fn fs_main() -> @location(0) vec4<f32> {
                 label: Some("atlas-mesh-encoder"),
             });
 
+        // Pass 1: clear to deep space and draw stars (no depth attachment).
         {
             let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
-                label: Some("atlas-mesh-pass"),
+                label: Some("atlas-stars-pass"),
                 color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: ::wgpu::Operations {
                         load: ::wgpu::LoadOp::Clear(::wgpu::Color {
-                            r: 0.02,
-                            g: 0.12,
-                            b: 0.23,
+                            r: 0.004,
+                            g: 0.008,
+                            b: 0.016,
                             a: 1.0,
                         }),
+                        store: ::wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            rpass.set_pipeline(&ctx.stars_pipeline);
+            rpass.draw(0..ctx.stars_count, 0..1);
+        }
+
+        // Pass 2: draw globe with depth, preserving the starfield color.
+        {
+            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
+                label: Some("atlas-globe-pass"),
+                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: ::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
                         store: ::wgpu::StoreOp::Store,
                     },
                 })],

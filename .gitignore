@@ -11,6 +11,10 @@
 /node_modules/
 /dist/
 
+# Trunk output (viewer_web)
+/crates/apps/viewer_web/dist/
+/crates/apps/viewer_web/.trunk/
+
 # Editor directories and system files
 .vscode/
 .idea/
