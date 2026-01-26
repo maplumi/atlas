@@ -1,0 +1,10 @@
+{
+  "version": "1.0",
+  "package_id": "atlas-demo-world",
+  "name": "Atlas Demo World",
+  "chunks": [
+    { "id": "cities", "kind": "points", "path": "chunks/cities.json" },
+    { "id": "air_corridors", "kind": "lines", "path": "chunks/air_corridors.json" },
+    { "id": "regions", "kind": "areas", "path": "chunks/regions.json" }
+  ]
+}

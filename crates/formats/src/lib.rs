@@ -5,4 +5,5 @@ pub mod scene_package;
 pub mod terrain_chunk;
 pub mod vector_chunk;
 
+pub use manifest::*;
 pub use scene_package::*;

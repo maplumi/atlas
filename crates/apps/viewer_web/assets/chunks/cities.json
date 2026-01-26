@@ -1,0 +1,11 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    { "type": "Feature", "properties": { "name": "New York" }, "geometry": { "type": "Point", "coordinates": [-74.0060, 40.7128] } },
+    { "type": "Feature", "properties": { "name": "London" }, "geometry": { "type": "Point", "coordinates": [-0.1276, 51.5074] } },
+    { "type": "Feature", "properties": { "name": "Tokyo" }, "geometry": { "type": "Point", "coordinates": [139.6503, 35.6762] } },
+    { "type": "Feature", "properties": { "name": "Nairobi" }, "geometry": { "type": "Point", "coordinates": [36.8219, -1.2921] } },
+    { "type": "Feature", "properties": { "name": "Sydney" }, "geometry": { "type": "Point", "coordinates": [151.2093, -33.8688] } },
+    { "type": "Feature", "properties": { "name": "São Paulo" }, "geometry": { "type": "Point", "coordinates": [-46.6333, -23.5505] } }
+  ]
+}

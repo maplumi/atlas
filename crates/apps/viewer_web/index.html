@@ -1,0 +1,230 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Atlas Viewer (Web)</title>
+    <link data-trunk rel="rust" data-wasm-opt="z" />
+    <link data-trunk rel="copy-dir" href="assets" />
+    <style>
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        background: #020617;
+        color: #e2e8f0;
+        font-family: "Inter", "JetBrains Mono", system-ui, sans-serif;
+      }
+      #app {
+        width: 100%;
+        height: 100%;
+        display: grid;
+        grid-template-columns: 320px 1fr;
+        grid-template-rows: 1fr;
+      }
+      #side-panel {
+        background: #0b132b;
+        border-right: 1px solid #1f2a44;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 16px;
+      }
+      #atlas-canvas-3d {
+        width: 100%;
+        height: 100%;
+        display: block;
+        touch-action: none;
+      }
+      .section {
+        border: 1px solid #1f2a44;
+        border-radius: 8px;
+        padding: 12px;
+        background: #0f172a;
+      }
+      .section h3 {
+        margin: 0 0 8px 0;
+        font-size: 14px;
+        letter-spacing: 0.3px;
+        color: #93c5fd;
+      }
+      label { display: block; margin-bottom: 8px; font-size: 13px; color: #cbd5e1; }
+      select, button, input[type="checkbox"] {
+        font-size: 13px;
+      }
+      button {
+        padding: 8px 10px;
+        margin-right: 6px;
+        border: 1px solid #1f2a44;
+        background: #111827;
+        color: #e5e7eb;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      button.active { background: #2563eb; border-color: #3b82f6; }
+      select { width: 100%; padding: 6px; border-radius: 6px; border: 1px solid #1f2a44; background: #0f172a; color: #e5e7eb; }
+      .checkbox { display: flex; gap: 8px; align-items: center; }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <div id="side-panel">
+        <div class="section">
+          <h3>Datasets</h3>
+          <label for="dataset">Choose dataset</label>
+          <select id="dataset">
+            <option value="demo-city" selected>Demo city</option>
+            <option value="terrain-hi">Terrain (Hi-Res)</option>
+            <option value="imagery">Imagery tiles</option>
+            <option value="vector">Vector roads</option>
+          </select>
+        </div>
+        <div class="section">
+          <h3>Status</h3>
+          <div id="status-text" style="font-size:12px; color:#cbd5e1;">Ready</div>
+        </div>
+      </div>
+      <canvas id="atlas-canvas-3d" width="1280" height="720"></canvas>
+    </div>
+    <script type="module">
+      function main(wasm) {
+        wireUi(wasm);
+        resizeCanvas(wasm);
+        window.addEventListener("resize", () => resizeCanvas(wasm));
+        wasm.init_wgpu();
+        // preload built-in dataset
+        wasm.load_dataset(new URL("./assets/scene.manifest.json", import.meta.url).toString());
+        startAnimation(wasm);
+      }
+
+      function startAnimation(wasm) {
+        function loop() {
+          try {
+            wasm.advance_frame();
+          } catch (e) {
+            console.error("advance_frame failed", e);
+            return;
+          }
+          window.requestAnimationFrame(loop);
+        }
+        window.requestAnimationFrame(loop);
+      }
+
+      function resizeCanvas(wasm) {
+        const panel = document.getElementById("side-panel");
+        const width = window.innerWidth - panel.offsetWidth;
+        const height = window.innerHeight;
+        const canvas3d = document.getElementById("atlas-canvas-3d");
+        canvas3d.width = width;
+        canvas3d.height = height;
+        wasm.set_canvas_sizes(width, height);
+      }
+
+      function setStatus(text) {
+        document.getElementById("status-text").textContent = text;
+      }
+
+      function wireUi(wasm) {
+        const dataset = document.getElementById("dataset");
+        const canvas = document.getElementById("atlas-canvas-3d");
+
+        canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+
+        let dragging = false;
+        let dragMode = "orbit"; // orbit | pan
+        let lastX = 0;
+        let lastY = 0;
+
+        canvas.addEventListener("pointerdown", (e) => {
+          canvas.setPointerCapture(e.pointerId);
+          dragging = true;
+          lastX = e.clientX;
+          lastY = e.clientY;
+
+          // left = orbit, right = pan, shift+left = pan
+          if (e.button === 2 || e.shiftKey) {
+            dragMode = "pan";
+          } else {
+            dragMode = "orbit";
+          }
+        });
+
+        canvas.addEventListener("pointermove", (e) => {
+          if (!dragging) return;
+          const dx = e.clientX - lastX;
+          const dy = e.clientY - lastY;
+          lastX = e.clientX;
+          lastY = e.clientY;
+
+          try {
+            if (dragMode === "pan") {
+              wasm.camera_pan(dx, dy);
+            } else {
+              wasm.camera_orbit(dx, dy);
+            }
+          } catch (err) {
+            console.error("camera input failed", err);
+          }
+        });
+
+        function stopDrag() {
+          dragging = false;
+        }
+        canvas.addEventListener("pointerup", stopDrag);
+        canvas.addEventListener("pointercancel", stopDrag);
+        canvas.addEventListener("pointerleave", stopDrag);
+
+        canvas.addEventListener(
+          "wheel",
+          (e) => {
+            e.preventDefault();
+            try {
+              wasm.camera_zoom(e.deltaY);
+            } catch (err) {
+              console.error("camera_zoom failed", err);
+            }
+          },
+          { passive: false }
+        );
+
+        window.addEventListener("keydown", (e) => {
+          if (e.key === "r" || e.key === "R") {
+            try {
+              wasm.camera_reset();
+            } catch (err) {
+              console.error("camera_reset failed", err);
+            }
+          }
+        });
+
+        dataset.addEventListener("change", (e) => {
+          const value = e.target.value;
+          wasm.set_dataset(value);
+          setStatus(`Dataset: ${value}`);
+        });
+
+        setStatus("Controls: LMB drag=orbit, RMB/Shift+drag=pan, wheel=zoom, R=reset");
+      }
+
+      function bootstrap() {
+        const alreadyLoaded = window.wasmBindings;
+        if (alreadyLoaded) {
+          main(alreadyLoaded);
+          return;
+        }
+
+        window.addEventListener("TrunkApplicationStarted", () => {
+          if (!window.wasmBindings) {
+            console.error("Trunk started but wasmBindings missing");
+            return;
+          }
+          main(window.wasmBindings);
+        });
+      }
+
+      bootstrap();
+    </script>
+  </body>
+</html>

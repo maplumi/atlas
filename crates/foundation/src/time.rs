@@ -1,8 +1,8 @@
 /// Time primitives
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct Time(pub f64); // seconds
 
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub struct TimeSpan {
     pub start: Time,
     pub end: Time,

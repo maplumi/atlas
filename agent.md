@@ -19,6 +19,8 @@ This file guides automated agents working in the `atlas` workspace. Follow the r
 - Linting: `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
 - Workspace structure: crates live under `crates/` and are narrowly scoped.
 - Public API: expose from each crate's `src/lib.rs`; keep internal modules in `src/`.
+- Design: follow single-responsibility; keep functions focused and files small.
+- Modules: use submodules in separate files rather than long monolithic files.
 
 ## Naming conventions (adopted)
 

@@ -9,3 +9,4 @@ path = "src/lib.rs"
 [dependencies]
 foundation = { path = "../foundation" }
 runtime = { path = "../runtime" }
+scene = { path = "../scene" }

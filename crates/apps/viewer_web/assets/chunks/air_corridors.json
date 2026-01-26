@@ -1,0 +1,20 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "name": "Transatlantic" },
+      "geometry": { "type": "LineString", "coordinates": [[-74.0060, 40.7128], [-0.1276, 51.5074]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "Europe to Asia" },
+      "geometry": { "type": "LineString", "coordinates": [[-0.1276, 51.5074], [139.6503, 35.6762]] }
+    },
+    {
+      "type": "Feature",
+      "properties": { "name": "Africa to Australia" },
+      "geometry": { "type": "LineString", "coordinates": [[36.8219, -1.2921], [151.2093, -33.8688]] }
+    }
+  ]
+}
