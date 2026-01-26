@@ -75,10 +75,7 @@
           <h3>Datasets</h3>
           <label for="dataset">Choose dataset</label>
           <select id="dataset">
-            <option value="demo-city" selected>Demo city</option>
-            <option value="terrain-hi">Terrain (Hi-Res)</option>
-            <option value="imagery">Imagery tiles</option>
-            <option value="vector">Vector roads</option>
+            <option value="" selected>Loading…</option>
           </select>
         </div>
         <div class="section">
@@ -102,8 +99,59 @@
         window.addEventListener("resize", () => resizeCanvas(wasm));
         wasm.init_wgpu();
         // preload built-in dataset
-        wasm.load_dataset(new URL("./assets/scene.manifest.json", import.meta.url).toString());
+        const manifestUrl = new URL("./assets/scene.manifest.json", import.meta.url).toString();
+        wasm.load_dataset(manifestUrl);
+        populateDatasets(manifestUrl, wasm);
         startAnimation(wasm);
+      }
+
+      async function populateDatasets(manifestUrl, wasm) {
+        const select = document.getElementById("dataset");
+        try {
+          const resp = await fetch(manifestUrl);
+          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+          const manifest = await resp.json();
+
+          const chunks = Array.isArray(manifest.chunks) ? manifest.chunks : [];
+          // Clear existing options.
+          select.innerHTML = "";
+
+          // Populate from manifest chunks.
+          if (chunks.length === 0) {
+            const opt = document.createElement("option");
+            opt.value = "";
+            opt.textContent = "(no datasets found)";
+            select.appendChild(opt);
+            return;
+          }
+
+          for (const c of chunks) {
+            const id = String(c.id ?? "");
+            if (!id) continue;
+            const kind = c.kind ? String(c.kind) : "";
+            const opt = document.createElement("option");
+            opt.value = id;
+            opt.textContent = kind ? `${id} (${kind})` : id;
+            select.appendChild(opt);
+          }
+
+          // Default selection: first dataset.
+          select.value = select.options[0]?.value ?? "";
+          if (select.value) {
+            try {
+              wasm.set_dataset(select.value);
+            } catch (err) {
+              console.error("set_dataset failed", err);
+            }
+          }
+        } catch (err) {
+          console.error("Failed to populate datasets", err);
+          select.innerHTML = "";
+          const opt = document.createElement("option");
+          opt.value = "";
+          opt.textContent = "Failed to load datasets";
+          select.appendChild(opt);
+        }
       }
 
       function startAnimation(wasm) {
@@ -209,6 +257,7 @@
 
         dataset.addEventListener("change", (e) => {
           const value = e.target.value;
+          if (!value) return;
           wasm.set_dataset(value);
           setStatus(`Dataset: ${value}`);
         });
