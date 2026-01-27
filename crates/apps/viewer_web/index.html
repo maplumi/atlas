@@ -88,6 +88,14 @@
       .row { display: flex; align-items: center; gap: 10px; }
       input[type="range"] { width: 100%; }
       .value { font-variant-numeric: tabular-nums; color: #cbd5e1; font-size: 12px; }
+      .layer-row {
+        display: grid;
+        grid-template-columns: 1fr 44px 1fr 1fr;
+        gap: 10px;
+        align-items: center;
+        margin-top: 8px;
+      }
+      .layer-row .mini { font-size: 11px; color: #94a3b8; }
     </style>
   </head>
   <body>
@@ -107,6 +115,18 @@
               <option value="" selected>Loading…</option>
             </select>
           </div>
+
+          <div class="section">
+            <h3>Upload</h3>
+            <label for="file-geojson">Upload GIS file (GeoJSON)</label>
+            <input id="file-geojson" type="file" accept=".json,.geojson,application/geo+json,application/json" />
+            <div style="font-size:12px; color:#94a3b8; line-height:1.35; margin-top:8px;">
+              Supports GeoJSON FeatureCollection/Feature/bare geometry with Point/LineString/Polygon (+ Multi*).
+            </div>
+            <div id="uploaded-info" style="margin-top:10px; font-size:12px; color:#cbd5e1; line-height:1.35;">
+              <div style="color:#94a3b8;">No upload loaded.</div>
+            </div>
+          </div>
           <div class="section">
             <h3>Overlays</h3>
             <label class="checkbox">
@@ -117,16 +137,134 @@
           <div class="section">
             <h3>Status</h3>
             <div id="status-text" style="font-size:12px; color:#cbd5e1;">Ready</div>
+            <div id="cursor-text" style="font-size:12px; color:#94a3b8; margin-top:6px;">Cursor: —</div>
+            <div id="pick-text" style="font-size:12px; color:#94a3b8; margin-top:2px;">Pick: —</div>
           </div>
         </div>
 
         <div id="tab-layers" class="tab-page hidden">
           <div class="section">
             <h3>Points</h3>
-            <label for="city-size">City marker size</label>
+            <label for="city-size">Point size (px)</label>
             <div class="row">
-              <input id="city-size" type="range" min="0.005" max="0.08" step="0.001" value="0.02" />
-              <span id="city-size-value" class="value">0.020</span>
+              <input id="city-size" type="range" min="2" max="24" step="1" value="6" />
+              <span id="city-size-value" class="value">6</span>
+            </div>
+          </div>
+
+          <div class="section">
+            <h3>Lines</h3>
+            <label for="line-width">Line width (px)</label>
+            <div class="row">
+              <input id="line-width" type="range" min="1" max="16" step="0.5" value="2.5" />
+              <span id="line-width-value" class="value">2.5</span>
+            </div>
+            <div style="font-size:12px; color:#94a3b8; line-height:1.35; margin-top:8px;">
+              Note: this viewer uses simple per-layer styles (color/opacity/lift/width), not rule-based GIS symbology.
+            </div>
+          </div>
+
+          <div class="section">
+            <h3>Layers</h3>
+
+            <div class="layer-row">
+              <label class="checkbox">
+                <input id="layer-cities" type="checkbox" />
+                <span>Cities (built-in)</span>
+              </label>
+              <input id="layer-cities-color" type="color" value="#ff4040" />
+              <div>
+                <div class="mini">Opacity</div>
+                <input id="layer-cities-opacity" type="range" min="0" max="1" step="0.01" value="0.95" />
+              </div>
+              <div>
+                <div class="mini">Lift</div>
+                <input id="layer-cities-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.02" />
+              </div>
+            </div>
+
+            <div class="layer-row">
+              <label class="checkbox">
+                <input id="layer-corridors" type="checkbox" />
+                <span>Air corridors (built-in)</span>
+              </label>
+              <input id="layer-corridors-color" type="color" value="#ffd640" />
+              <div>
+                <div class="mini">Opacity</div>
+                <input id="layer-corridors-opacity" type="range" min="0" max="1" step="0.01" value="0.90" />
+              </div>
+              <div>
+                <div class="mini">Lift</div>
+                <input id="layer-corridors-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
+              </div>
+            </div>
+
+            <div class="layer-row">
+              <label class="checkbox">
+                <input id="layer-regions" type="checkbox" />
+                <span>Regions (built-in)</span>
+              </label>
+              <input id="layer-regions-color" type="color" value="#19e6bf" />
+              <div>
+                <div class="mini">Opacity</div>
+                <input id="layer-regions-opacity" type="range" min="0" max="1" step="0.01" value="0.30" />
+              </div>
+              <div>
+                <div class="mini">Lift</div>
+                <input id="layer-regions-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
+              </div>
+            </div>
+
+            <div class="layer-row">
+              <label class="checkbox">
+                <input id="layer-uploaded-points" type="checkbox" />
+                <span id="layer-uploaded-points-label">Uploaded points</span>
+              </label>
+              <input id="layer-uploaded-points-color" type="color" value="#99f2ff" />
+              <div>
+                <div class="mini">Opacity</div>
+                <input id="layer-uploaded-points-opacity" type="range" min="0" max="1" step="0.01" value="0.95" />
+              </div>
+              <div>
+                <div class="mini">Lift</div>
+                <input id="layer-uploaded-points-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.02" />
+              </div>
+            </div>
+
+            <div class="layer-row">
+              <label class="checkbox">
+                <input id="layer-uploaded-corridors" type="checkbox" />
+                <span id="layer-uploaded-corridors-label">Uploaded lines</span>
+              </label>
+              <input id="layer-uploaded-corridors-color" type="color" value="#d9f299" />
+              <div>
+                <div class="mini">Opacity</div>
+                <input id="layer-uploaded-corridors-opacity" type="range" min="0" max="1" step="0.01" value="0.90" />
+              </div>
+              <div>
+                <div class="mini">Lift</div>
+                <input id="layer-uploaded-corridors-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
+              </div>
+            </div>
+
+            <div class="layer-row">
+              <label class="checkbox">
+                <input id="layer-uploaded-regions" type="checkbox" />
+                <span id="layer-uploaded-regions-label">Uploaded polygons</span>
+              </label>
+              <input id="layer-uploaded-regions-color" type="color" value="#73b7ff" />
+              <div>
+                <div class="mini">Opacity</div>
+                <input id="layer-uploaded-regions-opacity" type="range" min="0" max="1" step="0.01" value="0.25" />
+              </div>
+              <div>
+                <div class="mini">Lift</div>
+                <input id="layer-uploaded-regions-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
+              </div>
+            </div>
+
+            <div style="font-size:12px; color:#94a3b8; line-height:1.35; margin-top:10px;">
+              Tip: you can enable multiple layers at once. Click on a point layer to pick the nearest marker.
             </div>
           </div>
         </div>
@@ -244,11 +382,91 @@
         const tabSettings = document.getElementById("tab-settings");
 
         const dataset = document.getElementById("dataset");
+        const fileGeoJson = document.getElementById("file-geojson");
+        const uploadedInfo = document.getElementById("uploaded-info");
         const toggleGraticule = document.getElementById("toggle-graticule");
         const toggleRealSun = document.getElementById("toggle-real-sun");
         const citySize = document.getElementById("city-size");
         const citySizeValue = document.getElementById("city-size-value");
+        const lineWidth = document.getElementById("line-width");
+        const lineWidthValue = document.getElementById("line-width-value");
         const canvas = document.getElementById("atlas-canvas-3d");
+
+        const cursorText = document.getElementById("cursor-text");
+        const pickText = document.getElementById("pick-text");
+
+        const layerCities = document.getElementById("layer-cities");
+        const layerCitiesColor = document.getElementById("layer-cities-color");
+        const layerCitiesOpacity = document.getElementById("layer-cities-opacity");
+        const layerCitiesLift = document.getElementById("layer-cities-lift");
+
+        const layerCorridors = document.getElementById("layer-corridors");
+        const layerCorridorsColor = document.getElementById("layer-corridors-color");
+        const layerCorridorsOpacity = document.getElementById("layer-corridors-opacity");
+        const layerCorridorsLift = document.getElementById("layer-corridors-lift");
+
+        const layerRegions = document.getElementById("layer-regions");
+        const layerRegionsColor = document.getElementById("layer-regions-color");
+        const layerRegionsOpacity = document.getElementById("layer-regions-opacity");
+        const layerRegionsLift = document.getElementById("layer-regions-lift");
+
+        const layerUploadedPoints = document.getElementById("layer-uploaded-points");
+        const layerUploadedPointsLabel = document.getElementById("layer-uploaded-points-label");
+        const layerUploadedPointsColor = document.getElementById("layer-uploaded-points-color");
+        const layerUploadedPointsOpacity = document.getElementById("layer-uploaded-points-opacity");
+        const layerUploadedPointsLift = document.getElementById("layer-uploaded-points-lift");
+
+        const layerUploadedCorridors = document.getElementById("layer-uploaded-corridors");
+        const layerUploadedCorridorsLabel = document.getElementById("layer-uploaded-corridors-label");
+        const layerUploadedCorridorsColor = document.getElementById("layer-uploaded-corridors-color");
+        const layerUploadedCorridorsOpacity = document.getElementById("layer-uploaded-corridors-opacity");
+        const layerUploadedCorridorsLift = document.getElementById("layer-uploaded-corridors-lift");
+
+        const layerUploadedRegions = document.getElementById("layer-uploaded-regions");
+        const layerUploadedRegionsLabel = document.getElementById("layer-uploaded-regions-label");
+        const layerUploadedRegionsColor = document.getElementById("layer-uploaded-regions-color");
+        const layerUploadedRegionsOpacity = document.getElementById("layer-uploaded-regions-opacity");
+        const layerUploadedRegionsLift = document.getElementById("layer-uploaded-regions-lift");
+
+        function setUploadedInfo({ name, points, lines, polygons, error }) {
+          if (error) {
+            uploadedInfo.innerHTML = `<div style="color:#fca5a5;">Upload error: ${String(error)}</div>`;
+            return;
+          }
+          if (!name) {
+            uploadedInfo.innerHTML = `<div style="color:#94a3b8;">No upload loaded.</div>`;
+            return;
+          }
+          uploadedInfo.innerHTML = `
+            <div><span style="color:#93c5fd;">Uploaded:</span> ${name}</div>
+            <div style="color:#94a3b8;">Points: ${points ?? 0} • Lines: ${lines ?? 0} • Polygons: ${polygons ?? 0}</div>
+          `;
+        }
+
+        function wireLayerControls() {
+          function bind(id, checkbox, color, opacity, lift) {
+            checkbox.addEventListener("change", (e) => {
+              try { wasm.set_layer_visible(id, !!e.target.checked); } catch (err) { console.error(err); }
+            });
+            color.addEventListener("input", (e) => {
+              try { wasm.set_layer_color_hex(id, e.target.value); } catch (err) { console.error(err); }
+            });
+            opacity.addEventListener("input", (e) => {
+              try { wasm.set_layer_opacity(id, Number(e.target.value)); } catch (err) { console.error(err); }
+            });
+            lift.addEventListener("input", (e) => {
+              try { wasm.set_layer_lift(id, Number(e.target.value)); } catch (err) { console.error(err); }
+            });
+          }
+          bind("cities", layerCities, layerCitiesColor, layerCitiesOpacity, layerCitiesLift);
+          bind("air_corridors", layerCorridors, layerCorridorsColor, layerCorridorsOpacity, layerCorridorsLift);
+          bind("regions", layerRegions, layerRegionsColor, layerRegionsOpacity, layerRegionsLift);
+          bind("uploaded_points", layerUploadedPoints, layerUploadedPointsColor, layerUploadedPointsOpacity, layerUploadedPointsLift);
+          bind("uploaded_corridors", layerUploadedCorridors, layerUploadedCorridorsColor, layerUploadedCorridorsOpacity, layerUploadedCorridorsLift);
+          bind("uploaded_regions", layerUploadedRegions, layerUploadedRegionsColor, layerUploadedRegionsOpacity, layerUploadedRegionsLift);
+        }
+
+        wireLayerControls();
 
         function setTab(which) {
           const isGeneral = which === "general";
@@ -274,12 +492,18 @@
         let dragMode = "orbit"; // orbit | pan
         let lastX = 0;
         let lastY = 0;
+        let downX = 0;
+        let downY = 0;
+        let downButton = 0;
 
         canvas.addEventListener("pointerdown", (e) => {
           canvas.setPointerCapture(e.pointerId);
           dragging = true;
           lastX = e.clientX;
           lastY = e.clientY;
+          downX = e.clientX;
+          downY = e.clientY;
+          downButton = e.button;
 
           // left = orbit, right = pan, shift+left = pan
           if (e.button === 2 || e.shiftKey) {
@@ -290,6 +514,18 @@
         });
 
         canvas.addEventListener("pointermove", (e) => {
+          if (!dragging) {
+            try {
+              const info = wasm.cursor_move(e.offsetX, e.offsetY);
+              if (info && info.hit) {
+                cursorText.textContent = `Cursor: lon ${info.lon.toFixed(4)}°, lat ${info.lat.toFixed(4)}°`;
+              } else {
+                cursorText.textContent = "Cursor: —";
+              }
+            } catch (err) {
+              // ignore
+            }
+          }
           if (!dragging) return;
           const dx = e.clientX - lastX;
           const dy = e.clientY - lastY;
@@ -310,7 +546,26 @@
         function stopDrag() {
           dragging = false;
         }
-        canvas.addEventListener("pointerup", stopDrag);
+        canvas.addEventListener("pointerup", (e) => {
+          // If it was a click (not a drag), run picking.
+          const dx = e.clientX - downX;
+          const dy = e.clientY - downY;
+          const dist2 = dx * dx + dy * dy;
+          if (downButton === 0 && dist2 < 16) {
+            try {
+              const picked = wasm.cursor_click(e.offsetX, e.offsetY);
+              if (picked && picked.picked) {
+                const kind = picked.kind ? String(picked.kind) : "feature";
+                pickText.textContent = `Pick (${kind}): lon ${picked.lon.toFixed(4)}°, lat ${picked.lat.toFixed(4)}°`;
+              } else {
+                pickText.textContent = "Pick: —";
+              }
+            } catch (err) {
+              console.error("pick failed", err);
+            }
+          }
+          stopDrag();
+        });
         canvas.addEventListener("pointercancel", stopDrag);
         canvas.addEventListener("pointerleave", stopDrag);
 
@@ -342,6 +597,57 @@
           if (!value) return;
           wasm.set_dataset(value);
           setStatus(`Dataset: ${value}`);
+
+          // If this is a known built-in dataset, enable its layer checkbox.
+          if (value === "cities") layerCities.checked = true;
+          if (value === "air_corridors") layerCorridors.checked = true;
+          if (value === "regions") layerRegions.checked = true;
+        });
+
+        fileGeoJson.addEventListener("change", async () => {
+          const file = fileGeoJson.files && fileGeoJson.files[0];
+          if (!file) return;
+
+          try {
+            setStatus(`Loading ${file.name}…`);
+            const text = await file.text();
+            const summary = await wasm.load_geojson_file(file.name, text);
+
+            // Add/update an Uploaded option in the dataset dropdown.
+            const uploadedId = "__uploaded__";
+            let opt = Array.from(dataset.options).find((o) => o.value === uploadedId);
+            if (!opt) {
+              opt = document.createElement("option");
+              opt.value = uploadedId;
+              dataset.appendChild(opt);
+            }
+            opt.textContent = `uploaded (${file.name})`;
+            dataset.value = uploadedId;
+
+            setUploadedInfo({
+              name: summary?.name ?? file.name,
+              points: summary?.points ?? 0,
+              lines: summary?.lines ?? 0,
+              polygons: summary?.polygons ?? 0,
+            });
+
+            // Enable uploaded layers (if present) and label them.
+            layerUploadedPointsLabel.textContent = `Uploaded points (${file.name})`;
+            layerUploadedCorridorsLabel.textContent = `Uploaded lines (${file.name})`;
+            layerUploadedRegionsLabel.textContent = `Uploaded polygons (${file.name})`;
+            layerUploadedPoints.checked = (summary?.points ?? 0) > 0;
+            layerUploadedCorridors.checked = (summary?.lines ?? 0) > 0;
+            layerUploadedRegions.checked = (summary?.polygons ?? 0) > 0;
+
+            setStatus(`Uploaded: ${file.name}`);
+          } catch (err) {
+            console.error("GeoJSON upload failed", err);
+            setStatus("Upload failed (see console)");
+            setUploadedInfo({ error: err?.message ?? String(err) });
+          } finally {
+            // allow re-uploading the same file
+            fileGeoJson.value = "";
+          }
         });
 
         toggleGraticule.addEventListener("change", (e) => {
@@ -364,7 +670,7 @@
 
         function applyCitySize() {
           const v = Number(citySize.value);
-          citySizeValue.textContent = v.toFixed(3);
+          citySizeValue.textContent = String(v);
           try {
             wasm.set_city_marker_size(v);
           } catch (err) {
@@ -372,11 +678,24 @@
           }
         }
 
+        function applyLineWidth() {
+          const v = Number(lineWidth.value);
+          lineWidthValue.textContent = String(v);
+          try {
+            wasm.set_line_width_px(v);
+          } catch (err) {
+            console.error("set_line_width_px failed", err);
+          }
+        }
+
         citySize.addEventListener("input", applyCitySize);
         // Apply once at startup to sync wasm state.
         applyCitySize();
 
-        setStatus("Controls: LMB drag=orbit, RMB/Shift+drag=pan, wheel=zoom, R=reset");
+        lineWidth.addEventListener("input", applyLineWidth);
+        applyLineWidth();
+
+        setStatus("Controls: LMB drag=orbit, RMB/Shift+drag=pan, wheel=zoom, R=reset, click=pick");
       }
 
       function bootstrap() {

@@ -1,4 +1,4 @@
-name: Deploy Docs to GitHub Pages
+name: Deploy Site to GitHub Pages
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   id-token: write
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -21,13 +21,25 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          targets: wasm32-unknown-unknown
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
 
+      - name: Install Trunk
+        run: |
+          cargo install trunk --locked
+
       - name: Install mdbook
         run: |
           cargo install mdbook --locked
+
+      - name: Build web app (viewer_web)
+        run: |
+          mkdir -p dist
+          cd crates/apps/viewer_web
+          trunk build --release --public-url /atlas/ --dist "$GITHUB_WORKSPACE/dist"
 
       - name: Sync releases into docs
         run: |
@@ -39,13 +51,18 @@ jobs:
         run: |
           mdbook build docs
 
+      - name: Copy docs under /docs
+        run: |
+          mkdir -p dist/docs
+          rsync -a --delete docs/book/ dist/docs/
+
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: docs/book
+          path: dist
 
   deploy-pages:
-    needs: deploy
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - name: Deploy to GitHub Pages

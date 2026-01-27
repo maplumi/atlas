@@ -8,4 +8,4 @@ build-dir = "book"
 
 [output.html]
 # This repo is deployed as a *project* site: https://<user>.github.io/atlas/
-site-url = "/atlas/"
+site-url = "/atlas/docs/"

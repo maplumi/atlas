@@ -7,9 +7,16 @@ use wasm_bindgen_futures::spawn_local;
 use formats::SceneManifest;
 mod wgpu;
 use wgpu::{
-    CityVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh, resize_wgpu,
-    set_cities_points, set_corridors_points, set_regions_points,
+    CityVertex, CorridorVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh,
+    resize_wgpu, set_cities_points, set_corridors_points, set_regions_points,
 };
+
+#[derive(Debug, Copy, Clone)]
+struct LayerStyle {
+    visible: bool,
+    color: [f32; 4],
+    lift: f32,
+}
 
 #[derive(Debug, serde::Deserialize)]
 struct GeoJsonFeatureCollection {
@@ -48,23 +55,54 @@ impl Default for CameraState {
 }
 
 #[derive(Debug)]
-pub struct ViewerState {
-    pub dataset: String,
-    pub canvas_width: f64,
-    pub canvas_height: f64,
-    pub wgpu: Option<WgpuContext>,
-    pub show_graticule: bool,
-    pub sun_follow_real_time: bool,
-    pub city_marker_size: f32,
-    pub cities_centers: Option<Vec<[f32; 3]>>,
-    pub pending_cities: Option<Vec<CityVertex>>,
-    pub pending_corridors: Option<Vec<OverlayVertex>>,
-    pub pending_regions: Option<Vec<OverlayVertex>>,
-    pub frame_index: u64,
-    pub dt_s: f64,
-    pub time_s: f64,
-    pub time_end_s: f64,
-    pub camera: CameraState,
+struct ViewerState {
+    dataset: String,
+    canvas_width: f64,
+    canvas_height: f64,
+    wgpu: Option<WgpuContext>,
+    show_graticule: bool,
+    sun_follow_real_time: bool,
+
+    // Point marker size in screen pixels.
+    city_marker_size: f32,
+
+    // Line width in screen pixels (applies to all line layers).
+    line_width_px: f32,
+
+    // Layer styles and visibility.
+    cities_style: LayerStyle,
+    corridors_style: LayerStyle,
+    regions_style: LayerStyle,
+    uploaded_points_style: LayerStyle,
+    uploaded_corridors_style: LayerStyle,
+    uploaded_regions_style: LayerStyle,
+    selection_style: LayerStyle,
+    // CPU-side geometry (positions on/near the unit sphere).
+    cities_centers: Option<Vec<[f32; 3]>>,
+    corridors_positions: Option<Vec<[f32; 3]>>,
+    regions_positions: Option<Vec<[f32; 3]>>,
+
+    uploaded_name: Option<String>,
+    uploaded_centers: Option<Vec<[f32; 3]>>,
+    uploaded_corridors_positions: Option<Vec<[f32; 3]>>,
+    uploaded_regions_positions: Option<Vec<[f32; 3]>>,
+    uploaded_count_points: usize,
+    uploaded_count_lines: usize,
+    uploaded_count_polys: usize,
+
+    selection_center: Option<[f32; 3]>,
+    selection_line_positions: Option<Vec<[f32; 3]>>,
+    selection_poly_positions: Option<Vec<[f32; 3]>>,
+
+    // Combined buffers (all visible layers), uploaded into the shared GPU buffers.
+    pending_cities: Option<Vec<CityVertex>>,
+    pending_corridors: Option<Vec<CorridorVertex>>,
+    pending_regions: Option<Vec<OverlayVertex>>,
+    frame_index: u64,
+    dt_s: f64,
+    time_s: f64,
+    time_end_s: f64,
+    camera: CameraState,
 }
 
 thread_local! {
@@ -75,8 +113,31 @@ thread_local! {
         wgpu: None,
         show_graticule: false,
         sun_follow_real_time: true,
-        city_marker_size: 0.02,
+        city_marker_size: 6.0,
+        line_width_px: 2.5,
+
+        cities_style: LayerStyle { visible: false, color: [1.0, 0.25, 0.25, 0.95], lift: 0.02 },
+        corridors_style: LayerStyle { visible: false, color: [1.0, 0.85, 0.25, 0.90], lift: 0.0 },
+        regions_style: LayerStyle { visible: false, color: [0.10, 0.90, 0.75, 0.30], lift: 0.0 },
+        uploaded_points_style: LayerStyle { visible: false, color: [0.60, 0.95, 1.00, 0.95], lift: 0.02 },
+        uploaded_corridors_style: LayerStyle { visible: false, color: [0.85, 0.95, 0.60, 0.90], lift: 0.0 },
+        uploaded_regions_style: LayerStyle { visible: false, color: [0.45, 0.75, 1.00, 0.25], lift: 0.0 },
+        selection_style: LayerStyle { visible: true, color: [1.0, 1.0, 1.0, 0.95], lift: 0.02 },
+
         cities_centers: None,
+        corridors_positions: None,
+        regions_positions: None,
+        uploaded_name: None,
+        uploaded_centers: None,
+        uploaded_corridors_positions: None,
+        uploaded_regions_positions: None,
+        uploaded_count_points: 0,
+        uploaded_count_lines: 0,
+        uploaded_count_polys: 0,
+
+        selection_center: None,
+        selection_line_positions: None,
+        selection_poly_positions: None,
         pending_cities: None,
         pending_corridors: None,
         pending_regions: None,
@@ -181,21 +242,15 @@ fn current_sun_direction_world() -> Option<[f32; 3]> {
     Some(lon_lat_deg_to_world(subsolar_lon, subsolar_lat, 1.0))
 }
 
-fn build_corridor_line_vertices(points: &[[f32; 3]]) -> Vec<OverlayVertex> {
+fn build_corridor_line_positions(points: &[[f32; 3]]) -> Vec<[f32; 3]> {
     if points.len() < 2 {
         return Vec::new();
     }
 
-    let mut out = Vec::with_capacity((points.len().saturating_sub(1)) * 2);
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity((points.len().saturating_sub(1)) * 2);
     for seg in points.windows(2) {
-        out.push(OverlayVertex {
-            position: seg[0],
-            _pad: 0.0,
-        });
-        out.push(OverlayVertex {
-            position: seg[1],
-            _pad: 0.0,
-        });
+        out.push(seg[0]);
+        out.push(seg[1]);
     }
     out
 }
@@ -240,94 +295,6 @@ fn slerp_unit(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
         a[1] * s0 + b[1] * s1,
         a[2] * s0 + b[2] * s1,
     ])
-}
-
-fn build_city_vertices(centers: &[[f32; 3]], size: f32) -> Vec<CityVertex> {
-    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-    }
-
-    fn cross(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-        [
-            a[1] * b[2] - a[2] * b[1],
-            a[2] * b[0] - a[0] * b[2],
-            a[0] * b[1] - a[1] * b[0],
-        ]
-    }
-
-    fn norm(a: [f32; 3]) -> f32 {
-        dot(a, a).sqrt()
-    }
-
-    fn normalize(a: [f32; 3]) -> [f32; 3] {
-        let n = norm(a);
-        if n <= 0.0 {
-            [0.0, 0.0, 0.0]
-        } else {
-            [a[0] / n, a[1] / n, a[2] / n]
-        }
-    }
-
-    fn add(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-        [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-    }
-
-    fn sub(a: [f32; 3], b: [f32; 3]) -> [f32; 3] {
-        [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
-    }
-
-    fn mul(a: [f32; 3], s: f32) -> [f32; 3] {
-        [a[0] * s, a[1] * s, a[2] * s]
-    }
-
-    // Two triangles (6 vertices) per city.
-    let mut out = Vec::with_capacity(centers.len() * 6);
-    for &p in centers {
-        let n = normalize(p);
-        let up = if n[1].abs() > 0.95 {
-            [1.0, 0.0, 0.0]
-        } else {
-            [0.0, 1.0, 0.0]
-        };
-        let tangent = normalize(cross(up, n));
-        let bitangent = normalize(cross(n, tangent));
-
-        let t = mul(tangent, size);
-        let b = mul(bitangent, size);
-
-        // True quad corners in the tangent plane.
-        let p0 = add(add(p, t), b);
-        let p1 = add(sub(p, t), b);
-        let p2 = sub(sub(p, t), b);
-        let p3 = sub(add(p, t), b);
-
-        // Two triangles: p0-p1-p2 and p0-p2-p3
-        for v in [p0, p1, p2, p0, p2, p3] {
-            out.push(CityVertex {
-                position: v,
-                _pad: 0.0,
-            });
-        }
-
-        // The geometry is symmetric about p, so resizing should never move the center.
-        // (In debug builds, assert the centroid equals p.)
-        debug_assert!({
-            let base = out.len() - 6;
-            let mut c = [0.0f32; 3];
-            for i in 0..6 {
-                let q = out[base + i].position;
-                c[0] += q[0];
-                c[1] += q[1];
-                c[2] += q[2];
-            }
-            c[0] /= 6.0;
-            c[1] /= 6.0;
-            c[2] /= 6.0;
-            let eps = 1e-4;
-            (c[0] - p[0]).abs() < eps && (c[1] - p[1]).abs() < eps && (c[2] - p[2]).abs() < eps
-        });
-    }
-    out
 }
 
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
@@ -453,9 +420,12 @@ fn render_scene() -> Result<(), JsValue> {
             } else {
                 [0.4, 0.7, 0.2]
             };
-            let show_cities = state.dataset == "cities";
-            let show_corridors = state.dataset == "air_corridors";
-            let show_regions = state.dataset == "regions";
+
+            // Layer visibility is baked into the combined overlay buffers; we can always
+            // attempt to draw and rely on vertex counts to early-out.
+            let show_cities = true;
+            let show_corridors = true;
+            let show_regions = true;
             let _ = render_mesh(
                 ctx,
                 view_proj,
@@ -468,6 +438,214 @@ fn render_scene() -> Result<(), JsValue> {
         }
     });
     Ok(())
+}
+
+fn build_city_vertices(
+    centers: &[[f32; 3]],
+    size_px: f32,
+    color: [f32; 4],
+    lift: f32,
+) -> Vec<CityVertex> {
+    let size_px = size_px.clamp(1.0, 64.0);
+    let mut out: Vec<CityVertex> = Vec::with_capacity(centers.len() * 6);
+    for &c in centers {
+        let v0 = CityVertex {
+            center: c,
+            lift,
+            offset_px: [-size_px, -size_px],
+            color,
+        };
+        let v1 = CityVertex {
+            center: c,
+            lift,
+            offset_px: [size_px, -size_px],
+            color,
+        };
+        let v2 = CityVertex {
+            center: c,
+            lift,
+            offset_px: [size_px, size_px],
+            color,
+        };
+        let v3 = CityVertex {
+            center: c,
+            lift,
+            offset_px: [-size_px, size_px],
+            color,
+        };
+
+        // Two triangles: (v0,v1,v2) and (v0,v2,v3)
+        out.extend([v0, v1, v2, v0, v2, v3]);
+    }
+    out
+}
+
+fn build_corridor_vertices(
+    positions_line_list: &[[f32; 3]],
+    width_px: f32,
+    color: [f32; 4],
+    lift: f32,
+) -> Vec<CorridorVertex> {
+    let width_px = width_px.clamp(1.0, 24.0);
+    let seg_count = positions_line_list.len() / 2;
+    let mut out: Vec<CorridorVertex> = Vec::with_capacity(seg_count.saturating_mul(6));
+
+    for seg in positions_line_list.chunks_exact(2).take(250_000) {
+        let a = seg[0];
+        let b = seg[1];
+
+        // Skip degenerate segments.
+        let dx = a[0] - b[0];
+        let dy = a[1] - b[1];
+        let dz = a[2] - b[2];
+        if dx * dx + dy * dy + dz * dz < 1e-12 {
+            continue;
+        }
+
+        let v00 = CorridorVertex {
+            a,
+            b,
+            along: 0.0,
+            side: -1.0,
+            lift,
+            width_px,
+            color,
+        };
+        let v01 = CorridorVertex { side: 1.0, ..v00 };
+        let v11 = CorridorVertex {
+            along: 1.0,
+            side: 1.0,
+            ..v00
+        };
+        let v10 = CorridorVertex {
+            along: 1.0,
+            side: -1.0,
+            ..v00
+        };
+
+        // Two triangles for the segment quad.
+        out.extend([v00, v01, v11, v00, v11, v10]);
+    }
+
+    out
+}
+
+fn rebuild_overlays_and_upload() {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+
+        let mut points: Vec<CityVertex> = Vec::new();
+        let mut lines: Vec<CorridorVertex> = Vec::new();
+        let mut polys: Vec<OverlayVertex> = Vec::new();
+
+        // Points
+        if s.cities_style.visible
+            && let Some(centers) = s.cities_centers.as_deref()
+        {
+            points.extend(build_city_vertices(
+                centers,
+                s.city_marker_size,
+                s.cities_style.color,
+                s.cities_style.lift,
+            ));
+        }
+        if s.uploaded_points_style.visible
+            && let Some(centers) = s.uploaded_centers.as_deref()
+        {
+            points.extend(build_city_vertices(
+                centers,
+                s.city_marker_size,
+                s.uploaded_points_style.color,
+                s.uploaded_points_style.lift,
+            ));
+        }
+        if s.selection_style.visible
+            && let Some(c) = s.selection_center
+        {
+            points.extend(build_city_vertices(
+                std::slice::from_ref(&c),
+                s.city_marker_size * 1.35,
+                s.selection_style.color,
+                s.selection_style.lift,
+            ));
+        }
+
+        // Lines (thick quads)
+        if s.corridors_style.visible
+            && let Some(pos) = s.corridors_positions.as_deref()
+        {
+            lines.extend(build_corridor_vertices(
+                pos,
+                s.line_width_px,
+                s.corridors_style.color,
+                s.corridors_style.lift,
+            ));
+        }
+        if s.uploaded_corridors_style.visible
+            && let Some(pos) = s.uploaded_corridors_positions.as_deref()
+        {
+            lines.extend(build_corridor_vertices(
+                pos,
+                s.line_width_px,
+                s.uploaded_corridors_style.color,
+                s.uploaded_corridors_style.lift,
+            ));
+        }
+        if s.selection_style.visible
+            && let Some(pos) = s.selection_line_positions.as_deref()
+            && !pos.is_empty()
+        {
+            lines.extend(build_corridor_vertices(
+                pos,
+                (s.line_width_px * 1.6).clamp(1.0, 24.0),
+                s.selection_style.color,
+                s.selection_style.lift + 0.03,
+            ));
+        }
+
+        // Polygons (triangles)
+        if s.regions_style.visible
+            && let Some(pos) = s.regions_positions.as_deref()
+        {
+            polys.extend(pos.iter().map(|&p| OverlayVertex {
+                position: p,
+                lift: s.regions_style.lift,
+                color: s.regions_style.color,
+            }));
+        }
+        if s.uploaded_regions_style.visible
+            && let Some(pos) = s.uploaded_regions_positions.as_deref()
+        {
+            polys.extend(pos.iter().map(|&p| OverlayVertex {
+                position: p,
+                lift: s.uploaded_regions_style.lift,
+                color: s.uploaded_regions_style.color,
+            }));
+        }
+        if s.selection_style.visible
+            && let Some(pos) = s.selection_poly_positions.as_deref()
+            && !pos.is_empty()
+        {
+            polys.extend(pos.iter().map(|&p| OverlayVertex {
+                position: p,
+                lift: s.selection_style.lift + 0.03,
+                color: s.selection_style.color,
+            }));
+        }
+
+        if let Some(ctx) = &mut s.wgpu {
+            set_cities_points(ctx, &points);
+            set_corridors_points(ctx, &lines);
+            set_regions_points(ctx, &polys);
+            s.pending_cities = None;
+            s.pending_corridors = None;
+            s.pending_regions = None;
+        } else {
+            s.pending_cities = Some(points);
+            s.pending_corridors = Some(lines);
+            s.pending_regions = Some(polys);
+        }
+    });
 }
 
 #[wasm_bindgen(start)]
@@ -567,6 +745,7 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
     let should_load_cities = dataset == "cities";
     let should_load_corridors = dataset == "air_corridors";
     let should_load_regions = dataset == "regions";
+    let should_load_uploaded = dataset == "__uploaded__";
 
     STATE.with(|state| {
         state.borrow_mut().dataset = dataset;
@@ -585,32 +764,19 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
                 }
             };
 
-            let points = STATE.with(|state| {
-                let mut s = state.borrow_mut();
-                s.cities_centers = Some(centers);
-                build_city_vertices(
-                    s.cities_centers.as_deref().unwrap_or_default(),
-                    s.city_marker_size,
-                )
-            });
-
             STATE.with(|state| {
                 let mut s = state.borrow_mut();
-                if let Some(ctx) = &mut s.wgpu {
-                    set_cities_points(ctx, &points);
-                    s.pending_cities = None;
-                } else {
-                    s.pending_cities = Some(points);
-                }
+                s.cities_centers = Some(centers);
+                s.cities_style.visible = true;
             });
-
+            rebuild_overlays_and_upload();
             let _ = render_scene();
         });
     }
 
     if should_load_corridors {
         spawn_local(async move {
-            let verts = match fetch_air_corridors_vertices().await {
+            let verts = match fetch_air_corridors_positions().await {
                 Ok(v) => v,
                 Err(err) => {
                     web_sys::console::log_1(&JsValue::from_str(&format!(
@@ -623,21 +789,17 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 
             STATE.with(|state| {
                 let mut s = state.borrow_mut();
-                if let Some(ctx) = &mut s.wgpu {
-                    set_corridors_points(ctx, &verts);
-                    s.pending_corridors = None;
-                } else {
-                    s.pending_corridors = Some(verts);
-                }
+                s.corridors_positions = Some(verts);
+                s.corridors_style.visible = true;
             });
-
+            rebuild_overlays_and_upload();
             let _ = render_scene();
         });
     }
 
     if should_load_regions {
         spawn_local(async move {
-            let verts = match fetch_regions_vertices().await {
+            let verts = match fetch_regions_positions().await {
                 Ok(v) => v,
                 Err(err) => {
                     web_sys::console::log_1(&JsValue::from_str(&format!(
@@ -650,16 +812,22 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 
             STATE.with(|state| {
                 let mut s = state.borrow_mut();
-                if let Some(ctx) = &mut s.wgpu {
-                    set_regions_points(ctx, &verts);
-                    s.pending_regions = None;
-                } else {
-                    s.pending_regions = Some(verts);
-                }
+                s.regions_positions = Some(verts);
+                s.regions_style.visible = true;
             });
-
+            rebuild_overlays_and_upload();
             let _ = render_scene();
         });
+    }
+
+    if should_load_uploaded {
+        STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            s.uploaded_points_style.visible = true;
+            s.uploaded_corridors_style.visible = true;
+            s.uploaded_regions_style.visible = true;
+        });
+        rebuild_overlays_and_upload();
     }
 
     // Render immediately so selection changes are responsive.
@@ -669,24 +837,25 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn set_city_marker_size(size: f64) -> Result<(), JsValue> {
-    // Size is in world-space units on the unit sphere.
-    let size = (size as f32).clamp(0.001, 0.25);
+    // Size is in screen pixels.
+    let size = (size as f32).clamp(1.0, 64.0);
 
     STATE.with(|state| {
         let mut s = state.borrow_mut();
         s.city_marker_size = size;
-
-        if let Some(centers) = s.cities_centers.as_deref() {
-            let verts = build_city_vertices(centers, s.city_marker_size);
-            if let Some(ctx) = &mut s.wgpu {
-                set_cities_points(ctx, &verts);
-                s.pending_cities = None;
-            } else {
-                s.pending_cities = Some(verts);
-            }
-        }
     });
 
+    rebuild_overlays_and_upload();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_line_width_px(width_px: f64) -> Result<(), JsValue> {
+    let width_px = (width_px as f32).clamp(1.0, 24.0);
+    STATE.with(|state| {
+        state.borrow_mut().line_width_px = width_px;
+    });
+    rebuild_overlays_and_upload();
     render_scene()
 }
 
@@ -705,6 +874,806 @@ pub fn set_real_time_sun_enabled(enabled: bool) -> Result<(), JsValue> {
         state.borrow_mut().sun_follow_real_time = enabled;
     });
     render_scene()
+}
+
+fn layer_style_mut<'a>(s: &'a mut ViewerState, id: &str) -> Option<&'a mut LayerStyle> {
+    match id {
+        "cities" => Some(&mut s.cities_style),
+        "air_corridors" => Some(&mut s.corridors_style),
+        "regions" => Some(&mut s.regions_style),
+        "uploaded_points" => Some(&mut s.uploaded_points_style),
+        "uploaded_corridors" => Some(&mut s.uploaded_corridors_style),
+        "uploaded_regions" => Some(&mut s.uploaded_regions_style),
+        "selection" => Some(&mut s.selection_style),
+        _ => None,
+    }
+}
+
+#[wasm_bindgen]
+pub fn set_layer_visible(id: &str, visible: bool) -> Result<(), JsValue> {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if let Some(st) = layer_style_mut(&mut s, id) {
+            st.visible = visible;
+        }
+    });
+    rebuild_overlays_and_upload();
+    render_scene()
+}
+
+fn parse_hex_color(s: &str) -> Option<[f32; 3]> {
+    let s = s.trim();
+    let s = s.strip_prefix('#').unwrap_or(s);
+    if s.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&s[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&s[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&s[4..6], 16).ok()?;
+    Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
+}
+
+#[wasm_bindgen]
+pub fn set_layer_color_hex(id: &str, hex: &str) -> Result<(), JsValue> {
+    let rgb = parse_hex_color(hex).ok_or_else(|| JsValue::from_str("Invalid color"))?;
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if let Some(st) = layer_style_mut(&mut s, id) {
+            st.color[0] = rgb[0];
+            st.color[1] = rgb[1];
+            st.color[2] = rgb[2];
+        }
+    });
+    rebuild_overlays_and_upload();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_layer_opacity(id: &str, opacity: f64) -> Result<(), JsValue> {
+    let a = (opacity as f32).clamp(0.0, 1.0);
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if let Some(st) = layer_style_mut(&mut s, id) {
+            st.color[3] = a;
+        }
+    });
+    rebuild_overlays_and_upload();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_layer_lift(id: &str, lift: f64) -> Result<(), JsValue> {
+    let lift = (lift as f32).clamp(-0.1, 0.2);
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if let Some(st) = layer_style_mut(&mut s, id) {
+            st.lift = lift;
+        }
+    });
+    rebuild_overlays_and_upload();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn get_uploaded_summary() -> Result<JsValue, JsValue> {
+    let summary = js_sys::Object::new();
+    STATE.with(|state| {
+        let s = state.borrow();
+        let name = s.uploaded_name.clone().unwrap_or_else(|| "".to_string());
+        let _ = js_sys::Reflect::set(
+            &summary,
+            &JsValue::from_str("name"),
+            &JsValue::from_str(&name),
+        );
+        let _ = js_sys::Reflect::set(
+            &summary,
+            &JsValue::from_str("points"),
+            &JsValue::from_f64(s.uploaded_count_points as f64),
+        );
+        let _ = js_sys::Reflect::set(
+            &summary,
+            &JsValue::from_str("lines"),
+            &JsValue::from_f64(s.uploaded_count_lines as f64),
+        );
+        let _ = js_sys::Reflect::set(
+            &summary,
+            &JsValue::from_str("polygons"),
+            &JsValue::from_f64(s.uploaded_count_polys as f64),
+        );
+    });
+    Ok(summary.into())
+}
+
+fn world_to_lon_lat_deg(p: [f64; 3]) -> (f64, f64) {
+    let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-9);
+    let x = p[0] / r;
+    let y = p[1] / r;
+    let z = p[2] / r;
+    let lat = y.asin().to_degrees();
+    let lon = z.atan2(x).to_degrees();
+    (lon, lat)
+}
+
+fn ray_hit_globe(
+    camera: CameraState,
+    canvas_w: f64,
+    canvas_h: f64,
+    x_px: f64,
+    y_px: f64,
+) -> Option<[f64; 3]> {
+    if canvas_w <= 1.0 || canvas_h <= 1.0 {
+        return None;
+    }
+    let aspect = canvas_w / canvas_h;
+    let fov_y = 45f64.to_radians();
+    let tan = (0.5 * fov_y).tan();
+
+    let dir_cam = [
+        camera.pitch_rad.cos() * camera.yaw_rad.cos(),
+        camera.pitch_rad.sin(),
+        camera.pitch_rad.cos() * camera.yaw_rad.sin(),
+    ];
+    let eye = vec3_add(camera.target, vec3_mul(dir_cam, camera.distance));
+    let forward = vec3_normalize(vec3_sub(camera.target, eye));
+    let world_up = [0.0, 1.0, 0.0];
+    let right = vec3_normalize(vec3_cross(forward, world_up));
+    let up = vec3_cross(right, forward);
+
+    let ndc_x = (2.0 * (x_px / canvas_w) - 1.0) * aspect;
+    let ndc_y = 1.0 - 2.0 * (y_px / canvas_h);
+    let px = ndc_x * tan;
+    let py = ndc_y * tan;
+
+    let ray_dir = vec3_normalize(vec3_add(
+        forward,
+        vec3_add(vec3_mul(right, px), vec3_mul(up, py)),
+    ));
+
+    // Ray-sphere intersection for unit sphere at origin.
+    // Solve |eye + t*dir|^2 = 1.
+    let b = 2.0 * vec3_dot(eye, ray_dir);
+    let c = vec3_dot(eye, eye) - 1.0;
+    let disc = b * b - 4.0 * c;
+    if disc < 0.0 {
+        return None;
+    }
+    let t = (-b - disc.sqrt()) / 2.0;
+    if t <= 0.0 {
+        return None;
+    }
+    Some(vec3_add(eye, vec3_mul(ray_dir, t)))
+}
+
+fn mat4_mul_vec4(m: [[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
+    // Column-major: m[col][row]
+    [
+        m[0][0] * v[0] + m[1][0] * v[1] + m[2][0] * v[2] + m[3][0] * v[3],
+        m[0][1] * v[0] + m[1][1] * v[1] + m[2][1] * v[2] + m[3][1] * v[3],
+        m[0][2] * v[0] + m[1][2] * v[1] + m[2][2] * v[2] + m[3][2] * v[3],
+        m[0][3] * v[0] + m[1][3] * v[1] + m[2][3] * v[2] + m[3][3] * v[3],
+    ]
+}
+
+#[wasm_bindgen]
+pub fn cursor_move(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
+    let out = js_sys::Object::new();
+    let hit = STATE.with(|state| {
+        let s = state.borrow();
+        ray_hit_globe(s.camera, s.canvas_width, s.canvas_height, x_px, y_px)
+    });
+    if let Some(p) = hit {
+        let (lon, lat) = world_to_lon_lat_deg(p);
+        js_sys::Reflect::set(&out, &JsValue::from_str("hit"), &JsValue::TRUE)?;
+        js_sys::Reflect::set(&out, &JsValue::from_str("lon"), &JsValue::from_f64(lon))?;
+        js_sys::Reflect::set(&out, &JsValue::from_str("lat"), &JsValue::from_f64(lat))?;
+    } else {
+        js_sys::Reflect::set(&out, &JsValue::from_str("hit"), &JsValue::FALSE)?;
+    }
+    Ok(out.into())
+}
+
+#[wasm_bindgen]
+pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
+    let out = js_sys::Object::new();
+
+    let hit = STATE.with(|state| {
+        let s = state.borrow();
+        ray_hit_globe(s.camera, s.canvas_width, s.canvas_height, x_px, y_px)
+    });
+    if hit.is_none() {
+        // Clear selection if nothing hit on globe.
+        STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            s.selection_center = None;
+            s.selection_line_positions = None;
+            s.selection_poly_positions = None;
+        });
+        rebuild_overlays_and_upload();
+        let _ = render_scene();
+        js_sys::Reflect::set(&out, &JsValue::from_str("picked"), &JsValue::FALSE)?;
+        return Ok(out.into());
+    }
+
+    // Prefer: point (near) -> line (near) -> polygon (inside).
+    let picked = STATE.with(|state| {
+        let s = state.borrow();
+        let view_proj = camera_view_proj(s.camera, s.canvas_width, s.canvas_height);
+        let w = s.canvas_width.max(1.0) as f32;
+        let h = s.canvas_height.max(1.0) as f32;
+        let px = x_px as f32;
+        let py = y_px as f32;
+
+        let project = |p: [f32; 3]| -> Option<(f32, f32)> {
+            let clip = mat4_mul_vec4(view_proj, [p[0], p[1], p[2], 1.0]);
+            if clip[3].abs() < 1e-6 {
+                return None;
+            }
+            let ndc_x = clip[0] / clip[3];
+            let ndc_y = clip[1] / clip[3];
+            let sx = (ndc_x * 0.5 + 0.5) * w;
+            let sy = (1.0 - (ndc_y * 0.5 + 0.5)) * h;
+            Some((sx, sy))
+        };
+
+        // 1) Points
+        let mut best_point: Option<([f32; 3], f32)> = None;
+        let mut consider_points = |centers: &[[f32; 3]]| {
+            for &c in centers.iter().take(150_000) {
+                let Some((sx, sy)) = project(c) else {
+                    continue;
+                };
+                let dx = sx - px;
+                let dy = sy - py;
+                let d2 = dx * dx + dy * dy;
+                if best_point.map(|(_, bd2)| d2 < bd2).unwrap_or(true) {
+                    best_point = Some((c, d2));
+                }
+            }
+        };
+        if s.cities_style.visible
+            && let Some(centers) = s.cities_centers.as_deref()
+        {
+            consider_points(centers);
+        }
+        if s.uploaded_points_style.visible
+            && let Some(centers) = s.uploaded_centers.as_deref()
+        {
+            consider_points(centers);
+        }
+        if let Some((c, d2)) = best_point {
+            let radius_px = 12.0f32;
+            if d2 <= radius_px * radius_px {
+                return Some(("point".to_string(), Some(c), None, None));
+            }
+        }
+
+        // 2) Lines (distance to segment)
+        let mut best_line: Option<([f32; 3], [f32; 3], f32)> = None;
+        let mut consider_lines = |pos: &[[f32; 3]]| {
+            for seg in pos.chunks_exact(2).take(200_000) {
+                let a = seg[0];
+                let b = seg[1];
+                let Some((ax, ay)) = project(a) else {
+                    continue;
+                };
+                let Some((bx, by)) = project(b) else {
+                    continue;
+                };
+
+                let abx = bx - ax;
+                let aby = by - ay;
+                let apx = px - ax;
+                let apy = py - ay;
+                let denom = abx * abx + aby * aby;
+                if denom < 1e-6 {
+                    continue;
+                }
+                let mut t = (apx * abx + apy * aby) / denom;
+                t = t.clamp(0.0, 1.0);
+                let cx = ax + t * abx;
+                let cy = ay + t * aby;
+                let dx = px - cx;
+                let dy = py - cy;
+                let d2 = dx * dx + dy * dy;
+                if best_line.map(|(_, _, bd2)| d2 < bd2).unwrap_or(true) {
+                    best_line = Some((a, b, d2));
+                }
+            }
+        };
+        if s.corridors_style.visible
+            && let Some(pos) = s.corridors_positions.as_deref()
+        {
+            consider_lines(pos);
+        }
+        if s.uploaded_corridors_style.visible
+            && let Some(pos) = s.uploaded_corridors_positions.as_deref()
+        {
+            consider_lines(pos);
+        }
+        if let Some((a, b, d2)) = best_line {
+            let radius_px = (s.line_width_px * 0.5 + 6.0).max(6.0);
+            if d2 <= radius_px * radius_px {
+                return Some(("line".to_string(), None, Some(vec![a, b]), None));
+            }
+        }
+
+        // 3) Polygons (test projected triangles)
+        #[allow(clippy::too_many_arguments)]
+        fn point_in_tri(
+            px: f32,
+            py: f32,
+            ax: f32,
+            ay: f32,
+            bx: f32,
+            by: f32,
+            cx: f32,
+            cy: f32,
+        ) -> bool {
+            // Barycentric technique.
+            let v0x = cx - ax;
+            let v0y = cy - ay;
+            let v1x = bx - ax;
+            let v1y = by - ay;
+            let v2x = px - ax;
+            let v2y = py - ay;
+
+            let dot00 = v0x * v0x + v0y * v0y;
+            let dot01 = v0x * v1x + v0y * v1y;
+            let dot02 = v0x * v2x + v0y * v2y;
+            let dot11 = v1x * v1x + v1y * v1y;
+            let dot12 = v1x * v2x + v1y * v2y;
+
+            let denom = dot00 * dot11 - dot01 * dot01;
+            if denom.abs() < 1e-8 {
+                return false;
+            }
+            let inv = 1.0 / denom;
+            let u = (dot11 * dot02 - dot01 * dot12) * inv;
+            let v = (dot00 * dot12 - dot01 * dot02) * inv;
+            u >= 0.0 && v >= 0.0 && (u + v) <= 1.0
+        }
+
+        let consider_polys = |pos: &[[f32; 3]]| -> Option<Vec<[f32; 3]>> {
+            for tri in pos.chunks_exact(3).take(60_000) {
+                let a = tri[0];
+                let b = tri[1];
+                let c = tri[2];
+                let Some((ax, ay)) = project(a) else {
+                    continue;
+                };
+                let Some((bx, by)) = project(b) else {
+                    continue;
+                };
+                let Some((cx, cy)) = project(c) else {
+                    continue;
+                };
+                if point_in_tri(px, py, ax, ay, bx, by, cx, cy) {
+                    return Some(vec![a, b, c]);
+                }
+            }
+            None
+        };
+
+        if s.regions_style.visible
+            && let Some(pos) = s.regions_positions.as_deref()
+            && let Some(tri) = consider_polys(pos)
+        {
+            return Some(("polygon".to_string(), None, None, Some(tri)));
+        }
+        if s.uploaded_regions_style.visible
+            && let Some(pos) = s.uploaded_regions_positions.as_deref()
+            && let Some(tri) = consider_polys(pos)
+        {
+            return Some(("polygon".to_string(), None, None, Some(tri)));
+        }
+
+        None
+    });
+
+    if let Some((kind, point, line, poly)) = picked {
+        STATE.with(|state| {
+            let mut s = state.borrow_mut();
+            s.selection_center = point;
+            s.selection_line_positions = line;
+            s.selection_poly_positions = poly;
+        });
+        rebuild_overlays_and_upload();
+        js_sys::Reflect::set(&out, &JsValue::from_str("picked"), &JsValue::TRUE)?;
+        js_sys::Reflect::set(&out, &JsValue::from_str("kind"), &JsValue::from_str(&kind))?;
+
+        // Prefer returning lon/lat for the picked point itself.
+        if let Some(c) = point {
+            let (lon, lat) = world_to_lon_lat_deg([c[0] as f64, c[1] as f64, c[2] as f64]);
+            js_sys::Reflect::set(&out, &JsValue::from_str("lon"), &JsValue::from_f64(lon))?;
+            js_sys::Reflect::set(&out, &JsValue::from_str("lat"), &JsValue::from_f64(lat))?;
+        } else if let Some(p) = hit {
+            let (lon, lat) = world_to_lon_lat_deg(p);
+            js_sys::Reflect::set(&out, &JsValue::from_str("lon"), &JsValue::from_f64(lon))?;
+            js_sys::Reflect::set(&out, &JsValue::from_str("lat"), &JsValue::from_f64(lat))?;
+        }
+
+        let _ = render_scene();
+        return Ok(out.into());
+    }
+
+    // Clear selection if nothing picked.
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.selection_center = None;
+        s.selection_line_positions = None;
+        s.selection_poly_positions = None;
+    });
+    rebuild_overlays_and_upload();
+    let _ = render_scene();
+    js_sys::Reflect::set(&out, &JsValue::from_str("picked"), &JsValue::FALSE)?;
+    Ok(out.into())
+}
+
+#[wasm_bindgen]
+pub fn load_geojson_file(name: String, geojson_text: String) -> Result<JsValue, JsValue> {
+    let parsed = parse_geojson_any(&geojson_text)?;
+
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.uploaded_name = Some(name.clone());
+        s.uploaded_centers = Some(parsed.centers);
+        s.uploaded_corridors_positions = Some(parsed.corridors_positions);
+        s.uploaded_regions_positions = Some(parsed.regions_positions);
+        s.uploaded_count_points = parsed.count_points;
+        s.uploaded_count_lines = parsed.count_lines;
+        s.uploaded_count_polys = parsed.count_polys;
+
+        // Keep the legacy dataset selection in sync, but visibility is layer-based.
+        s.dataset = "__uploaded__".to_string();
+        s.uploaded_points_style.visible = s.uploaded_count_points > 0;
+        s.uploaded_corridors_style.visible = s.uploaded_count_lines > 0;
+        s.uploaded_regions_style.visible = s.uploaded_count_polys > 0;
+    });
+
+    rebuild_overlays_and_upload();
+    let _ = render_scene();
+
+    let summary = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &summary,
+        &JsValue::from_str("name"),
+        &JsValue::from_str(&name),
+    )?;
+    STATE.with(|state| {
+        let s = state.borrow();
+        let _ = js_sys::Reflect::set(
+            &summary,
+            &JsValue::from_str("points"),
+            &JsValue::from_f64(s.uploaded_count_points as f64),
+        );
+        let _ = js_sys::Reflect::set(
+            &summary,
+            &JsValue::from_str("lines"),
+            &JsValue::from_f64(s.uploaded_count_lines as f64),
+        );
+        let _ = js_sys::Reflect::set(
+            &summary,
+            &JsValue::from_str("polygons"),
+            &JsValue::from_f64(s.uploaded_count_polys as f64),
+        );
+    });
+    Ok(summary.into())
+}
+
+fn parse_coord_pair(v: &serde_json::Value) -> Option<(f64, f64)> {
+    let arr = v.as_array()?;
+    if arr.len() < 2 {
+        return None;
+    }
+    let lon = arr[0].as_f64()?;
+    let lat = arr[1].as_f64()?;
+    Some((lon, lat))
+}
+
+struct ParsedGeo {
+    centers: Vec<[f32; 3]>,
+    corridors_positions: Vec<[f32; 3]>,
+    regions_positions: Vec<[f32; 3]>,
+    count_points: usize,
+    count_lines: usize,
+    count_polys: usize,
+}
+
+fn parse_geojson_any(geojson_text: &str) -> Result<ParsedGeo, JsValue> {
+    let root: serde_json::Value =
+        serde_json::from_str(geojson_text).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    // Extract a list of geometry objects.
+    let mut geometries: Vec<serde_json::Value> = Vec::new();
+    let ty = root
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| JsValue::from_str("GeoJSON missing 'type'"))?;
+
+    match ty {
+        "FeatureCollection" => {
+            let features = root
+                .get("features")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| JsValue::from_str("Invalid FeatureCollection.features"))?;
+            for f in features {
+                if let Some(g) = f.get("geometry") {
+                    geometries.push(g.clone());
+                }
+            }
+        }
+        "Feature" => {
+            let g = root
+                .get("geometry")
+                .ok_or_else(|| JsValue::from_str("Invalid Feature.geometry"))?;
+            geometries.push(g.clone());
+        }
+        _ => {
+            // Treat as a bare geometry.
+            geometries.push(root);
+        }
+    }
+
+    let mut centers: Vec<[f32; 3]> = Vec::new();
+    let mut corridors_positions: Vec<[f32; 3]> = Vec::new();
+    let mut regions_positions: Vec<[f32; 3]> = Vec::new();
+
+    let mut count_points = 0usize;
+    let mut count_lines = 0usize;
+    let mut count_polys = 0usize;
+
+    for g in geometries {
+        let gty = g.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let coords = g.get("coordinates");
+        if coords.is_none() {
+            continue;
+        }
+        let coords = coords.unwrap();
+
+        match gty {
+            "Point" => {
+                if let Some((lon, lat)) = parse_coord_pair(coords) {
+                    centers.push(lon_lat_deg_to_world(lon, lat, 1.0));
+                    count_points += 1;
+                }
+            }
+            "MultiPoint" => {
+                if let Some(arr) = coords.as_array() {
+                    for c in arr {
+                        if let Some((lon, lat)) = parse_coord_pair(c) {
+                            centers.push(lon_lat_deg_to_world(lon, lat, 1.0));
+                            count_points += 1;
+                        }
+                    }
+                }
+            }
+            "LineString" => {
+                corridors_positions.extend(parse_linestring_corridors(coords)?);
+                count_lines += 1;
+            }
+            "MultiLineString" => {
+                let lines = coords
+                    .as_array()
+                    .ok_or_else(|| JsValue::from_str("Invalid MultiLineString coordinates"))?;
+                for l in lines {
+                    corridors_positions.extend(parse_linestring_corridors(l)?);
+                    count_lines += 1;
+                }
+            }
+            "Polygon" => {
+                regions_positions.extend(parse_polygon_regions(coords)?);
+                count_polys += 1;
+            }
+            "MultiPolygon" => {
+                let polys = coords
+                    .as_array()
+                    .ok_or_else(|| JsValue::from_str("Invalid MultiPolygon coordinates"))?;
+                for p in polys {
+                    regions_positions.extend(parse_polygon_regions(p)?);
+                    count_polys += 1;
+                }
+            }
+            _ => {
+                // ignore unsupported geometry types
+            }
+        }
+    }
+
+    // Basic safety caps for big uploads.
+    const MAX_POINTS: usize = 250_000;
+    const MAX_LINE_VERTS: usize = 800_000;
+    const MAX_POLY_VERTS: usize = 800_000;
+    if centers.len() > MAX_POINTS {
+        centers.truncate(MAX_POINTS);
+    }
+    if corridors_positions.len() > MAX_LINE_VERTS {
+        corridors_positions.truncate(MAX_LINE_VERTS);
+    }
+    if regions_positions.len() > MAX_POLY_VERTS {
+        regions_positions.truncate(MAX_POLY_VERTS);
+    }
+
+    Ok(ParsedGeo {
+        centers,
+        corridors_positions,
+        regions_positions,
+        count_points,
+        count_lines,
+        count_polys,
+    })
+}
+
+fn parse_linestring_corridors(coords: &serde_json::Value) -> Result<Vec<[f32; 3]>, JsValue> {
+    let coords = coords
+        .as_array()
+        .ok_or_else(|| JsValue::from_str("Invalid LineString coordinates"))?;
+    if coords.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    let mut pts_unit: Vec<[f32; 3]> = Vec::with_capacity(coords.len());
+    for c in coords {
+        if let Some((lon, lat)) = parse_coord_pair(c) {
+            pts_unit.push(lon_lat_deg_to_world(lon, lat, 1.0));
+        }
+    }
+    if pts_unit.len() < 2 {
+        return Ok(Vec::new());
+    }
+
+    let mut out: Vec<[f32; 3]> = Vec::new();
+
+    for seg in pts_unit.windows(2) {
+        let a = seg[0];
+        let b = seg[1];
+
+        let d = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0);
+        let omega = d.acos();
+        let steps = ((omega / (5f32.to_radians())).ceil() as usize).clamp(4, 128);
+
+        let mut arc: Vec<[f32; 3]> = Vec::with_capacity(steps + 1);
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let u = slerp_unit(a, b, t);
+            arc.push([u[0] * 1.012, u[1] * 1.012, u[2] * 1.012]);
+        }
+
+        out.extend(build_corridor_line_positions(&arc));
+    }
+
+    Ok(out)
+}
+
+fn parse_polygon_regions(coords: &serde_json::Value) -> Result<Vec<[f32; 3]>, JsValue> {
+    let rings = coords
+        .as_array()
+        .ok_or_else(|| JsValue::from_str("Invalid Polygon coordinates"))?;
+    if rings.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    fn drop_closing_duplicate(points: &mut Vec<(f64, f64)>) {
+        if points.len() >= 2 {
+            let first = points[0];
+            let last = *points.last().unwrap();
+            if (first.0 - last.0).abs() < 1e-9 && (first.1 - last.1).abs() < 1e-9 {
+                points.pop();
+            }
+        }
+    }
+
+    let mut rings_ll: Vec<Vec<(f64, f64)>> = Vec::with_capacity(rings.len());
+    for ring in rings {
+        let arr = ring
+            .as_array()
+            .ok_or_else(|| JsValue::from_str("Invalid Polygon ring"))?;
+        let mut pts: Vec<(f64, f64)> = Vec::with_capacity(arr.len());
+        for c in arr {
+            if let Some((lon, lat)) = parse_coord_pair(c) {
+                pts.push((lon, lat));
+            }
+        }
+        drop_closing_duplicate(&mut pts);
+        if pts.len() >= 3 {
+            rings_ll.push(pts);
+        }
+    }
+
+    if rings_ll.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Tangent-plane basis at the first outer vertex.
+    let (lon0, lat0) = rings_ll[0][0];
+    let p0 = lon_lat_deg_to_world(lon0, lat0, 1.0);
+    let n = vec3_normalize([p0[0] as f64, p0[1] as f64, p0[2] as f64]);
+    let up = if n[1].abs() < 0.99 {
+        [0.0, 1.0, 0.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let east = vec3_normalize(vec3_cross(up, n));
+    let north = vec3_cross(n, east);
+
+    fn signed_area(poly: &[(f64, f64)]) -> f64 {
+        let mut a = 0.0;
+        for i in 0..poly.len() {
+            let (x0, y0) = poly[i];
+            let (x1, y1) = poly[(i + 1) % poly.len()];
+            a += x0 * y1 - x1 * y0;
+        }
+        0.5 * a
+    }
+
+    // Project lon/lat to local 2D, and compute world-space vertices for rendering.
+    let mut outer_2d: Vec<(f64, f64)> = Vec::with_capacity(rings_ll[0].len());
+    for &(lon, lat) in &rings_ll[0] {
+        let u = lon_lat_deg_to_world(lon, lat, 1.0);
+        let uf = [u[0] as f64, u[1] as f64, u[2] as f64];
+        outer_2d.push((vec3_dot(uf, east), vec3_dot(uf, north)));
+    }
+    if signed_area(&outer_2d) < 0.0 {
+        rings_ll[0].reverse();
+        outer_2d.reverse();
+    }
+
+    let mut coords_2d: Vec<f64> = Vec::new();
+    let mut world: Vec<[f32; 3]> = Vec::new();
+    let mut holes: Vec<usize> = Vec::new();
+
+    for &(lon, lat) in &rings_ll[0] {
+        let u = lon_lat_deg_to_world(lon, lat, 1.0);
+        let uf = [u[0] as f64, u[1] as f64, u[2] as f64];
+        coords_2d.push(vec3_dot(uf, east));
+        coords_2d.push(vec3_dot(uf, north));
+        world.push(lon_lat_deg_to_world(lon, lat, 1.006));
+    }
+
+    let mut vert_count = rings_ll[0].len();
+    for ring in rings_ll.iter().skip(1) {
+        // Build and orient hole ring in 2D.
+        let mut ring_2d: Vec<(f64, f64)> = Vec::with_capacity(ring.len());
+        for &(lon, lat) in ring {
+            let u = lon_lat_deg_to_world(lon, lat, 1.0);
+            let uf = [u[0] as f64, u[1] as f64, u[2] as f64];
+            ring_2d.push((vec3_dot(uf, east), vec3_dot(uf, north)));
+        }
+        let mut ring_ll = ring.clone();
+        if signed_area(&ring_2d) > 0.0 {
+            ring_ll.reverse();
+            ring_2d.reverse();
+        }
+
+        holes.push(vert_count);
+        for i in 0..ring_ll.len() {
+            coords_2d.push(ring_2d[i].0);
+            coords_2d.push(ring_2d[i].1);
+            let (lon, lat) = ring_ll[i];
+            world.push(lon_lat_deg_to_world(lon, lat, 1.006));
+        }
+        vert_count += ring_ll.len();
+    }
+
+    if world.len() < 3 {
+        return Ok(Vec::new());
+    }
+
+    let indices = earcutr::earcut(&coords_2d, &holes, 2)
+        .map_err(|e| JsValue::from_str(&format!("Failed to triangulate polygon: {e:?}")))?;
+    if indices.len() < 3 {
+        return Ok(Vec::new());
+    }
+
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(indices.len());
+    for tri in indices.chunks_exact(3) {
+        let i0 = tri[0];
+        let i1 = tri[1];
+        let i2 = tri[2];
+        if i0 < world.len() && i1 < world.len() && i2 < world.len() {
+            out.extend([world[i0], world[i1], world[i2]]);
+        }
+    }
+    Ok(out)
 }
 
 #[wasm_bindgen]
@@ -836,14 +1805,13 @@ async fn fetch_cities_centers() -> Result<Vec<[f32; 3]>, JsValue> {
         let lon_deg = coords[0].as_f64().unwrap_or(0.0);
         let lat_deg = coords[1].as_f64().unwrap_or(0.0);
 
-        // Lift slightly off the surface to reduce z-fighting.
-        out.push(lon_lat_deg_to_world(lon_deg, lat_deg, 1.01));
+        out.push(lon_lat_deg_to_world(lon_deg, lat_deg, 1.0));
     }
 
     Ok(out)
 }
 
-async fn fetch_air_corridors_vertices() -> Result<Vec<OverlayVertex>, JsValue> {
+async fn fetch_air_corridors_positions() -> Result<Vec<[f32; 3]>, JsValue> {
     let resp = Request::get("assets/chunks/air_corridors.json")
         .send()
         .await
@@ -856,7 +1824,7 @@ async fn fetch_air_corridors_vertices() -> Result<Vec<OverlayVertex>, JsValue> {
     let fc: GeoJsonFeatureCollection =
         serde_json::from_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    let mut out: Vec<OverlayVertex> = Vec::new();
+    let mut out: Vec<[f32; 3]> = Vec::new();
 
     for f in fc.features {
         if f.geometry.ty != "LineString" {
@@ -905,14 +1873,14 @@ async fn fetch_air_corridors_vertices() -> Result<Vec<OverlayVertex>, JsValue> {
                 arc.push([u[0] * 1.012, u[1] * 1.012, u[2] * 1.012]);
             }
 
-            out.extend(build_corridor_line_vertices(&arc));
+            out.extend(build_corridor_line_positions(&arc));
         }
     }
 
     Ok(out)
 }
 
-async fn fetch_regions_vertices() -> Result<Vec<OverlayVertex>, JsValue> {
+async fn fetch_regions_positions() -> Result<Vec<[f32; 3]>, JsValue> {
     let resp = Request::get("assets/chunks/regions.json")
         .send()
         .await
@@ -925,7 +1893,7 @@ async fn fetch_regions_vertices() -> Result<Vec<OverlayVertex>, JsValue> {
     let fc: GeoJsonFeatureCollection =
         serde_json::from_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    let mut out: Vec<OverlayVertex> = Vec::new();
+    let mut out: Vec<[f32; 3]> = Vec::new();
 
     for f in fc.features {
         if f.geometry.ty != "Polygon" {
@@ -980,12 +1948,7 @@ async fn fetch_regions_vertices() -> Result<Vec<OverlayVertex>, JsValue> {
             let pa = lon_lat_deg_to_world(lona, lata, 1.006);
             let pb = lon_lat_deg_to_world(lonb, latb, 1.006);
 
-            for p in [p0, pa, pb] {
-                out.push(OverlayVertex {
-                    position: p,
-                    _pad: 0.0,
-                });
-            }
+            out.extend([p0, pa, pb]);
         }
     }
 

@@ -40,7 +40,9 @@ mod imp {
 struct Globals {
     view_proj: mat4x4<f32>,
     light_dir: vec3<f32>,
-    _pad: f32,
+    _pad0: f32,
+    viewport: vec2<f32>,
+    _pad1: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -76,7 +78,9 @@ fn fs_main(fs_in: VsOut) -> @location(0) vec4<f32> {
 struct Globals {
     view_proj: mat4x4<f32>,
     light_dir: vec3<f32>,
-    _pad: f32,
+    _pad0: f32,
+    viewport: vec2<f32>,
+    _pad1: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -142,7 +146,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 struct Globals {
     view_proj: mat4x4<f32>,
     light_dir: vec3<f32>,
-    _pad: f32,
+    _pad0: f32,
+    viewport: vec2<f32>,
+    _pad1: vec2<f32>,
 };
 
 @group(0) @binding(0)
@@ -150,17 +156,35 @@ var<storage, read> globals: Globals;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
 };
 
 @vertex
-fn vs_main(@location(0) position: vec3<f32>) -> VsOut {
-    return VsOut(globals.view_proj * vec4<f32>(position, 1.0));
+fn vs_main(
+    @location(0) center: vec3<f32>,
+    @location(1) lift: f32,
+    @location(2) offset_px: vec2<f32>,
+    @location(3) color: vec4<f32>,
+) -> VsOut {
+    let base_r = length(center);
+    let dir = normalize(center);
+    let world_pos = dir * (base_r + lift);
+    var clip = globals.view_proj * vec4<f32>(world_pos, 1.0);
+
+    // Screen-space expansion: convert pixel offsets into NDC, then into clip-space.
+    let ndc = vec2<f32>(
+        (offset_px.x / globals.viewport.x) * 2.0,
+        (offset_px.y / globals.viewport.y) * 2.0,
+    );
+    let delta = vec2<f32>(ndc.x, -ndc.y) * clip.w;
+    clip = vec4<f32>(clip.x + delta.x, clip.y + delta.y, clip.z, clip.w);
+
+    return VsOut(clip, color);
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    // Bright city markers.
-    return vec4<f32>(1.0, 0.25, 0.25, 0.95);
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return in.color;
 }
 "#;
 
@@ -168,21 +192,57 @@ fn fs_main() -> @location(0) vec4<f32> {
 struct Globals {
     view_proj: mat4x4<f32>,
     light_dir: vec3<f32>,
-    _pad: f32,
+    _pad0: f32,
+    viewport: vec2<f32>,
+    _pad1: vec2<f32>,
 };
 
 @group(0) @binding(0)
 var<storage, read> globals: Globals;
 
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
 @vertex
-fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
-    return globals.view_proj * vec4<f32>(position, 1.0);
+fn vs_main(
+    @location(0) a: vec3<f32>,
+    @location(1) b: vec3<f32>,
+    @location(2) along: f32,
+    @location(3) side: f32,
+    @location(4) lift: f32,
+    @location(5) width_px: f32,
+    @location(6) color: vec4<f32>,
+) -> VsOut {
+    // Apply lift radially to both endpoints.
+    let a_dir = normalize(a);
+    let b_dir = normalize(b);
+    let a_world = a_dir * (length(a) + lift);
+    let b_world = b_dir * (length(b) + lift);
+
+    let clip_a = globals.view_proj * vec4<f32>(a_world, 1.0);
+    let clip_b = globals.view_proj * vec4<f32>(b_world, 1.0);
+
+    let ndc_a = clip_a.xy / max(clip_a.w, 1e-6);
+    let ndc_b = clip_b.xy / max(clip_b.w, 1e-6);
+    let dir = ndc_b - ndc_a;
+    let dir_len = max(length(dir), 1e-6);
+    let perp = vec2<f32>(-dir.y, dir.x) / dir_len;
+
+    let half_w = 0.5 * width_px;
+    let px_to_ndc = vec2<f32>(2.0 / globals.viewport.x, 2.0 / globals.viewport.y);
+    let offset_ndc = perp * (half_w * px_to_ndc) * side;
+
+    var clip = mix(clip_a, clip_b, along);
+    let delta = offset_ndc * clip.w;
+    clip = vec4<f32>(clip.x + delta.x, clip.y + delta.y, clip.z, clip.w);
+    return VsOut(clip, color);
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    // Warm yellow corridors.
-    return vec4<f32>(1.0, 0.85, 0.25, 0.9);
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return in.color;
 }
 "#;
 
@@ -190,21 +250,34 @@ fn fs_main() -> @location(0) vec4<f32> {
 struct Globals {
     view_proj: mat4x4<f32>,
     light_dir: vec3<f32>,
-    _pad: f32,
+    _pad0: f32,
+    viewport: vec2<f32>,
+    _pad1: vec2<f32>,
 };
 
 @group(0) @binding(0)
 var<storage, read> globals: Globals;
 
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
 @vertex
-fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
-    return globals.view_proj * vec4<f32>(position, 1.0);
+fn vs_main(
+    @location(0) position: vec3<f32>,
+    @location(1) lift: f32,
+    @location(2) color: vec4<f32>,
+) -> VsOut {
+    let base_r = length(position);
+    let dir = normalize(position);
+    let world_pos = dir * (base_r + lift);
+    return VsOut(globals.view_proj * vec4<f32>(world_pos, 1.0), color);
 }
 
 @fragment
-fn fs_main() -> @location(0) vec4<f32> {
-    // Transparent teal regions.
-    return vec4<f32>(0.10, 0.90, 0.75, 0.30);
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return in.color;
 }
 "#;
 
@@ -224,15 +297,30 @@ fn fs_main() -> @location(0) vec4<f32> {
     #[repr(C)]
     #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct CityVertex {
-        pub position: [f32; 3],
-        pub _pad: f32,
+        pub center: [f32; 3],
+        pub lift: f32,
+        pub offset_px: [f32; 2],
+        pub color: [f32; 4],
     }
 
     #[repr(C)]
     #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct OverlayVertex {
         pub position: [f32; 3],
-        pub _pad: f32,
+        pub lift: f32,
+        pub color: [f32; 4],
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct CorridorVertex {
+        pub a: [f32; 3],
+        pub b: [f32; 3],
+        pub along: f32,
+        pub side: f32,
+        pub lift: f32,
+        pub width_px: f32,
+        pub color: [f32; 4],
     }
 
     #[repr(C)]
@@ -240,7 +328,9 @@ fn fs_main() -> @location(0) vec4<f32> {
     struct Globals {
         view_proj: [[f32; 4]; 4],
         light_dir: [f32; 3],
-        _pad: f32,
+        _pad0: f32,
+        viewport: [f32; 2],
+        _pad1: [f32; 2],
     }
 
     fn create_depth_view(
@@ -338,7 +428,7 @@ fn fs_main() -> @location(0) vec4<f32> {
             let mut prev = None;
             for i in 0..=samples {
                 let t = i as f32 / samples as f32;
-                let lat = (-90.0 + 180.0 * t) as f32;
+                let lat = -90.0 + 180.0 * t;
                 let mut p = lat_lon_to_unit(lat.to_radians(), lon);
                 p[0] *= lift;
                 p[1] *= lift;
@@ -357,7 +447,7 @@ fn fs_main() -> @location(0) vec4<f32> {
             let mut prev = None;
             for i in 0..=samples {
                 let t = i as f32 / samples as f32;
-                let lon = (-180.0 + 360.0 * t) as f32;
+                let lon = -180.0 + 360.0 * t;
                 let mut p = lat_lon_to_unit(lat, lon.to_radians());
                 p[0] *= lift;
                 p[1] *= lift;
@@ -670,11 +760,28 @@ fn fs_main() -> @location(0) vec4<f32> {
                 buffers: &[::wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<CityVertex>() as ::wgpu::BufferAddress,
                     step_mode: ::wgpu::VertexStepMode::Vertex,
-                    attributes: &[::wgpu::VertexAttribute {
-                        format: ::wgpu::VertexFormat::Float32x3,
-                        offset: 0,
-                        shader_location: 0,
-                    }],
+                    attributes: &[
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32x2,
+                            offset: 16,
+                            shader_location: 2,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32x4,
+                            offset: 24,
+                            shader_location: 3,
+                        },
+                    ],
                 }],
             },
             fragment: Some(::wgpu::FragmentState {
@@ -716,13 +823,45 @@ fn fs_main() -> @location(0) vec4<f32> {
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
                 buffers: &[::wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<OverlayVertex>() as ::wgpu::BufferAddress,
+                    array_stride: std::mem::size_of::<CorridorVertex>() as ::wgpu::BufferAddress,
                     step_mode: ::wgpu::VertexStepMode::Vertex,
-                    attributes: &[::wgpu::VertexAttribute {
-                        format: ::wgpu::VertexFormat::Float32x3,
-                        offset: 0,
-                        shader_location: 0,
-                    }],
+                    attributes: &[
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32x3,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32,
+                            offset: 24,
+                            shader_location: 2,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32,
+                            offset: 28,
+                            shader_location: 3,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32,
+                            offset: 32,
+                            shader_location: 4,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32,
+                            offset: 36,
+                            shader_location: 5,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32x4,
+                            offset: 40,
+                            shader_location: 6,
+                        },
+                    ],
                 }],
             },
             fragment: Some(::wgpu::FragmentState {
@@ -736,7 +875,7 @@ fn fs_main() -> @location(0) vec4<f32> {
                 })],
             }),
             primitive: ::wgpu::PrimitiveState {
-                topology: ::wgpu::PrimitiveTopology::LineList,
+                topology: ::wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: ::wgpu::FrontFace::Ccw,
                 cull_mode: None,
@@ -766,11 +905,23 @@ fn fs_main() -> @location(0) vec4<f32> {
                 buffers: &[::wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<OverlayVertex>() as ::wgpu::BufferAddress,
                     step_mode: ::wgpu::VertexStepMode::Vertex,
-                    attributes: &[::wgpu::VertexAttribute {
-                        format: ::wgpu::VertexFormat::Float32x3,
-                        offset: 0,
-                        shader_location: 0,
-                    }],
+                    attributes: &[
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32x4,
+                            offset: 16,
+                            shader_location: 2,
+                        },
+                    ],
                 }],
             },
             fragment: Some(::wgpu::FragmentState {
@@ -828,8 +979,10 @@ fn fs_main() -> @location(0) vec4<f32> {
         let cities_vertex_buffer = device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
             label: Some("atlas-cities-vertices"),
             contents: bytemuck::bytes_of(&CityVertex {
-                position: [0.0, 0.0, 0.0],
-                _pad: 0.0,
+                center: [0.0, 0.0, 0.0],
+                lift: 0.0,
+                offset_px: [0.0, 0.0],
+                color: [1.0, 1.0, 1.0, 1.0],
             }),
             usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
         });
@@ -837,9 +990,14 @@ fn fs_main() -> @location(0) vec4<f32> {
         let corridors_vertex_buffer =
             device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
                 label: Some("atlas-corridors-vertices"),
-                contents: bytemuck::bytes_of(&OverlayVertex {
-                    position: [0.0, 0.0, 0.0],
-                    _pad: 0.0,
+                contents: bytemuck::bytes_of(&CorridorVertex {
+                    a: [0.0, 0.0, 0.0],
+                    b: [0.0, 0.0, 0.0],
+                    along: 0.0,
+                    side: 0.0,
+                    lift: 0.0,
+                    width_px: 1.0,
+                    color: [1.0, 1.0, 1.0, 1.0],
                 }),
                 usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
             });
@@ -849,7 +1007,8 @@ fn fs_main() -> @location(0) vec4<f32> {
                 label: Some("atlas-regions-vertices"),
                 contents: bytemuck::bytes_of(&OverlayVertex {
                     position: [0.0, 0.0, 0.0],
-                    _pad: 0.0,
+                    lift: 0.0,
+                    color: [1.0, 1.0, 1.0, 1.0],
                 }),
                 usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
             });
@@ -858,7 +1017,9 @@ fn fs_main() -> @location(0) vec4<f32> {
         let globals = Globals {
             view_proj: [[0.0; 4]; 4],
             light_dir: [0.4, 0.7, 0.2],
-            _pad: 0.0,
+            _pad0: 0.0,
+            viewport: [1.0, 1.0],
+            _pad1: [0.0, 0.0],
         };
         queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&globals));
 
@@ -909,7 +1070,7 @@ fn fs_main() -> @location(0) vec4<f32> {
         ctx.cities_vertex_count = points.len() as u32;
     }
 
-    pub fn set_corridors_points(ctx: &mut WgpuContext, points: &[OverlayVertex]) {
+    pub fn set_corridors_points(ctx: &mut WgpuContext, points: &[CorridorVertex]) {
         if points.is_empty() {
             ctx.corridors_vertex_count = 0;
             return;
@@ -968,7 +1129,9 @@ fn fs_main() -> @location(0) vec4<f32> {
         let globals = Globals {
             view_proj,
             light_dir,
-            _pad: 0.0,
+            _pad0: 0.0,
+            viewport: [ctx.config.width as f32, ctx.config.height as f32],
+            _pad1: [0.0, 0.0],
         };
         ctx.queue
             .write_buffer(&ctx.uniform_buffer, 0, bytemuck::bytes_of(&globals));
@@ -1192,20 +1355,35 @@ mod imp {
     #[derive(Debug, Copy, Clone)]
     #[allow(dead_code)]
     pub struct CityVertex {
-        pub position: [f32; 3],
-        pub _pad: f32,
+        pub center: [f32; 3],
+        pub lift: f32,
+        pub offset_px: [f32; 2],
+        pub color: [f32; 4],
     }
 
     #[derive(Debug, Copy, Clone)]
     #[allow(dead_code)]
     pub struct OverlayVertex {
         pub position: [f32; 3],
-        pub _pad: f32,
+        pub lift: f32,
+        pub color: [f32; 4],
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    #[allow(dead_code)]
+    pub struct CorridorVertex {
+        pub a: [f32; 3],
+        pub b: [f32; 3],
+        pub along: f32,
+        pub side: f32,
+        pub lift: f32,
+        pub width_px: f32,
+        pub color: [f32; 4],
     }
 
     pub fn set_cities_points(_ctx: &mut WgpuContext, _points: &[CityVertex]) {}
 
-    pub fn set_corridors_points(_ctx: &mut WgpuContext, _points: &[OverlayVertex]) {}
+    pub fn set_corridors_points(_ctx: &mut WgpuContext, _points: &[CorridorVertex]) {}
 
     pub fn set_regions_points(_ctx: &mut WgpuContext, _points: &[OverlayVertex]) {}
 
@@ -1225,6 +1403,6 @@ mod imp {
 }
 
 pub use imp::{
-    CityVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh, resize_wgpu,
-    set_cities_points, set_corridors_points, set_regions_points,
+    CityVertex, CorridorVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh,
+    resize_wgpu, set_cities_points, set_corridors_points, set_regions_points,
 };
