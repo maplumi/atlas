@@ -89,8 +89,8 @@ fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
 
 @fragment
 fn fs_main() -> @location(0) vec4<f32> {
-    // Light blue overlay lines.
-    return vec4<f32>(0.65, 0.85, 1.0, 1.0);
+    // Light blue overlay lines (keep semi-transparent so it doesn't overpower data layers).
+    return vec4<f32>(0.65, 0.85, 1.0, 0.35);
 }
 "#;
 
@@ -329,6 +329,9 @@ fn fs_main() -> @location(0) vec4<f32> {
         let parallel_step_deg: i32 = 15;
         let samples: i32 = 128;
 
+        // Lift the graticule slightly above the globe to avoid z-fighting.
+        let lift = 1.002;
+
         // Meridians: lon fixed, lat varies -90..90.
         for lon_deg in (0..360).step_by(meridian_step_deg as usize) {
             let lon = (lon_deg as f32).to_radians();
@@ -336,7 +339,10 @@ fn fs_main() -> @location(0) vec4<f32> {
             for i in 0..=samples {
                 let t = i as f32 / samples as f32;
                 let lat = (-90.0 + 180.0 * t) as f32;
-                let p = lat_lon_to_unit(lat.to_radians(), lon);
+                let mut p = lat_lon_to_unit(lat.to_radians(), lon);
+                p[0] *= lift;
+                p[1] *= lift;
+                p[2] *= lift;
                 if let Some(prev_p) = prev {
                     verts.push(LineVertex { position: prev_p });
                     verts.push(LineVertex { position: p });
@@ -352,7 +358,10 @@ fn fs_main() -> @location(0) vec4<f32> {
             for i in 0..=samples {
                 let t = i as f32 / samples as f32;
                 let lon = (-180.0 + 360.0 * t) as f32;
-                let p = lat_lon_to_unit(lat, lon.to_radians());
+                let mut p = lat_lon_to_unit(lat, lon.to_radians());
+                p[0] *= lift;
+                p[1] *= lift;
+                p[2] *= lift;
                 if let Some(prev_p) = prev {
                     verts.push(LineVertex { position: prev_p });
                     verts.push(LineVertex { position: p });
@@ -638,9 +647,14 @@ fn fs_main() -> @location(0) vec4<f32> {
                 unclipped_depth: false,
                 conservative: false,
             },
-            // Keep this pipeline depthless; depth bias / depth state can be a source of
-            // backend-specific issues on WebGL.
-            depth_stencil: None,
+            // Depth-test against the globe so back-side lines don't show through.
+            depth_stencil: Some(::wgpu::DepthStencilState {
+                format: ::wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: false,
+                depth_compare: ::wgpu::CompareFunction::LessEqual,
+                stencil: ::wgpu::StencilState::default(),
+                bias: ::wgpu::DepthBiasState::default(),
+            }),
             multisample: ::wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -1026,7 +1040,39 @@ fn fs_main() -> @location(0) vec4<f32> {
             rpass.draw_indexed(0..ctx.index_count, 0, 0..1);
         }
 
-        // Pass 3 (optional): region polygons (depth-tested, alpha blended).
+        // Pass 3 (optional): graticule overlay (depth-tested, alpha blended).
+        if show_graticule {
+            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
+                label: Some("atlas-graticule-pass"),
+                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: ::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(::wgpu::RenderPassDepthStencilAttachment {
+                    view: &ctx.depth_view,
+                    depth_ops: Some(::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            rpass.set_pipeline(&ctx.graticule_pipeline);
+            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            rpass.set_vertex_buffer(0, ctx.graticule_vertex_buffer.slice(..));
+            rpass.draw(0..ctx.graticule_vertex_count, 0..1);
+        }
+
+        // Pass 4 (optional): region polygons (depth-tested, alpha blended).
         if show_regions && ctx.regions_vertex_count > 0 {
             let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
                 label: Some("atlas-regions-pass"),
@@ -1058,7 +1104,7 @@ fn fs_main() -> @location(0) vec4<f32> {
             rpass.draw(0..ctx.regions_vertex_count, 0..1);
         }
 
-        // Pass 4 (optional): air corridors (depth-tested, alpha blended).
+        // Pass 5 (optional): air corridors (depth-tested, alpha blended).
         if show_corridors && ctx.corridors_vertex_count > 0 {
             let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
                 label: Some("atlas-corridors-pass"),
@@ -1088,31 +1134,6 @@ fn fs_main() -> @location(0) vec4<f32> {
             rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
             rpass.set_vertex_buffer(0, ctx.corridors_vertex_buffer.slice(..));
             rpass.draw(0..ctx.corridors_vertex_count, 0..1);
-        }
-
-        // Pass 5 (optional): graticule overlay (depthless, alpha blended).
-        if show_graticule {
-            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
-                label: Some("atlas-graticule-pass"),
-                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: ::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            rpass.set_pipeline(&ctx.graticule_pipeline);
-            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
-            rpass.set_vertex_buffer(0, ctx.graticule_vertex_buffer.slice(..));
-            rpass.draw(0..ctx.graticule_vertex_count, 0..1);
         }
 
         // Pass 6 (optional): city markers (depth-tested triangles).
