@@ -18,6 +18,8 @@ mod imp {
         pub pipeline: ::wgpu::RenderPipeline,
         pub graticule_pipeline: ::wgpu::RenderPipeline,
         pub cities_pipeline: ::wgpu::RenderPipeline,
+        pub corridors_pipeline: ::wgpu::RenderPipeline,
+        pub regions_pipeline: ::wgpu::RenderPipeline,
         pub uniform_buffer: ::wgpu::Buffer,
         pub uniform_bind_group: ::wgpu::BindGroup,
         pub depth_view: ::wgpu::TextureView,
@@ -28,6 +30,10 @@ mod imp {
         pub graticule_vertex_count: u32,
         pub cities_vertex_buffer: ::wgpu::Buffer,
         pub cities_vertex_count: u32,
+        pub corridors_vertex_buffer: ::wgpu::Buffer,
+        pub corridors_vertex_count: u32,
+        pub regions_vertex_buffer: ::wgpu::Buffer,
+        pub regions_vertex_count: u32,
     }
 
     const GLOBE_SHADER: &str = r#"
@@ -158,6 +164,50 @@ fn fs_main() -> @location(0) vec4<f32> {
 }
 "#;
 
+    const CORRIDORS_SHADER: &str = r#"
+struct Globals {
+    view_proj: mat4x4<f32>,
+    light_dir: vec3<f32>,
+    _pad: f32,
+};
+
+@group(0) @binding(0)
+var<storage, read> globals: Globals;
+
+@vertex
+fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+    return globals.view_proj * vec4<f32>(position, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    // Warm yellow corridors.
+    return vec4<f32>(1.0, 0.85, 0.25, 0.9);
+}
+"#;
+
+    const REGIONS_SHADER: &str = r#"
+struct Globals {
+    view_proj: mat4x4<f32>,
+    light_dir: vec3<f32>,
+    _pad: f32,
+};
+
+@group(0) @binding(0)
+var<storage, read> globals: Globals;
+
+@vertex
+fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
+    return globals.view_proj * vec4<f32>(position, 1.0);
+}
+
+@fragment
+fn fs_main() -> @location(0) vec4<f32> {
+    // Transparent teal regions.
+    return vec4<f32>(0.10, 0.90, 0.75, 0.30);
+}
+"#;
+
     #[repr(C)]
     #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
     struct Vertex {
@@ -174,6 +224,13 @@ fn fs_main() -> @location(0) vec4<f32> {
     #[repr(C)]
     #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct CityVertex {
+        pub position: [f32; 3],
+        pub _pad: f32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct OverlayVertex {
         pub position: [f32; 3],
         pub _pad: f32,
     }
@@ -398,6 +455,16 @@ fn fs_main() -> @location(0) vec4<f32> {
             source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(CITIES_SHADER)),
         });
 
+        let corridors_shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
+            label: Some("atlas-corridors-shader"),
+            source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(CORRIDORS_SHADER)),
+        });
+
+        let regions_shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
+            label: Some("atlas-regions-shader"),
+            source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(REGIONS_SHADER)),
+        });
+
         let uniform_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
             label: Some("atlas-globals"),
             size: std::mem::size_of::<Globals>() as u64,
@@ -607,7 +674,103 @@ fn fs_main() -> @location(0) vec4<f32> {
                 })],
             }),
             primitive: ::wgpu::PrimitiveState {
-                topology: ::wgpu::PrimitiveTopology::PointList,
+                topology: ::wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: ::wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: ::wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(::wgpu::DepthStencilState {
+                format: ::wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: false,
+                depth_compare: ::wgpu::CompareFunction::LessEqual,
+                stencil: ::wgpu::StencilState::default(),
+                bias: ::wgpu::DepthBiasState::default(),
+            }),
+            multisample: ::wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let corridors_pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+            label: Some("atlas-corridors-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: ::wgpu::VertexState {
+                module: &corridors_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[::wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<OverlayVertex>() as ::wgpu::BufferAddress,
+                    step_mode: ::wgpu::VertexStepMode::Vertex,
+                    attributes: &[::wgpu::VertexAttribute {
+                        format: ::wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    }],
+                }],
+            },
+            fragment: Some(::wgpu::FragmentState {
+                module: &corridors_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(::wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: ::wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: ::wgpu::PrimitiveState {
+                topology: ::wgpu::PrimitiveTopology::LineList,
+                strip_index_format: None,
+                front_face: ::wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: ::wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(::wgpu::DepthStencilState {
+                format: ::wgpu::TextureFormat::Depth24Plus,
+                depth_write_enabled: false,
+                depth_compare: ::wgpu::CompareFunction::LessEqual,
+                stencil: ::wgpu::StencilState::default(),
+                bias: ::wgpu::DepthBiasState::default(),
+            }),
+            multisample: ::wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let regions_pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+            label: Some("atlas-regions-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: ::wgpu::VertexState {
+                module: &regions_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[::wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<OverlayVertex>() as ::wgpu::BufferAddress,
+                    step_mode: ::wgpu::VertexStepMode::Vertex,
+                    attributes: &[::wgpu::VertexAttribute {
+                        format: ::wgpu::VertexFormat::Float32x3,
+                        offset: 0,
+                        shader_location: 0,
+                    }],
+                }],
+            },
+            fragment: Some(::wgpu::FragmentState {
+                module: &regions_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(::wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: ::wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: ::wgpu::PrimitiveState {
+                topology: ::wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: ::wgpu::FrontFace::Ccw,
                 cull_mode: None,
@@ -657,6 +820,26 @@ fn fs_main() -> @location(0) vec4<f32> {
             usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
         });
 
+        let corridors_vertex_buffer =
+            device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
+                label: Some("atlas-corridors-vertices"),
+                contents: bytemuck::bytes_of(&OverlayVertex {
+                    position: [0.0, 0.0, 0.0],
+                    _pad: 0.0,
+                }),
+                usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            });
+
+        let regions_vertex_buffer =
+            device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
+                label: Some("atlas-regions-vertices"),
+                contents: bytemuck::bytes_of(&OverlayVertex {
+                    position: [0.0, 0.0, 0.0],
+                    _pad: 0.0,
+                }),
+                usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            });
+
         // Initialize uniforms so the first render doesn't read uninitialized memory.
         let globals = Globals {
             view_proj: [[0.0; 4]; 4],
@@ -677,6 +860,8 @@ fn fs_main() -> @location(0) vec4<f32> {
             pipeline,
             graticule_pipeline,
             cities_pipeline,
+            corridors_pipeline,
+            regions_pipeline,
             uniform_buffer,
             uniform_bind_group,
             depth_view,
@@ -687,6 +872,10 @@ fn fs_main() -> @location(0) vec4<f32> {
             graticule_vertex_count: graticule_vertices.len() as u32,
             cities_vertex_buffer,
             cities_vertex_count: 0,
+            corridors_vertex_buffer,
+            corridors_vertex_count: 0,
+            regions_vertex_buffer,
+            regions_vertex_count: 0,
         })
     }
 
@@ -706,6 +895,38 @@ fn fs_main() -> @location(0) vec4<f32> {
         ctx.cities_vertex_count = points.len() as u32;
     }
 
+    pub fn set_corridors_points(ctx: &mut WgpuContext, points: &[OverlayVertex]) {
+        if points.is_empty() {
+            ctx.corridors_vertex_count = 0;
+            return;
+        }
+
+        ctx.corridors_vertex_buffer =
+            ctx.device
+                .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
+                    label: Some("atlas-corridors-vertices"),
+                    contents: bytemuck::cast_slice(points),
+                    usage: ::wgpu::BufferUsages::VERTEX,
+                });
+        ctx.corridors_vertex_count = points.len() as u32;
+    }
+
+    pub fn set_regions_points(ctx: &mut WgpuContext, points: &[OverlayVertex]) {
+        if points.is_empty() {
+            ctx.regions_vertex_count = 0;
+            return;
+        }
+
+        ctx.regions_vertex_buffer =
+            ctx.device
+                .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
+                    label: Some("atlas-regions-vertices"),
+                    contents: bytemuck::cast_slice(points),
+                    usage: ::wgpu::BufferUsages::VERTEX,
+                });
+        ctx.regions_vertex_count = points.len() as u32;
+    }
+
     pub fn resize_wgpu(ctx: &mut WgpuContext, width: u32, height: u32) {
         ctx.config.width = width.max(1);
         ctx.config.height = height.max(1);
@@ -718,6 +939,8 @@ fn fs_main() -> @location(0) vec4<f32> {
         view_proj: [[f32; 4]; 4],
         show_graticule: bool,
         show_cities: bool,
+        show_corridors: bool,
+        show_regions: bool,
     ) -> Result<(), JsValue> {
         let frame = ctx
             .surface
@@ -802,7 +1025,71 @@ fn fs_main() -> @location(0) vec4<f32> {
             rpass.draw_indexed(0..ctx.index_count, 0, 0..1);
         }
 
-        // Pass 3 (optional): graticule overlay (depthless, alpha blended).
+        // Pass 3 (optional): region polygons (depth-tested, alpha blended).
+        if show_regions && ctx.regions_vertex_count > 0 {
+            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
+                label: Some("atlas-regions-pass"),
+                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: ::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(::wgpu::RenderPassDepthStencilAttachment {
+                    view: &ctx.depth_view,
+                    depth_ops: Some(::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            rpass.set_pipeline(&ctx.regions_pipeline);
+            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            rpass.set_vertex_buffer(0, ctx.regions_vertex_buffer.slice(..));
+            rpass.draw(0..ctx.regions_vertex_count, 0..1);
+        }
+
+        // Pass 4 (optional): air corridors (depth-tested, alpha blended).
+        if show_corridors && ctx.corridors_vertex_count > 0 {
+            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
+                label: Some("atlas-corridors-pass"),
+                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: ::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(::wgpu::RenderPassDepthStencilAttachment {
+                    view: &ctx.depth_view,
+                    depth_ops: Some(::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            rpass.set_pipeline(&ctx.corridors_pipeline);
+            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            rpass.set_vertex_buffer(0, ctx.corridors_vertex_buffer.slice(..));
+            rpass.draw(0..ctx.corridors_vertex_count, 0..1);
+        }
+
+        // Pass 5 (optional): graticule overlay (depthless, alpha blended).
         if show_graticule {
             let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
                 label: Some("atlas-graticule-pass"),
@@ -827,7 +1114,7 @@ fn fs_main() -> @location(0) vec4<f32> {
             rpass.draw(0..ctx.graticule_vertex_count, 0..1);
         }
 
-        // Pass 4 (optional): city markers (depth-tested points).
+        // Pass 6 (optional): city markers (depth-tested triangles).
         if show_cities && ctx.cities_vertex_count > 0 {
             let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
                 label: Some("atlas-cities-pass"),
@@ -887,13 +1174,26 @@ mod imp {
         pub _pad: f32,
     }
 
+    #[derive(Debug, Copy, Clone)]
+    #[allow(dead_code)]
+    pub struct OverlayVertex {
+        pub position: [f32; 3],
+        pub _pad: f32,
+    }
+
     pub fn set_cities_points(_ctx: &mut WgpuContext, _points: &[CityVertex]) {}
+
+    pub fn set_corridors_points(_ctx: &mut WgpuContext, _points: &[OverlayVertex]) {}
+
+    pub fn set_regions_points(_ctx: &mut WgpuContext, _points: &[OverlayVertex]) {}
 
     pub fn render_mesh(
         _ctx: &WgpuContext,
         _view_proj: [[f32; 4]; 4],
         _show_graticule: bool,
         _show_cities: bool,
+        _show_corridors: bool,
+        _show_regions: bool,
     ) -> Result<(), JsValue> {
         Err(JsValue::from_str(
             "wgpu rendering is only available on wasm32 targets",
@@ -902,5 +1202,6 @@ mod imp {
 }
 
 pub use imp::{
-    CityVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh, resize_wgpu, set_cities_points,
+    CityVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh, resize_wgpu,
+    set_cities_points, set_corridors_points, set_regions_points,
 };

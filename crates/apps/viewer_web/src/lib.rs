@@ -7,7 +7,8 @@ use wasm_bindgen_futures::spawn_local;
 use formats::SceneManifest;
 mod wgpu;
 use wgpu::{
-    CityVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh, resize_wgpu, set_cities_points,
+    CityVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh, resize_wgpu,
+    set_cities_points, set_corridors_points, set_regions_points,
 };
 
 #[derive(Debug, serde::Deserialize)]
@@ -23,8 +24,8 @@ struct GeoJsonFeature {
 #[derive(Debug, serde::Deserialize)]
 struct GeoJsonGeometry {
     #[serde(rename = "type")]
-    _ty: String,
-    coordinates: [f64; 2],
+    ty: String,
+    coordinates: serde_json::Value,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -56,6 +57,8 @@ pub struct ViewerState {
     pub city_marker_size: f32,
     pub cities_centers: Option<Vec<[f32; 3]>>,
     pub pending_cities: Option<Vec<CityVertex>>,
+    pub pending_corridors: Option<Vec<OverlayVertex>>,
+    pub pending_regions: Option<Vec<OverlayVertex>>,
     pub frame_index: u64,
     pub dt_s: f64,
     pub time_s: f64,
@@ -73,12 +76,97 @@ thread_local! {
         city_marker_size: 0.02,
         cities_centers: None,
         pending_cities: None,
+        pending_corridors: None,
+        pending_regions: None,
         frame_index: 0,
         dt_s: 1.0 / 60.0,
         time_s: 0.0,
         time_end_s: 10.0,
         camera: CameraState::default(),
     });
+}
+
+fn lon_lat_deg_to_world(lon_deg: f64, lat_deg: f64, lift_k: f32) -> [f32; 3] {
+    let lon = (lon_deg as f32).to_radians();
+    let lat = (lat_deg as f32).to_radians();
+
+    // Coordinate system:
+    // - Right-handed
+    // - Origin at globe center
+    // - +Y north
+    // - +X lon=0°,lat=0° (equator / Greenwich)
+    // - +Z lon=90°E,lat=0°
+    let cos_lat = lat.cos();
+    let sin_lat = lat.sin();
+    let cos_lon = lon.cos();
+    let sin_lon = lon.sin();
+    let mut p = [cos_lat * cos_lon, sin_lat, cos_lat * sin_lon];
+
+    p[0] *= lift_k;
+    p[1] *= lift_k;
+    p[2] *= lift_k;
+    p
+}
+
+fn build_corridor_line_vertices(points: &[[f32; 3]]) -> Vec<OverlayVertex> {
+    if points.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut out = Vec::with_capacity((points.len().saturating_sub(1)) * 2);
+    for seg in points.windows(2) {
+        out.push(OverlayVertex {
+            position: seg[0],
+            _pad: 0.0,
+        });
+        out.push(OverlayVertex {
+            position: seg[1],
+            _pad: 0.0,
+        });
+    }
+    out
+}
+
+fn slerp_unit(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
+    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+    fn norm(a: [f32; 3]) -> f32 {
+        dot(a, a).sqrt()
+    }
+    fn normalize(a: [f32; 3]) -> [f32; 3] {
+        let n = norm(a);
+        if n <= 0.0 {
+            [0.0, 0.0, 0.0]
+        } else {
+            [a[0] / n, a[1] / n, a[2] / n]
+        }
+    }
+
+    let a = normalize(a);
+    let b = normalize(b);
+    let mut d = dot(a, b);
+    d = d.clamp(-1.0, 1.0);
+
+    // If the points are almost identical, fall back to linear interpolation.
+    if d > 0.9995 {
+        let v = [
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t,
+        ];
+        return normalize(v);
+    }
+
+    let omega = d.acos();
+    let sin_omega = omega.sin();
+    let s0 = ((1.0 - t) * omega).sin() / sin_omega;
+    let s1 = (t * omega).sin() / sin_omega;
+    normalize([
+        a[0] * s0 + b[0] * s1,
+        a[1] * s0 + b[1] * s1,
+        a[2] * s0 + b[2] * s1,
+    ])
 }
 
 fn build_city_vertices(centers: &[[f32; 3]], size: f32) -> Vec<CityVertex> {
@@ -147,6 +235,24 @@ fn build_city_vertices(centers: &[[f32; 3]], size: f32) -> Vec<CityVertex> {
                 _pad: 0.0,
             });
         }
+
+        // The geometry is symmetric about p, so resizing should never move the center.
+        // (In debug builds, assert the centroid equals p.)
+        debug_assert!({
+            let base = out.len() - 6;
+            let mut c = [0.0f32; 3];
+            for i in 0..6 {
+                let q = out[base + i].position;
+                c[0] += q[0];
+                c[1] += q[1];
+                c[2] += q[2];
+            }
+            c[0] /= 6.0;
+            c[1] /= 6.0;
+            c[2] /= 6.0;
+            let eps = 1e-4;
+            (c[0] - p[0]).abs() < eps && (c[1] - p[1]).abs() < eps && (c[2] - p[2]).abs() < eps
+        });
     }
     out
 }
@@ -269,7 +375,16 @@ fn render_scene() -> Result<(), JsValue> {
         if let Some(ctx) = &state.wgpu {
             let view_proj = camera_view_proj(state.camera, state.canvas_width, state.canvas_height);
             let show_cities = state.dataset == "cities";
-            let _ = render_mesh(ctx, view_proj, state.show_graticule, show_cities);
+            let show_corridors = state.dataset == "air_corridors";
+            let show_regions = state.dataset == "regions";
+            let _ = render_mesh(
+                ctx,
+                view_proj,
+                state.show_graticule,
+                show_cities,
+                show_corridors,
+                show_regions,
+            );
         }
     });
     Ok(())
@@ -370,6 +485,8 @@ pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
 pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
     let dataset = dataset.to_string();
     let should_load_cities = dataset == "cities";
+    let should_load_corridors = dataset == "air_corridors";
+    let should_load_regions = dataset == "regions";
 
     STATE.with(|state| {
         state.borrow_mut().dataset = dataset;
@@ -404,6 +521,60 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
                     s.pending_cities = None;
                 } else {
                     s.pending_cities = Some(points);
+                }
+            });
+
+            let _ = render_scene();
+        });
+    }
+
+    if should_load_corridors {
+        spawn_local(async move {
+            let verts = match fetch_air_corridors_vertices().await {
+                Ok(v) => v,
+                Err(err) => {
+                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                        "Failed to fetch air corridors: {:?}",
+                        err
+                    )));
+                    return;
+                }
+            };
+
+            STATE.with(|state| {
+                let mut s = state.borrow_mut();
+                if let Some(ctx) = &mut s.wgpu {
+                    set_corridors_points(ctx, &verts);
+                    s.pending_corridors = None;
+                } else {
+                    s.pending_corridors = Some(verts);
+                }
+            });
+
+            let _ = render_scene();
+        });
+    }
+
+    if should_load_regions {
+        spawn_local(async move {
+            let verts = match fetch_regions_vertices().await {
+                Ok(v) => v,
+                Err(err) => {
+                    web_sys::console::log_1(&JsValue::from_str(&format!(
+                        "Failed to fetch regions: {:?}",
+                        err
+                    )));
+                    return;
+                }
+            };
+
+            STATE.with(|state| {
+                let mut s = state.borrow_mut();
+                if let Some(ctx) = &mut s.wgpu {
+                    set_regions_points(ctx, &verts);
+                    s.pending_regions = None;
+                } else {
+                    s.pending_regions = Some(verts);
                 }
             });
 
@@ -509,12 +680,26 @@ async fn init_wgpu_inner() -> Result<(), JsValue> {
     STATE.with(|state| {
         let mut s = state.borrow_mut();
         let pending = s.pending_cities.take();
+        let pending_corridors = s.pending_corridors.take();
+        let pending_regions = s.pending_regions.take();
         s.wgpu = Some(ctx);
 
         if let Some(points) = pending
             && let Some(ctx) = &mut s.wgpu
         {
             set_cities_points(ctx, &points);
+        }
+
+        if let Some(points) = pending_corridors
+            && let Some(ctx) = &mut s.wgpu
+        {
+            set_corridors_points(ctx, &points);
+        }
+
+        if let Some(points) = pending_regions
+            && let Some(ctx) = &mut s.wgpu
+        {
+            set_regions_points(ctx, &points);
         }
     });
 
@@ -549,24 +734,171 @@ async fn fetch_cities_centers() -> Result<Vec<[f32; 3]>, JsValue> {
 
     let mut out = Vec::with_capacity(fc.features.len());
     for f in fc.features {
-        let [lon_deg, lat_deg] = f.geometry.coordinates;
-        let lon = (lon_deg as f32).to_radians();
-        let lat = (lat_deg as f32).to_radians();
-
-        // Match the globe's coordinate convention.
-        let cos_lat = lat.cos();
-        let sin_lat = lat.sin();
-        let cos_lon = lon.cos();
-        let sin_lon = lon.sin();
-        let mut p = [cos_lat * cos_lon, sin_lat, cos_lat * sin_lon];
+        if f.geometry.ty != "Point" {
+            continue;
+        }
+        let coords = f
+            .geometry
+            .coordinates
+            .as_array()
+            .ok_or_else(|| JsValue::from_str("Invalid Point coordinates"))?;
+        if coords.len() < 2 {
+            continue;
+        }
+        let lon_deg = coords[0].as_f64().unwrap_or(0.0);
+        let lat_deg = coords[1].as_f64().unwrap_or(0.0);
 
         // Lift slightly off the surface to reduce z-fighting.
-        let k = 1.01;
-        p[0] *= k;
-        p[1] *= k;
-        p[2] *= k;
+        out.push(lon_lat_deg_to_world(lon_deg, lat_deg, 1.01));
+    }
 
-        out.push(p);
+    Ok(out)
+}
+
+async fn fetch_air_corridors_vertices() -> Result<Vec<OverlayVertex>, JsValue> {
+    let resp = Request::get("assets/chunks/air_corridors.json")
+        .send()
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let fc: GeoJsonFeatureCollection =
+        serde_json::from_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let mut out: Vec<OverlayVertex> = Vec::new();
+
+    for f in fc.features {
+        if f.geometry.ty != "LineString" {
+            continue;
+        }
+        let coords = f
+            .geometry
+            .coordinates
+            .as_array()
+            .ok_or_else(|| JsValue::from_str("Invalid LineString coordinates"))?;
+        if coords.len() < 2 {
+            continue;
+        }
+
+        // Convert to unit vectors first so we can draw a great-circle arc.
+        let mut pts_unit: Vec<[f32; 3]> = Vec::with_capacity(coords.len());
+        for c in coords {
+            let arr = c
+                .as_array()
+                .ok_or_else(|| JsValue::from_str("Invalid coordinate pair"))?;
+            if arr.len() < 2 {
+                continue;
+            }
+            let lon_deg = arr[0].as_f64().unwrap_or(0.0);
+            let lat_deg = arr[1].as_f64().unwrap_or(0.0);
+            let p = lon_lat_deg_to_world(lon_deg, lat_deg, 1.0);
+            pts_unit.push(p);
+        }
+        if pts_unit.len() < 2 {
+            continue;
+        }
+
+        // Sample each segment as a great-circle to avoid chords through the globe.
+        for seg in pts_unit.windows(2) {
+            let a = seg[0];
+            let b = seg[1];
+
+            let d = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0);
+            let omega = d.acos();
+            let steps = ((omega / (5f32.to_radians())).ceil() as usize).clamp(4, 128);
+
+            let mut arc: Vec<[f32; 3]> = Vec::with_capacity(steps + 1);
+            for i in 0..=steps {
+                let t = i as f32 / steps as f32;
+                let u = slerp_unit(a, b, t);
+                arc.push([u[0] * 1.012, u[1] * 1.012, u[2] * 1.012]);
+            }
+
+            out.extend(build_corridor_line_vertices(&arc));
+        }
+    }
+
+    Ok(out)
+}
+
+async fn fetch_regions_vertices() -> Result<Vec<OverlayVertex>, JsValue> {
+    let resp = Request::get("assets/chunks/regions.json")
+        .send()
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let fc: GeoJsonFeatureCollection =
+        serde_json::from_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    let mut out: Vec<OverlayVertex> = Vec::new();
+
+    for f in fc.features {
+        if f.geometry.ty != "Polygon" {
+            continue;
+        }
+        let rings = f
+            .geometry
+            .coordinates
+            .as_array()
+            .ok_or_else(|| JsValue::from_str("Invalid Polygon coordinates"))?;
+        if rings.is_empty() {
+            continue;
+        }
+
+        let outer = rings[0]
+            .as_array()
+            .ok_or_else(|| JsValue::from_str("Invalid Polygon ring"))?;
+        if outer.len() < 4 {
+            continue;
+        }
+
+        // Drop the duplicated closing vertex if present.
+        let mut verts_ll: Vec<(f64, f64)> = Vec::with_capacity(outer.len());
+        for c in outer {
+            let arr = c
+                .as_array()
+                .ok_or_else(|| JsValue::from_str("Invalid coordinate pair"))?;
+            if arr.len() < 2 {
+                continue;
+            }
+            let lon_deg = arr[0].as_f64().unwrap_or(0.0);
+            let lat_deg = arr[1].as_f64().unwrap_or(0.0);
+            verts_ll.push((lon_deg, lat_deg));
+        }
+        if verts_ll.len() >= 2 {
+            let first = verts_ll[0];
+            let last = *verts_ll.last().unwrap();
+            if (first.0 - last.0).abs() < 1e-9 && (first.1 - last.1).abs() < 1e-9 {
+                verts_ll.pop();
+            }
+        }
+        if verts_ll.len() < 3 {
+            continue;
+        }
+
+        // Simple fan triangulation (works for the demo rectangles).
+        let (lon0, lat0) = verts_ll[0];
+        let p0 = lon_lat_deg_to_world(lon0, lat0, 1.006);
+        for i in 1..(verts_ll.len() - 1) {
+            let (lona, lata) = verts_ll[i];
+            let (lonb, latb) = verts_ll[i + 1];
+            let pa = lon_lat_deg_to_world(lona, lata, 1.006);
+            let pb = lon_lat_deg_to_world(lonb, latb, 1.006);
+
+            for p in [p0, pa, pb] {
+                out.push(OverlayVertex {
+                    position: p,
+                    _pad: 0.0,
+                });
+            }
+        }
     }
 
     Ok(out)
