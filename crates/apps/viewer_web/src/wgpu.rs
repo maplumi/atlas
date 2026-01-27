@@ -99,6 +99,17 @@ fn fs_main() -> @location(0) vec4<f32> {
 "#;
 
     const STARS_SHADER: &str = r#"
+struct Globals {
+    view_proj: mat4x4<f32>,
+    light_dir: vec3<f32>,
+    _pad0: f32,
+    viewport: vec2<f32>,
+    _pad1: vec2<f32>,
+};
+
+@group(0) @binding(0)
+var<storage, read> globals: Globals;
+
 fn hash_u32(x_in: u32) -> u32 {
     // 32-bit integer mix (non-linear) to avoid visible correlation patterns.
     var x = x_in;
@@ -121,19 +132,27 @@ struct VsOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
-    // Deterministic pseudo-random star positions in clip space.
-    // Use different salts per component to avoid structure.
+    // Deterministic pseudo-random star directions on the unit sphere.
+    // These are rendered as an "infinite" background by using w=0 so camera
+    // translation does not affect them, but camera rotation does.
     let rx = hash01(vid ^ 0x68bc21ebu);
     let ry = hash01(vid ^ 0x02e5be93u);
     let rb = hash01(vid ^ 0x9e3779b9u);
 
-    let x = rx * 2.0 - 1.0;
-    let y = ry * 2.0 - 1.0;
+    // Sample uniformly on sphere via cos(theta) and phi.
+    let z = ry * 2.0 - 1.0;
+    let phi = 6.2831853 * rx;
+    let r = sqrt(max(1.0 - z * z, 0.0));
+    let dir = vec3<f32>(r * cos(phi), r * sin(phi), z);
     // Slightly vary brightness; keep faint stars common.
     // Keep overall brightness conservative to avoid a "snow" look.
     let a = 0.03 + 0.22 * rb * rb;
 
-    return VsOut(vec4<f32>(x, y, 0.9999, 1.0), a);
+    // Project as a direction-at-infinity.
+    var clip = globals.view_proj * vec4<f32>(dir, 0.0);
+    // Push to far plane to keep it behind everything.
+    clip = vec4<f32>(clip.x, clip.y, clip.w, clip.w);
+    return VsOut(clip, a);
 }
 
 @fragment
@@ -604,7 +623,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let stars_pipeline_layout =
             device.create_pipeline_layout(&::wgpu::PipelineLayoutDescriptor {
                 label: Some("atlas-stars-pipeline-layout"),
-                bind_group_layouts: &[],
+                bind_group_layouts: &[&uniform_bind_group_layout],
                 immediate_size: 0,
             });
 
@@ -1167,6 +1186,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             });
 
             rpass.set_pipeline(&ctx.stars_pipeline);
+            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
             rpass.draw(0..ctx.stars_count, 0..1);
         }
 
