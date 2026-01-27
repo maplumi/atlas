@@ -5,6 +5,9 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
 use formats::SceneManifest;
+use foundation::math::{WGS84_A, WGS84_B, ecef_to_geodetic};
+use layers::vector::VectorLayer;
+use scene::components::VectorGeometryKind;
 mod wgpu;
 use wgpu::{
     CityVertex, CorridorVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh,
@@ -15,24 +18,8 @@ use wgpu::{
 struct LayerStyle {
     visible: bool,
     color: [f32; 4],
+    // UI lift is a fraction of Earth radius (legacy semantics).
     lift: f32,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GeoJsonFeatureCollection {
-    features: Vec<GeoJsonFeature>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GeoJsonFeature {
-    geometry: GeoJsonGeometry,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct GeoJsonGeometry {
-    #[serde(rename = "type")]
-    ty: String,
-    coordinates: serde_json::Value,
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -48,7 +35,7 @@ impl Default for CameraState {
         Self {
             yaw_rad: 0.6,
             pitch_rad: 0.3,
-            distance: 3.0,
+            distance: 3.0 * WGS84_A,
             target: [0.0, 0.0, 0.0],
         }
     }
@@ -77,7 +64,14 @@ struct ViewerState {
     uploaded_corridors_style: LayerStyle,
     uploaded_regions_style: LayerStyle,
     selection_style: LayerStyle,
-    // CPU-side geometry (positions on/near the unit sphere).
+
+    // Engine worlds (source-of-truth). Renderable geometry must be derived via `layers`.
+    cities_world: Option<scene::World>,
+    corridors_world: Option<scene::World>,
+    regions_world: Option<scene::World>,
+    uploaded_world: Option<scene::World>,
+
+    // CPU-side cached geometry in viewer coordinates.
     cities_centers: Option<Vec<[f32; 3]>>,
     corridors_positions: Option<Vec<[f32; 3]>>,
     regions_positions: Option<Vec<[f32; 3]>>,
@@ -107,7 +101,7 @@ struct ViewerState {
 
 thread_local! {
     static STATE: RefCell<ViewerState> = RefCell::new(ViewerState {
-        dataset: "demo-city".to_string(),
+        dataset: "cities".to_string(),
         canvas_width: 1280.0,
         canvas_height: 720.0,
         wgpu: None,
@@ -124,9 +118,15 @@ thread_local! {
         uploaded_regions_style: LayerStyle { visible: false, color: [0.45, 0.75, 1.00, 0.25], lift: 0.0 },
         selection_style: LayerStyle { visible: true, color: [1.0, 1.0, 1.0, 0.95], lift: 0.02 },
 
+        cities_world: None,
+        corridors_world: None,
+        regions_world: None,
+        uploaded_world: None,
+
         cities_centers: None,
         corridors_positions: None,
         regions_positions: None,
+
         uploaded_name: None,
         uploaded_centers: None,
         uploaded_corridors_positions: None,
@@ -147,154 +147,6 @@ thread_local! {
         time_end_s: 10.0,
         camera: CameraState::default(),
     });
-}
-
-fn lon_lat_deg_to_world(lon_deg: f64, lat_deg: f64, lift_k: f32) -> [f32; 3] {
-    let lon = (lon_deg as f32).to_radians();
-    let lat = (lat_deg as f32).to_radians();
-
-    // Coordinate system:
-    // - Right-handed
-    // - Origin at globe center
-    // - +Y north
-    // - +X lon=0°,lat=0° (equator / Greenwich)
-    // - +Z lon=90°E,lat=0°
-    let cos_lat = lat.cos();
-    let sin_lat = lat.sin();
-    let cos_lon = lon.cos();
-    let sin_lon = lon.sin();
-    let mut p = [cos_lat * cos_lon, sin_lat, cos_lat * sin_lon];
-
-    p[0] *= lift_k;
-    p[1] *= lift_k;
-    p[2] *= lift_k;
-    p
-}
-
-fn current_sun_direction_world() -> Option<[f32; 3]> {
-    // Compute an approximate sun direction in the same coordinate system as the globe.
-    // This is a standard low-cost solar position approximation (good enough for lighting).
-    //
-    // Returns a unit vector pointing from Earth center toward the Sun.
-
-    fn deg_to_rad(d: f64) -> f64 {
-        d.to_radians()
-    }
-
-    fn rad_to_deg(r: f64) -> f64 {
-        r.to_degrees()
-    }
-
-    fn wrap_360(mut d: f64) -> f64 {
-        d %= 360.0;
-        if d < 0.0 {
-            d += 360.0;
-        }
-        d
-    }
-
-    fn wrap_180(mut d: f64) -> f64 {
-        d = wrap_360(d);
-        if d > 180.0 {
-            d -= 360.0;
-        }
-        d
-    }
-
-    let ms = js_sys::Date::new_0().get_time();
-    if !ms.is_finite() {
-        return None;
-    }
-
-    // Julian Day from Unix epoch (1970-01-01T00:00:00Z) == 2440587.5
-    let jd = 2440587.5 + (ms / 86_400_000.0);
-    let n = jd - 2451545.0; // days since J2000
-    let t = n / 36525.0;
-
-    // Mean longitude and anomaly (degrees)
-    let l = wrap_360(280.46 + 0.9856474 * n);
-    let g = wrap_360(357.528 + 0.9856003 * n);
-
-    // Ecliptic longitude (degrees)
-    let lambda = wrap_360(l + 1.915 * deg_to_rad(g).sin() + 0.020 * deg_to_rad(2.0 * g).sin());
-    // Obliquity of the ecliptic (degrees)
-    let eps = 23.439 - 0.0000004 * n;
-
-    // Right ascension & declination
-    let lambda_r = deg_to_rad(lambda);
-    let eps_r = deg_to_rad(eps);
-    let alpha_r = (eps_r.cos() * lambda_r.sin()).atan2(lambda_r.cos());
-    let delta_r = (eps_r.sin() * lambda_r.sin()).asin();
-
-    let alpha_deg = wrap_360(rad_to_deg(alpha_r));
-    let delta_deg = rad_to_deg(delta_r);
-
-    // Greenwich Mean Sidereal Time (degrees)
-    let gmst = wrap_360(
-        280.46061837 + 360.98564736629 * (jd - 2451545.0) + 0.000387933 * t * t
-            - (t * t * t) / 38_710_000.0,
-    );
-
-    // Subsolar longitude: alpha - GMST (degrees east).
-    let subsolar_lon = wrap_180(alpha_deg - gmst);
-    let subsolar_lat = delta_deg;
-
-    Some(lon_lat_deg_to_world(subsolar_lon, subsolar_lat, 1.0))
-}
-
-fn build_corridor_line_positions(points: &[[f32; 3]]) -> Vec<[f32; 3]> {
-    if points.len() < 2 {
-        return Vec::new();
-    }
-
-    let mut out: Vec<[f32; 3]> = Vec::with_capacity((points.len().saturating_sub(1)) * 2);
-    for seg in points.windows(2) {
-        out.push(seg[0]);
-        out.push(seg[1]);
-    }
-    out
-}
-
-fn slerp_unit(a: [f32; 3], b: [f32; 3], t: f32) -> [f32; 3] {
-    fn dot(a: [f32; 3], b: [f32; 3]) -> f32 {
-        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-    }
-    fn norm(a: [f32; 3]) -> f32 {
-        dot(a, a).sqrt()
-    }
-    fn normalize(a: [f32; 3]) -> [f32; 3] {
-        let n = norm(a);
-        if n <= 0.0 {
-            [0.0, 0.0, 0.0]
-        } else {
-            [a[0] / n, a[1] / n, a[2] / n]
-        }
-    }
-
-    let a = normalize(a);
-    let b = normalize(b);
-    let mut d = dot(a, b);
-    d = d.clamp(-1.0, 1.0);
-
-    // If the points are almost identical, fall back to linear interpolation.
-    if d > 0.9995 {
-        let v = [
-            a[0] + (b[0] - a[0]) * t,
-            a[1] + (b[1] - a[1]) * t,
-            a[2] + (b[2] - a[2]) * t,
-        ];
-        return normalize(v);
-    }
-
-    let omega = d.acos();
-    let sin_omega = omega.sin();
-    let s0 = ((1.0 - t) * omega).sin() / sin_omega;
-    let s1 = (t * omega).sin() / sin_omega;
-    normalize([
-        a[0] * s0 + b[0] * s1,
-        a[1] * s0 + b[1] * s1,
-        a[2] * s0 + b[2] * s1,
-    ])
 }
 
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
@@ -360,11 +212,6 @@ fn mat4_perspective_rh_z0(fov_y_rad: f64, aspect: f64, near: f64, far: f64) -> [
     let m23 = ((near * far) / (near - far)) as f32;
 
     // Column-major (WGSL) perspective matrix, RH, depth range [0, 1].
-    // This is the column-major form of:
-    // [ m00,  0,   0,   0 ]
-    // [  0,  m11,  0,   0 ]
-    // [  0,   0,  m22, m23 ]
-    // [  0,   0,  -1,   0 ]
     [
         [m00, 0.0, 0.0, 0.0],
         [0.0, m11, 0.0, 0.0],
@@ -405,8 +252,76 @@ fn camera_view_proj(camera: CameraState, canvas_width: f64, canvas_height: f64) 
     ];
     let eye = vec3_add(camera.target, vec3_mul(dir, camera.distance));
     let view = mat4_look_at_rh(eye, camera.target, [0.0, 1.0, 0.0]);
-    let proj = mat4_perspective_rh_z0(45f64.to_radians(), aspect, 0.05, 10_000.0);
+
+    // Dynamic clipping planes to keep depth precision reasonable across Earth-scale zoom.
+    // A fixed far plane (Earth * 100s) makes the depth buffer too coarse and causes
+    // severe z-fighting between the globe and draped overlays.
+    let near = (camera.distance * 0.001).max(10.0);
+    let far = (camera.distance * 4.0 + 4.0 * WGS84_A).max(near + 1.0);
+    let proj = mat4_perspective_rh_z0(45f64.to_radians(), aspect, near, far);
     mat4_mul(proj, view)
+}
+
+fn current_sun_direction_world() -> Option<[f32; 3]> {
+    // Low-cost solar position approximation.
+    fn wrap_360(mut d: f64) -> f64 {
+        d %= 360.0;
+        if d < 0.0 {
+            d += 360.0;
+        }
+        d
+    }
+    fn wrap_180(mut d: f64) -> f64 {
+        d = wrap_360(d);
+        if d > 180.0 {
+            d -= 360.0;
+        }
+        d
+    }
+
+    let ms = js_sys::Date::new_0().get_time();
+    if !ms.is_finite() {
+        return None;
+    }
+
+    // Julian Day from Unix epoch (1970-01-01T00:00:00Z) == 2440587.5
+    let jd = 2440587.5 + (ms / 86_400_000.0);
+    let n = jd - 2451545.0; // days since J2000
+
+    // Mean longitude and anomaly (degrees)
+    let l = wrap_360(280.46 + 0.9856474 * n);
+    let g = wrap_360(357.528 + 0.9856003 * n);
+
+    // Ecliptic longitude (degrees)
+    let lambda = wrap_360(l + 1.915 * g.to_radians().sin() + 0.020 * (2.0 * g).to_radians().sin());
+    // Obliquity of the ecliptic (degrees)
+    let epsilon = 23.439 - 0.0000004 * n;
+
+    // Right ascension (alpha) and declination (delta)
+    let lambda_rad = lambda.to_radians();
+    let eps_rad = epsilon.to_radians();
+    let alpha = (eps_rad.cos() * lambda_rad.sin())
+        .atan2(lambda_rad.cos())
+        .to_degrees();
+    let delta = (eps_rad.sin() * lambda_rad.sin()).asin().to_degrees();
+
+    // Greenwich Mean Sidereal Time (degrees)
+    let t = (jd - 2451545.0) / 36525.0;
+    let gmst = wrap_360(
+        280.46061837 + 360.98564736629 * (jd - 2451545.0) + 0.000387933 * t * t
+            - (t * t * t) / 38710000.0,
+    );
+
+    // Subsolar point
+    let subsolar_lon = wrap_180(alpha - gmst);
+    let subsolar_lat = delta;
+
+    // Convert to a unit direction in ECEF, then map to viewer coords: (x, z, -y)
+    let lon = subsolar_lon.to_radians();
+    let lat = subsolar_lat.to_radians();
+    let cos_lat = lat.cos();
+    let ecef = [cos_lat * lon.cos(), cos_lat * lon.sin(), lat.sin()];
+    Some([ecef[0] as f32, ecef[2] as f32, (-ecef[1]) as f32])
 }
 
 fn render_scene() -> Result<(), JsValue> {
@@ -480,6 +395,21 @@ fn build_city_vertices(
     out
 }
 
+fn ecef_vec3_to_viewer_f32(p: foundation::math::Vec3) -> [f32; 3] {
+    // Viewer coordinates are a permuted ECEF: viewer = (x, z, -y)
+    [p.x as f32, p.z as f32, (-p.y) as f32]
+}
+
+fn world_from_vector_chunk(
+    chunk: &formats::VectorChunk,
+    expected_kind: Option<VectorGeometryKind>,
+) -> scene::World {
+    let mut world = scene::World::new();
+    scene::prefabs::spawn_wgs84_globe(&mut world);
+    formats::ingest_vector_chunk(&mut world, chunk, expected_kind);
+    world
+}
+
 fn build_corridor_vertices(
     positions_line_list: &[[f32; 3]],
     width_px: f32,
@@ -487,6 +417,12 @@ fn build_corridor_vertices(
     lift: f32,
 ) -> Vec<CorridorVertex> {
     let width_px = width_px.clamp(1.0, 24.0);
+    // `lift` is a fraction of Earth radius (legacy UI semantics); convert to meters.
+    let mut lift_m = lift * (WGS84_A as f32);
+    if lift_m <= 0.0 {
+        // Keep corridors slightly above the surface to avoid z-fighting.
+        lift_m = 50.0;
+    }
     let seg_count = positions_line_list.len() / 2;
     let mut out: Vec<CorridorVertex> = Vec::with_capacity(seg_count.saturating_mul(6));
 
@@ -507,7 +443,7 @@ fn build_corridor_vertices(
             b,
             along: 0.0,
             side: -1.0,
-            lift,
+            lift: lift_m,
             width_px,
             color,
         };
@@ -533,6 +469,70 @@ fn build_corridor_vertices(
 fn rebuild_overlays_and_upload() {
     STATE.with(|state| {
         let mut s = state.borrow_mut();
+
+        // Refresh cached viewer-space geometry from the engine worlds.
+        // This ensures all rendered features flow through `layers`.
+        let layer = VectorLayer::new(1);
+
+        // Built-ins
+        s.cities_centers = s.cities_world.as_ref().map(|w| {
+            let snap = layer.extract(w);
+            snap.points
+                .into_iter()
+                .map(ecef_vec3_to_viewer_f32)
+                .collect::<Vec<_>>()
+        });
+
+        s.corridors_positions = s.corridors_world.as_ref().map(|w| {
+            let snap = layer.extract(w);
+            let mut out: Vec<[f32; 3]> = Vec::new();
+            for line in snap.lines {
+                for seg in line.windows(2) {
+                    out.push(ecef_vec3_to_viewer_f32(seg[0]));
+                    out.push(ecef_vec3_to_viewer_f32(seg[1]));
+                }
+            }
+            out
+        });
+
+        s.regions_positions = s.regions_world.as_ref().map(|w| {
+            let snap = layer.extract(w);
+            snap.area_triangles
+                .into_iter()
+                .map(ecef_vec3_to_viewer_f32)
+                .collect::<Vec<_>>()
+        });
+
+        // Uploaded
+        if let Some(w) = s.uploaded_world.as_ref() {
+            let snap = layer.extract(w);
+            s.uploaded_centers = Some(
+                snap.points
+                    .into_iter()
+                    .map(ecef_vec3_to_viewer_f32)
+                    .collect::<Vec<_>>(),
+            );
+            s.uploaded_corridors_positions = Some({
+                let mut out: Vec<[f32; 3]> = Vec::new();
+                for line in snap.lines {
+                    for seg in line.windows(2) {
+                        out.push(ecef_vec3_to_viewer_f32(seg[0]));
+                        out.push(ecef_vec3_to_viewer_f32(seg[1]));
+                    }
+                }
+                out
+            });
+            s.uploaded_regions_positions = Some(
+                snap.area_triangles
+                    .into_iter()
+                    .map(ecef_vec3_to_viewer_f32)
+                    .collect::<Vec<_>>(),
+            );
+        } else {
+            s.uploaded_centers = None;
+            s.uploaded_corridors_positions = None;
+            s.uploaded_regions_positions = None;
+        }
 
         let mut points: Vec<CityVertex> = Vec::new();
         let mut lines: Vec<CorridorVertex> = Vec::new();
@@ -607,18 +607,27 @@ fn rebuild_overlays_and_upload() {
         if s.regions_style.visible
             && let Some(pos) = s.regions_positions.as_deref()
         {
+            let mut lift_m = s.regions_style.lift * (WGS84_A as f32);
+            if lift_m <= 0.0 {
+                // Keep area fills slightly above the surface to avoid z-fighting.
+                lift_m = 50.0;
+            }
             polys.extend(pos.iter().map(|&p| OverlayVertex {
                 position: p,
-                lift: s.regions_style.lift,
+                lift: lift_m,
                 color: s.regions_style.color,
             }));
         }
         if s.uploaded_regions_style.visible
             && let Some(pos) = s.uploaded_regions_positions.as_deref()
         {
+            let mut lift_m = s.uploaded_regions_style.lift * (WGS84_A as f32);
+            if lift_m <= 0.0 {
+                lift_m = 50.0;
+            }
             polys.extend(pos.iter().map(|&p| OverlayVertex {
                 position: p,
-                lift: s.uploaded_regions_style.lift,
+                lift: lift_m,
                 color: s.uploaded_regions_style.color,
             }));
         }
@@ -626,9 +635,10 @@ fn rebuild_overlays_and_upload() {
             && let Some(pos) = s.selection_poly_positions.as_deref()
             && !pos.is_empty()
         {
+            let lift_m = (s.selection_style.lift + 0.03) * (WGS84_A as f32);
             polys.extend(pos.iter().map(|&p| OverlayVertex {
                 position: p,
-                lift: s.selection_style.lift + 0.03,
+                lift: lift_m,
                 color: s.selection_style.color,
             }));
         }
@@ -733,8 +743,45 @@ pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
 pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
     STATE.with(|state| {
         let mut s = state.borrow_mut();
+        let cam = s.camera;
         let zoom = (wheel_delta_y * 0.0015).exp();
-        s.camera.distance = clamp(s.camera.distance * zoom, 0.25, 5000.0);
+
+        // Keep this a soft clamp (mostly for UX), but also ensure the *camera eye*
+        // cannot go inside the globe when orbiting around/near it.
+        let min_dist = 10.0;
+        let max_dist = 200.0 * WGS84_A;
+        let mut dist = clamp(cam.distance * zoom, min_dist, max_dist);
+
+        let dir_cam = [
+            cam.pitch_rad.cos() * cam.yaw_rad.cos(),
+            cam.pitch_rad.sin(),
+            cam.pitch_rad.cos() * cam.yaw_rad.sin(),
+        ];
+        let dir_cam = vec3_normalize(dir_cam);
+        let eye = vec3_add(cam.target, vec3_mul(dir_cam, dist));
+
+        // Conservative: enforce the camera is outside a sphere of radius WGS84_A.
+        // (Good enough to prevent pathological inside-the-globe behavior, even
+        // though the visual globe is an ellipsoid.)
+        let min_eye_r = 1.001 * WGS84_A;
+        let eye_r = vec3_dot(eye, eye).sqrt();
+        if eye_r < min_eye_r {
+            // Solve |target + dir*t| = min_eye_r for t, and move to the exiting root.
+            let b = 2.0 * vec3_dot(cam.target, dir_cam);
+            let c = vec3_dot(cam.target, cam.target) - min_eye_r * min_eye_r;
+            let disc = b * b - 4.0 * c;
+            if disc >= 0.0 {
+                let sdisc = disc.sqrt();
+                let t0 = (-b - sdisc) / 2.0;
+                let t1 = (-b + sdisc) / 2.0;
+                let t = t0.max(t1);
+                if t.is_finite() && t > 0.0 {
+                    dist = clamp(t, min_dist, max_dist);
+                }
+            }
+        }
+
+        s.camera.distance = dist;
     });
     render_scene()
 }
@@ -753,7 +800,7 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 
     if should_load_cities {
         spawn_local(async move {
-            let centers = match fetch_cities_centers().await {
+            let chunk = match fetch_vector_chunk("assets/chunks/cities.json").await {
                 Ok(c) => c,
                 Err(err) => {
                     web_sys::console::log_1(&JsValue::from_str(&format!(
@@ -764,9 +811,11 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
                 }
             };
 
+            let world = world_from_vector_chunk(&chunk, Some(VectorGeometryKind::Point));
+
             STATE.with(|state| {
                 let mut s = state.borrow_mut();
-                s.cities_centers = Some(centers);
+                s.cities_world = Some(world);
                 s.cities_style.visible = true;
             });
             rebuild_overlays_and_upload();
@@ -776,8 +825,8 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 
     if should_load_corridors {
         spawn_local(async move {
-            let verts = match fetch_air_corridors_positions().await {
-                Ok(v) => v,
+            let chunk = match fetch_vector_chunk("assets/chunks/air_corridors.json").await {
+                Ok(c) => c,
                 Err(err) => {
                     web_sys::console::log_1(&JsValue::from_str(&format!(
                         "Failed to fetch air corridors: {:?}",
@@ -787,9 +836,11 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
                 }
             };
 
+            let world = world_from_vector_chunk(&chunk, Some(VectorGeometryKind::Line));
+
             STATE.with(|state| {
                 let mut s = state.borrow_mut();
-                s.corridors_positions = Some(verts);
+                s.corridors_world = Some(world);
                 s.corridors_style.visible = true;
             });
             rebuild_overlays_and_upload();
@@ -799,8 +850,8 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 
     if should_load_regions {
         spawn_local(async move {
-            let verts = match fetch_regions_positions().await {
-                Ok(v) => v,
+            let chunk = match fetch_vector_chunk("assets/chunks/regions.json").await {
+                Ok(c) => c,
                 Err(err) => {
                     web_sys::console::log_1(&JsValue::from_str(&format!(
                         "Failed to fetch regions: {:?}",
@@ -810,9 +861,11 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
                 }
             };
 
+            let world = world_from_vector_chunk(&chunk, Some(VectorGeometryKind::Area));
+
             STATE.with(|state| {
                 let mut s = state.borrow_mut();
-                s.regions_positions = Some(verts);
+                s.regions_world = Some(world);
                 s.regions_style.visible = true;
             });
             rebuild_overlays_and_upload();
@@ -823,9 +876,9 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
     if should_load_uploaded {
         STATE.with(|state| {
             let mut s = state.borrow_mut();
-            s.uploaded_points_style.visible = true;
-            s.uploaded_corridors_style.visible = true;
-            s.uploaded_regions_style.visible = true;
+            s.uploaded_points_style.visible = s.uploaded_count_points > 0;
+            s.uploaded_corridors_style.visible = s.uploaded_count_lines > 0;
+            s.uploaded_regions_style.visible = s.uploaded_count_polys > 0;
         });
         rebuild_overlays_and_upload();
     }
@@ -985,13 +1038,10 @@ pub fn get_uploaded_summary() -> Result<JsValue, JsValue> {
 }
 
 fn world_to_lon_lat_deg(p: [f64; 3]) -> (f64, f64) {
-    let r = (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt().max(1e-9);
-    let x = p[0] / r;
-    let y = p[1] / r;
-    let z = p[2] / r;
-    let lat = y.asin().to_degrees();
-    let lon = z.atan2(x).to_degrees();
-    (lon, lat)
+    // Convert viewer coordinates back to ECEF (z-up): ecef = (x, -z, y)
+    let ecef = foundation::math::Ecef::new(p[0], -p[2], p[1]);
+    let geo = ecef_to_geodetic(ecef);
+    (geo.lon_rad.to_degrees(), geo.lat_rad.to_degrees())
 }
 
 fn ray_hit_globe(
@@ -1029,18 +1079,48 @@ fn ray_hit_globe(
         vec3_add(vec3_mul(right, px), vec3_mul(up, py)),
     ));
 
-    // Ray-sphere intersection for unit sphere at origin.
-    // Solve |eye + t*dir|^2 = 1.
-    let b = 2.0 * vec3_dot(eye, ray_dir);
-    let c = vec3_dot(eye, eye) - 1.0;
-    let disc = b * b - 4.0 * c;
+    // Ray-ellipsoid intersection for the WGS84 globe centered at origin.
+    // Ellipsoid equation: (x/rx)^2 + (y/ry)^2 + (z/rz)^2 = 1.
+    // Our viewer coordinates map ECEF (x,y,z) -> (x, z, -y), so the radii are:
+    // x: WGS84_A, y: WGS84_B, z: WGS84_A.
+    let rx = WGS84_A;
+    let ry = WGS84_B;
+    let rz = WGS84_A;
+    let inv_rx2 = 1.0 / (rx * rx);
+    let inv_ry2 = 1.0 / (ry * ry);
+    let inv_rz2 = 1.0 / (rz * rz);
+
+    let a = ray_dir[0] * ray_dir[0] * inv_rx2
+        + ray_dir[1] * ray_dir[1] * inv_ry2
+        + ray_dir[2] * ray_dir[2] * inv_rz2;
+    if a.abs() < 1e-18 {
+        return None;
+    }
+    let b = 2.0
+        * (eye[0] * ray_dir[0] * inv_rx2
+            + eye[1] * ray_dir[1] * inv_ry2
+            + eye[2] * ray_dir[2] * inv_rz2);
+    let c = eye[0] * eye[0] * inv_rx2 + eye[1] * eye[1] * inv_ry2 + eye[2] * eye[2] * inv_rz2 - 1.0;
+
+    let disc = b * b - 4.0 * a * c;
     if disc < 0.0 {
         return None;
     }
-    let t = (-b - disc.sqrt()) / 2.0;
-    if t <= 0.0 {
+    let sdisc = disc.sqrt();
+    let t0 = (-b - sdisc) / (2.0 * a);
+    let t1 = (-b + sdisc) / (2.0 * a);
+
+    // Choose the nearest positive hit.
+    let t = if t0 > 0.0 && t1 > 0.0 {
+        t0.min(t1)
+    } else if t0 > 0.0 {
+        t0
+    } else if t1 > 0.0 {
+        t1
+    } else {
         return None;
-    }
+    };
+
     Some(vec3_add(eye, vec3_mul(ray_dir, t)))
 }
 
@@ -1141,7 +1221,33 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
             consider_points(centers);
         }
         if let Some((c, d2)) = best_point {
-            let radius_px = 12.0f32;
+            // Approximate marker radius in pixels by projecting a small tangent offset.
+            let mut radius_px = 12.0f32;
+            if let Some((cx, cy)) = project(c) {
+                // World units are meters; approximate pixel radius by projecting a tangent offset.
+                // Use an ellipsoid normal (viewer radii: x=A, y=B, z=A).
+                let a2 = WGS84_A * WGS84_A;
+                let b2 = WGS84_B * WGS84_B;
+                let n =
+                    vec3_normalize([(c[0] as f64) / a2, (c[1] as f64) / b2, (c[2] as f64) / a2]);
+                let up = if n[1].abs() < 0.99 {
+                    [0.0f64, 1.0, 0.0]
+                } else {
+                    [1.0f64, 0.0, 0.0]
+                };
+                let east = vec3_normalize(vec3_cross(up, n));
+                let half_size_m = s.city_marker_size as f64;
+                let p = [
+                    (c[0] as f64 + east[0] * half_size_m) as f32,
+                    (c[1] as f64 + east[1] * half_size_m) as f32,
+                    (c[2] as f64 + east[2] * half_size_m) as f32,
+                ];
+                if let Some((px2, py2)) = project(p) {
+                    let dx = px2 - cx;
+                    let dy = py2 - cy;
+                    radius_px = (dx * dx + dy * dy).sqrt().clamp(6.0, 64.0);
+                }
+            }
             if d2 <= radius_px * radius_px {
                 return Some(("point".to_string(), Some(c), None, None));
             }
@@ -1311,19 +1417,35 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
 
 #[wasm_bindgen]
 pub fn load_geojson_file(name: String, geojson_text: String) -> Result<JsValue, JsValue> {
-    let parsed = parse_geojson_any(&geojson_text)?;
+    let chunk = formats::VectorChunk::from_geojson_str(&geojson_text)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    // Count primitives for UI.
+    let mut count_points = 0usize;
+    let mut count_lines = 0usize;
+    let mut count_polys = 0usize;
+    for f in &chunk.features {
+        match &f.geometry {
+            formats::VectorGeometry::Point(_) => count_points += 1,
+            formats::VectorGeometry::MultiPoint(v) => count_points += v.len(),
+            formats::VectorGeometry::LineString(_) => count_lines += 1,
+            formats::VectorGeometry::MultiLineString(v) => count_lines += v.len(),
+            formats::VectorGeometry::Polygon(_) => count_polys += 1,
+            formats::VectorGeometry::MultiPolygon(v) => count_polys += v.len(),
+        }
+    }
+
+    let world = world_from_vector_chunk(&chunk, None);
 
     STATE.with(|state| {
         let mut s = state.borrow_mut();
         s.uploaded_name = Some(name.clone());
-        s.uploaded_centers = Some(parsed.centers);
-        s.uploaded_corridors_positions = Some(parsed.corridors_positions);
-        s.uploaded_regions_positions = Some(parsed.regions_positions);
-        s.uploaded_count_points = parsed.count_points;
-        s.uploaded_count_lines = parsed.count_lines;
-        s.uploaded_count_polys = parsed.count_polys;
+        s.uploaded_world = Some(world);
+        s.uploaded_count_points = count_points;
+        s.uploaded_count_lines = count_lines;
+        s.uploaded_count_polys = count_polys;
 
-        // Keep the legacy dataset selection in sync, but visibility is layer-based.
+        // Switch to uploaded dataset immediately (matches previous behavior).
         s.dataset = "__uploaded__".to_string();
         s.uploaded_points_style.visible = s.uploaded_count_points > 0;
         s.uploaded_corridors_style.visible = s.uploaded_count_lines > 0;
@@ -1339,341 +1461,39 @@ pub fn load_geojson_file(name: String, geojson_text: String) -> Result<JsValue, 
         &JsValue::from_str("name"),
         &JsValue::from_str(&name),
     )?;
-    STATE.with(|state| {
-        let s = state.borrow();
-        let _ = js_sys::Reflect::set(
-            &summary,
-            &JsValue::from_str("points"),
-            &JsValue::from_f64(s.uploaded_count_points as f64),
-        );
-        let _ = js_sys::Reflect::set(
-            &summary,
-            &JsValue::from_str("lines"),
-            &JsValue::from_f64(s.uploaded_count_lines as f64),
-        );
-        let _ = js_sys::Reflect::set(
-            &summary,
-            &JsValue::from_str("polygons"),
-            &JsValue::from_f64(s.uploaded_count_polys as f64),
-        );
-    });
+    // Legacy permissive uploader counters (kept for UI compatibility).
+    let _ = js_sys::Reflect::set(
+        &summary,
+        &JsValue::from_str("skipped_coords"),
+        &JsValue::from_f64(0.0),
+    );
+    let _ = js_sys::Reflect::set(
+        &summary,
+        &JsValue::from_str("fixed_swapped"),
+        &JsValue::from_f64(0.0),
+    );
+    let _ = js_sys::Reflect::set(
+        &summary,
+        &JsValue::from_str("fixed_web_mercator"),
+        &JsValue::from_f64(0.0),
+    );
+    let _ = js_sys::Reflect::set(
+        &summary,
+        &JsValue::from_str("points"),
+        &JsValue::from_f64(count_points as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &summary,
+        &JsValue::from_str("lines"),
+        &JsValue::from_f64(count_lines as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &summary,
+        &JsValue::from_str("polygons"),
+        &JsValue::from_f64(count_polys as f64),
+    );
+
     Ok(summary.into())
-}
-
-fn parse_coord_pair(v: &serde_json::Value) -> Option<(f64, f64)> {
-    let arr = v.as_array()?;
-    if arr.len() < 2 {
-        return None;
-    }
-    let lon = arr[0].as_f64()?;
-    let lat = arr[1].as_f64()?;
-    Some((lon, lat))
-}
-
-struct ParsedGeo {
-    centers: Vec<[f32; 3]>,
-    corridors_positions: Vec<[f32; 3]>,
-    regions_positions: Vec<[f32; 3]>,
-    count_points: usize,
-    count_lines: usize,
-    count_polys: usize,
-}
-
-fn parse_geojson_any(geojson_text: &str) -> Result<ParsedGeo, JsValue> {
-    let root: serde_json::Value =
-        serde_json::from_str(geojson_text).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    // Extract a list of geometry objects.
-    let mut geometries: Vec<serde_json::Value> = Vec::new();
-    let ty = root
-        .get("type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| JsValue::from_str("GeoJSON missing 'type'"))?;
-
-    match ty {
-        "FeatureCollection" => {
-            let features = root
-                .get("features")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| JsValue::from_str("Invalid FeatureCollection.features"))?;
-            for f in features {
-                if let Some(g) = f.get("geometry") {
-                    geometries.push(g.clone());
-                }
-            }
-        }
-        "Feature" => {
-            let g = root
-                .get("geometry")
-                .ok_or_else(|| JsValue::from_str("Invalid Feature.geometry"))?;
-            geometries.push(g.clone());
-        }
-        _ => {
-            // Treat as a bare geometry.
-            geometries.push(root);
-        }
-    }
-
-    let mut centers: Vec<[f32; 3]> = Vec::new();
-    let mut corridors_positions: Vec<[f32; 3]> = Vec::new();
-    let mut regions_positions: Vec<[f32; 3]> = Vec::new();
-
-    let mut count_points = 0usize;
-    let mut count_lines = 0usize;
-    let mut count_polys = 0usize;
-
-    for g in geometries {
-        let gty = g.get("type").and_then(|v| v.as_str()).unwrap_or("");
-        let coords = g.get("coordinates");
-        if coords.is_none() {
-            continue;
-        }
-        let coords = coords.unwrap();
-
-        match gty {
-            "Point" => {
-                if let Some((lon, lat)) = parse_coord_pair(coords) {
-                    centers.push(lon_lat_deg_to_world(lon, lat, 1.0));
-                    count_points += 1;
-                }
-            }
-            "MultiPoint" => {
-                if let Some(arr) = coords.as_array() {
-                    for c in arr {
-                        if let Some((lon, lat)) = parse_coord_pair(c) {
-                            centers.push(lon_lat_deg_to_world(lon, lat, 1.0));
-                            count_points += 1;
-                        }
-                    }
-                }
-            }
-            "LineString" => {
-                corridors_positions.extend(parse_linestring_corridors(coords)?);
-                count_lines += 1;
-            }
-            "MultiLineString" => {
-                let lines = coords
-                    .as_array()
-                    .ok_or_else(|| JsValue::from_str("Invalid MultiLineString coordinates"))?;
-                for l in lines {
-                    corridors_positions.extend(parse_linestring_corridors(l)?);
-                    count_lines += 1;
-                }
-            }
-            "Polygon" => {
-                regions_positions.extend(parse_polygon_regions(coords)?);
-                count_polys += 1;
-            }
-            "MultiPolygon" => {
-                let polys = coords
-                    .as_array()
-                    .ok_or_else(|| JsValue::from_str("Invalid MultiPolygon coordinates"))?;
-                for p in polys {
-                    regions_positions.extend(parse_polygon_regions(p)?);
-                    count_polys += 1;
-                }
-            }
-            _ => {
-                // ignore unsupported geometry types
-            }
-        }
-    }
-
-    // Basic safety caps for big uploads.
-    const MAX_POINTS: usize = 250_000;
-    const MAX_LINE_VERTS: usize = 800_000;
-    const MAX_POLY_VERTS: usize = 800_000;
-    if centers.len() > MAX_POINTS {
-        centers.truncate(MAX_POINTS);
-    }
-    if corridors_positions.len() > MAX_LINE_VERTS {
-        corridors_positions.truncate(MAX_LINE_VERTS);
-    }
-    if regions_positions.len() > MAX_POLY_VERTS {
-        regions_positions.truncate(MAX_POLY_VERTS);
-    }
-
-    Ok(ParsedGeo {
-        centers,
-        corridors_positions,
-        regions_positions,
-        count_points,
-        count_lines,
-        count_polys,
-    })
-}
-
-fn parse_linestring_corridors(coords: &serde_json::Value) -> Result<Vec<[f32; 3]>, JsValue> {
-    let coords = coords
-        .as_array()
-        .ok_or_else(|| JsValue::from_str("Invalid LineString coordinates"))?;
-    if coords.len() < 2 {
-        return Ok(Vec::new());
-    }
-
-    let mut pts_unit: Vec<[f32; 3]> = Vec::with_capacity(coords.len());
-    for c in coords {
-        if let Some((lon, lat)) = parse_coord_pair(c) {
-            pts_unit.push(lon_lat_deg_to_world(lon, lat, 1.0));
-        }
-    }
-    if pts_unit.len() < 2 {
-        return Ok(Vec::new());
-    }
-
-    let mut out: Vec<[f32; 3]> = Vec::new();
-
-    for seg in pts_unit.windows(2) {
-        let a = seg[0];
-        let b = seg[1];
-
-        let d = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0);
-        let omega = d.acos();
-        let steps = ((omega / (5f32.to_radians())).ceil() as usize).clamp(4, 128);
-
-        let mut arc: Vec<[f32; 3]> = Vec::with_capacity(steps + 1);
-        for i in 0..=steps {
-            let t = i as f32 / steps as f32;
-            let u = slerp_unit(a, b, t);
-            arc.push([u[0] * 1.012, u[1] * 1.012, u[2] * 1.012]);
-        }
-
-        out.extend(build_corridor_line_positions(&arc));
-    }
-
-    Ok(out)
-}
-
-fn parse_polygon_regions(coords: &serde_json::Value) -> Result<Vec<[f32; 3]>, JsValue> {
-    let rings = coords
-        .as_array()
-        .ok_or_else(|| JsValue::from_str("Invalid Polygon coordinates"))?;
-    if rings.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    fn drop_closing_duplicate(points: &mut Vec<(f64, f64)>) {
-        if points.len() >= 2 {
-            let first = points[0];
-            let last = *points.last().unwrap();
-            if (first.0 - last.0).abs() < 1e-9 && (first.1 - last.1).abs() < 1e-9 {
-                points.pop();
-            }
-        }
-    }
-
-    let mut rings_ll: Vec<Vec<(f64, f64)>> = Vec::with_capacity(rings.len());
-    for ring in rings {
-        let arr = ring
-            .as_array()
-            .ok_or_else(|| JsValue::from_str("Invalid Polygon ring"))?;
-        let mut pts: Vec<(f64, f64)> = Vec::with_capacity(arr.len());
-        for c in arr {
-            if let Some((lon, lat)) = parse_coord_pair(c) {
-                pts.push((lon, lat));
-            }
-        }
-        drop_closing_duplicate(&mut pts);
-        if pts.len() >= 3 {
-            rings_ll.push(pts);
-        }
-    }
-
-    if rings_ll.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Tangent-plane basis at the first outer vertex.
-    let (lon0, lat0) = rings_ll[0][0];
-    let p0 = lon_lat_deg_to_world(lon0, lat0, 1.0);
-    let n = vec3_normalize([p0[0] as f64, p0[1] as f64, p0[2] as f64]);
-    let up = if n[1].abs() < 0.99 {
-        [0.0, 1.0, 0.0]
-    } else {
-        [1.0, 0.0, 0.0]
-    };
-    let east = vec3_normalize(vec3_cross(up, n));
-    let north = vec3_cross(n, east);
-
-    fn signed_area(poly: &[(f64, f64)]) -> f64 {
-        let mut a = 0.0;
-        for i in 0..poly.len() {
-            let (x0, y0) = poly[i];
-            let (x1, y1) = poly[(i + 1) % poly.len()];
-            a += x0 * y1 - x1 * y0;
-        }
-        0.5 * a
-    }
-
-    // Project lon/lat to local 2D, and compute world-space vertices for rendering.
-    let mut outer_2d: Vec<(f64, f64)> = Vec::with_capacity(rings_ll[0].len());
-    for &(lon, lat) in &rings_ll[0] {
-        let u = lon_lat_deg_to_world(lon, lat, 1.0);
-        let uf = [u[0] as f64, u[1] as f64, u[2] as f64];
-        outer_2d.push((vec3_dot(uf, east), vec3_dot(uf, north)));
-    }
-    if signed_area(&outer_2d) < 0.0 {
-        rings_ll[0].reverse();
-        outer_2d.reverse();
-    }
-
-    let mut coords_2d: Vec<f64> = Vec::new();
-    let mut world: Vec<[f32; 3]> = Vec::new();
-    let mut holes: Vec<usize> = Vec::new();
-
-    for &(lon, lat) in &rings_ll[0] {
-        let u = lon_lat_deg_to_world(lon, lat, 1.0);
-        let uf = [u[0] as f64, u[1] as f64, u[2] as f64];
-        coords_2d.push(vec3_dot(uf, east));
-        coords_2d.push(vec3_dot(uf, north));
-        world.push(lon_lat_deg_to_world(lon, lat, 1.006));
-    }
-
-    let mut vert_count = rings_ll[0].len();
-    for ring in rings_ll.iter().skip(1) {
-        // Build and orient hole ring in 2D.
-        let mut ring_2d: Vec<(f64, f64)> = Vec::with_capacity(ring.len());
-        for &(lon, lat) in ring {
-            let u = lon_lat_deg_to_world(lon, lat, 1.0);
-            let uf = [u[0] as f64, u[1] as f64, u[2] as f64];
-            ring_2d.push((vec3_dot(uf, east), vec3_dot(uf, north)));
-        }
-        let mut ring_ll = ring.clone();
-        if signed_area(&ring_2d) > 0.0 {
-            ring_ll.reverse();
-            ring_2d.reverse();
-        }
-
-        holes.push(vert_count);
-        for i in 0..ring_ll.len() {
-            coords_2d.push(ring_2d[i].0);
-            coords_2d.push(ring_2d[i].1);
-            let (lon, lat) = ring_ll[i];
-            world.push(lon_lat_deg_to_world(lon, lat, 1.006));
-        }
-        vert_count += ring_ll.len();
-    }
-
-    if world.len() < 3 {
-        return Ok(Vec::new());
-    }
-
-    let indices = earcutr::earcut(&coords_2d, &holes, 2)
-        .map_err(|e| JsValue::from_str(&format!("Failed to triangulate polygon: {e:?}")))?;
-    if indices.len() < 3 {
-        return Ok(Vec::new());
-    }
-
-    let mut out: Vec<[f32; 3]> = Vec::with_capacity(indices.len());
-    for tri in indices.chunks_exact(3) {
-        let i0 = tri[0];
-        let i1 = tri[1];
-        let i2 = tri[2];
-        if i0 < world.len() && i1 < world.len() && i2 < world.len() {
-            out.extend([world[i0], world[i1], world[i2]]);
-        }
-    }
-    Ok(out)
 }
 
 #[wasm_bindgen]
@@ -1775,9 +1595,8 @@ async fn fetch_manifest(url: &str) -> Result<SceneManifest, JsValue> {
     serde_json::from_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))
 }
 
-async fn fetch_cities_centers() -> Result<Vec<[f32; 3]>, JsValue> {
-    // Use a relative URL so it works under Trunk dev server and GitHub Pages.
-    let resp = Request::get("assets/chunks/cities.json")
+async fn fetch_vector_chunk(url: &str) -> Result<formats::VectorChunk, JsValue> {
+    let resp = Request::get(url)
         .send()
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -1785,172 +1604,5 @@ async fn fetch_cities_centers() -> Result<Vec<[f32; 3]>, JsValue> {
         .text()
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let fc: GeoJsonFeatureCollection =
-        serde_json::from_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut out = Vec::with_capacity(fc.features.len());
-    for f in fc.features {
-        if f.geometry.ty != "Point" {
-            continue;
-        }
-        let coords = f
-            .geometry
-            .coordinates
-            .as_array()
-            .ok_or_else(|| JsValue::from_str("Invalid Point coordinates"))?;
-        if coords.len() < 2 {
-            continue;
-        }
-        let lon_deg = coords[0].as_f64().unwrap_or(0.0);
-        let lat_deg = coords[1].as_f64().unwrap_or(0.0);
-
-        out.push(lon_lat_deg_to_world(lon_deg, lat_deg, 1.0));
-    }
-
-    Ok(out)
-}
-
-async fn fetch_air_corridors_positions() -> Result<Vec<[f32; 3]>, JsValue> {
-    let resp = Request::get("assets/chunks/air_corridors.json")
-        .send()
-        .await
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let fc: GeoJsonFeatureCollection =
-        serde_json::from_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut out: Vec<[f32; 3]> = Vec::new();
-
-    for f in fc.features {
-        if f.geometry.ty != "LineString" {
-            continue;
-        }
-        let coords = f
-            .geometry
-            .coordinates
-            .as_array()
-            .ok_or_else(|| JsValue::from_str("Invalid LineString coordinates"))?;
-        if coords.len() < 2 {
-            continue;
-        }
-
-        // Convert to unit vectors first so we can draw a great-circle arc.
-        let mut pts_unit: Vec<[f32; 3]> = Vec::with_capacity(coords.len());
-        for c in coords {
-            let arr = c
-                .as_array()
-                .ok_or_else(|| JsValue::from_str("Invalid coordinate pair"))?;
-            if arr.len() < 2 {
-                continue;
-            }
-            let lon_deg = arr[0].as_f64().unwrap_or(0.0);
-            let lat_deg = arr[1].as_f64().unwrap_or(0.0);
-            let p = lon_lat_deg_to_world(lon_deg, lat_deg, 1.0);
-            pts_unit.push(p);
-        }
-        if pts_unit.len() < 2 {
-            continue;
-        }
-
-        // Sample each segment as a great-circle to avoid chords through the globe.
-        for seg in pts_unit.windows(2) {
-            let a = seg[0];
-            let b = seg[1];
-
-            let d = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0);
-            let omega = d.acos();
-            let steps = ((omega / (5f32.to_radians())).ceil() as usize).clamp(4, 128);
-
-            let mut arc: Vec<[f32; 3]> = Vec::with_capacity(steps + 1);
-            for i in 0..=steps {
-                let t = i as f32 / steps as f32;
-                let u = slerp_unit(a, b, t);
-                arc.push([u[0] * 1.012, u[1] * 1.012, u[2] * 1.012]);
-            }
-
-            out.extend(build_corridor_line_positions(&arc));
-        }
-    }
-
-    Ok(out)
-}
-
-async fn fetch_regions_positions() -> Result<Vec<[f32; 3]>, JsValue> {
-    let resp = Request::get("assets/chunks/regions.json")
-        .send()
-        .await
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let fc: GeoJsonFeatureCollection =
-        serde_json::from_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))?;
-
-    let mut out: Vec<[f32; 3]> = Vec::new();
-
-    for f in fc.features {
-        if f.geometry.ty != "Polygon" {
-            continue;
-        }
-        let rings = f
-            .geometry
-            .coordinates
-            .as_array()
-            .ok_or_else(|| JsValue::from_str("Invalid Polygon coordinates"))?;
-        if rings.is_empty() {
-            continue;
-        }
-
-        let outer = rings[0]
-            .as_array()
-            .ok_or_else(|| JsValue::from_str("Invalid Polygon ring"))?;
-        if outer.len() < 4 {
-            continue;
-        }
-
-        // Drop the duplicated closing vertex if present.
-        let mut verts_ll: Vec<(f64, f64)> = Vec::with_capacity(outer.len());
-        for c in outer {
-            let arr = c
-                .as_array()
-                .ok_or_else(|| JsValue::from_str("Invalid coordinate pair"))?;
-            if arr.len() < 2 {
-                continue;
-            }
-            let lon_deg = arr[0].as_f64().unwrap_or(0.0);
-            let lat_deg = arr[1].as_f64().unwrap_or(0.0);
-            verts_ll.push((lon_deg, lat_deg));
-        }
-        if verts_ll.len() >= 2 {
-            let first = verts_ll[0];
-            let last = *verts_ll.last().unwrap();
-            if (first.0 - last.0).abs() < 1e-9 && (first.1 - last.1).abs() < 1e-9 {
-                verts_ll.pop();
-            }
-        }
-        if verts_ll.len() < 3 {
-            continue;
-        }
-
-        // Simple fan triangulation (works for the demo rectangles).
-        let (lon0, lat0) = verts_ll[0];
-        let p0 = lon_lat_deg_to_world(lon0, lat0, 1.006);
-        for i in 1..(verts_ll.len() - 1) {
-            let (lona, lata) = verts_ll[i];
-            let (lonb, latb) = verts_ll[i + 1];
-            let pa = lon_lat_deg_to_world(lona, lata, 1.006);
-            let pb = lon_lat_deg_to_world(lonb, latb, 1.006);
-
-            out.extend([p0, pa, pb]);
-        }
-    }
-
-    Ok(out)
+    formats::VectorChunk::from_geojson_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))
 }

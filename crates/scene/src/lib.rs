@@ -1,5 +1,6 @@
 pub mod components;
 pub mod entity;
+pub mod prefabs;
 pub mod selection;
 pub mod spatial;
 pub mod temporal;

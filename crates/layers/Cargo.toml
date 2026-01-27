@@ -11,3 +11,7 @@ foundation = { path = "../foundation" }
 scene = { path = "../scene" }
 gpu = { path = "../gpu" }
 streaming = { path = "../streaming" }
+earcutr = "0.4"
+
+[dev-dependencies]
+formats = { path = "../formats" }

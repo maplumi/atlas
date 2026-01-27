@@ -195,10 +195,10 @@
         <div id="tab-layers" class="tab-page hidden">
           <div class="section">
             <h3>Points</h3>
-            <label for="city-size">Point size (px)</label>
+            <label for="city-size">Point size (m)</label>
             <div class="row">
-              <input id="city-size" type="range" min="2" max="24" step="1" value="6" />
-              <span id="city-size-value" class="value">6</span>
+              <input id="city-size" type="range" min="100" max="50000" step="100" value="6000" />
+              <span id="city-size-value" class="value">6000</span>
             </div>
           </div>
 
@@ -229,7 +229,7 @@
               </div>
               <div>
                 <div class="mini">Lift</div>
-                <input id="layer-cities-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.02" />
+                <input id="layer-cities-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
               </div>
             </div>
 
@@ -277,7 +277,7 @@
               </div>
               <div>
                 <div class="mini">Lift</div>
-                <input id="layer-uploaded-points-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.02" />
+                <input id="layer-uploaded-points-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
               </div>
             </div>
 
@@ -327,7 +327,7 @@
               <span>Real-time sun shadows</span>
             </label>
             <div style="font-size:12px; color:#94a3b8; line-height:1.35;">
-              Syncs the globe lighting to the current UTC time.
+              Syncs the globe lighting to your current system time.
             </div>
           </div>
         </div>
@@ -504,7 +504,7 @@
         const layerUploadedRegionsOpacity = document.getElementById("layer-uploaded-regions-opacity");
         const layerUploadedRegionsLift = document.getElementById("layer-uploaded-regions-lift");
 
-        function setUploadedInfo({ name, points, lines, polygons, error }) {
+        function setUploadedInfo({ name, points, lines, polygons, skipped_coords, fixed_swapped, fixed_web_mercator, error }) {
           if (error) {
             uploadedInfo.innerHTML = `<div style="color:#fca5a5;">Upload error: ${String(error)}</div>`;
             return;
@@ -513,9 +513,16 @@
             uploadedInfo.innerHTML = `<div style="color:#94a3b8;">No upload loaded.</div>`;
             return;
           }
+
+          const skipped = Number(skipped_coords ?? 0);
+          const swapped = Number(fixed_swapped ?? 0);
+          const merc = Number(fixed_web_mercator ?? 0);
+          const hasDiag = (skipped + swapped + merc) > 0;
+
           uploadedInfo.innerHTML = `
             <div><span style="color:#93c5fd;">Uploaded:</span> ${name}</div>
             <div style="color:#94a3b8;">Points: ${points ?? 0} • Lines: ${lines ?? 0} • Polygons: ${polygons ?? 0}</div>
+            ${hasDiag ? `<div style="color:#94a3b8;">Coords: fixed swap ${swapped} • fixed mercator ${merc} • skipped ${skipped}</div>` : ""}
           `;
         }
 

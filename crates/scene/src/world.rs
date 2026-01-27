@@ -1,5 +1,6 @@
 use crate::components::{
-    ComponentBounds, ComponentTimeSpan, Drawable2D, Drawable3D, Transform, Visibility,
+    ComponentBounds, ComponentTimeSpan, ComponentVectorGeometry, Drawable2D, Drawable3D, Transform,
+    VectorGeometry, VectorGeometryId, Visibility,
 };
 use crate::entity::EntityId;
 use foundation::handles::Handle;
@@ -14,6 +15,8 @@ pub struct World {
     time_spans: Vec<Option<ComponentTimeSpan>>,
     drawables_2d: Vec<Option<Drawable2D>>,
     drawables_3d: Vec<Option<Drawable3D>>,
+    vector_geometry: Vec<Option<ComponentVectorGeometry>>,
+    vector_geometries: Vec<VectorGeometry>,
 }
 
 impl World {
@@ -57,6 +60,51 @@ impl World {
     pub fn set_drawable_3d(&mut self, entity: EntityId, drawable: Drawable3D) {
         self.ensure_capacity(entity.index() as usize);
         self.drawables_3d[entity.index() as usize] = Some(drawable);
+    }
+
+    pub fn add_vector_geometry(&mut self, geometry: VectorGeometry) -> VectorGeometryId {
+        let id = VectorGeometryId(self.vector_geometries.len() as u32);
+        self.vector_geometries.push(geometry);
+        id
+    }
+
+    pub fn set_vector_geometry(&mut self, entity: EntityId, component: ComponentVectorGeometry) {
+        self.ensure_capacity(entity.index() as usize);
+        self.vector_geometry[entity.index() as usize] = Some(component);
+    }
+
+    pub fn vector_geometry_component(&self, entity: EntityId) -> Option<ComponentVectorGeometry> {
+        self.vector_geometry
+            .get(entity.index() as usize)
+            .and_then(|v| *v)
+    }
+
+    pub fn vector_geometry(&self, id: VectorGeometryId) -> Option<&VectorGeometry> {
+        self.vector_geometries.get(id.0 as usize)
+    }
+
+    pub fn vector_geometries_by_entity(
+        &self,
+    ) -> Vec<(EntityId, Transform, ComponentVectorGeometry)> {
+        let mut out = Vec::new();
+        for (idx, comp) in self.vector_geometry.iter().enumerate() {
+            let Some(comp) = comp else { continue };
+            let Some(transform) = self.transforms.get(idx).and_then(|t| *t) else {
+                continue;
+            };
+            let visible = self
+                .visibility
+                .get(idx)
+                .and_then(|v| *v)
+                .map(|v| v.visible)
+                .unwrap_or(true);
+            if !visible {
+                continue;
+            }
+
+            out.push((EntityId(Handle::new(idx as u32, 0)), transform, *comp));
+        }
+        out
     }
 
     pub fn drawables_2d(&self) -> Vec<(EntityId, Transform, Drawable2D)> {
@@ -139,6 +187,7 @@ impl World {
             self.time_spans.resize(new_len, None);
             self.drawables_2d.resize(new_len, None);
             self.drawables_3d.resize(new_len, None);
+            self.vector_geometry.resize(new_len, None);
         }
     }
 }

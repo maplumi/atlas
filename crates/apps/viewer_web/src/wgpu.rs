@@ -5,6 +5,8 @@ mod imp {
     use wasm_bindgen::JsCast;
     use wasm_bindgen::prelude::*;
 
+    use foundation::math::{WGS84_A, WGS84_B};
+
     #[derive(Debug)]
     pub struct WgpuContext {
         pub _instance: &'static ::wgpu::Instance,
@@ -178,26 +180,37 @@ struct VsOut {
     @location(0) color: vec4<f32>,
 };
 
+fn ellipsoid_normal(p: vec3<f32>) -> vec3<f32> {
+    // Viewer coordinates use radii: x=A, y=B, z=A.
+    let a: f32 = 6378137.0;
+    let b: f32 = 6356752.314245179;
+    let a2 = a * a;
+    let b2 = b * b;
+    return normalize(vec3<f32>(p.x / a2, p.y / b2, p.z / a2));
+}
+
 @vertex
 fn vs_main(
     @location(0) center: vec3<f32>,
     @location(1) lift: f32,
-    @location(2) offset_px: vec2<f32>,
+    // Half-size offset in meters (constant physical size).
+    @location(2) offset_m: vec2<f32>,
     @location(3) color: vec4<f32>,
 ) -> VsOut {
-    let base_r = length(center);
-    let dir = normalize(center);
-    let world_pos = dir * (base_r + lift);
-    var clip = globals.view_proj * vec4<f32>(world_pos, 1.0);
+    let n = ellipsoid_normal(center);
+    let world_center = center + n * lift;
 
-    // Screen-space expansion: convert pixel offsets into NDC, then into clip-space.
-    let ndc = vec2<f32>(
-        (offset_px.x / globals.viewport.x) * 2.0,
-        (offset_px.y / globals.viewport.y) * 2.0,
-    );
-    let delta = vec2<f32>(ndc.x, -ndc.y) * clip.w;
-    clip = vec4<f32>(clip.x + delta.x, clip.y + delta.y, clip.z, clip.w);
+    // Tangent basis.
+    let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.99);
+    let east = normalize(cross(up, n));
+    let north = normalize(cross(n, east));
 
+    // World units are meters.
+    let offset_world = (east * offset_m.x) + (north * offset_m.y);
+
+    // Place marker corners in the local tangent plane.
+    let world_pos = world_center + offset_world;
+    let clip = globals.view_proj * vec4<f32>(world_pos, 1.0);
     return VsOut(clip, color);
 }
 
@@ -224,6 +237,15 @@ struct VsOut {
     @location(0) color: vec4<f32>,
 };
 
+fn ellipsoid_normal(p: vec3<f32>) -> vec3<f32> {
+    // Viewer coordinates use radii: x=A, y=B, z=A.
+    let a: f32 = 6378137.0;
+    let b: f32 = 6356752.314245179;
+    let a2 = a * a;
+    let b2 = b * b;
+    return normalize(vec3<f32>(p.x / a2, p.y / b2, p.z / a2));
+}
+
 @vertex
 fn vs_main(
     @location(0) a: vec3<f32>,
@@ -234,11 +256,9 @@ fn vs_main(
     @location(5) width_px: f32,
     @location(6) color: vec4<f32>,
 ) -> VsOut {
-    // Apply lift radially to both endpoints.
-    let a_dir = normalize(a);
-    let b_dir = normalize(b);
-    let a_world = a_dir * (length(a) + lift);
-    let b_world = b_dir * (length(b) + lift);
+    // Apply lift along the ellipsoid normal at each endpoint.
+    let a_world = a + ellipsoid_normal(a) * lift;
+    let b_world = b + ellipsoid_normal(b) * lift;
 
     let clip_a = globals.view_proj * vec4<f32>(a_world, 1.0);
     let clip_b = globals.view_proj * vec4<f32>(b_world, 1.0);
@@ -282,15 +302,23 @@ struct VsOut {
     @location(0) color: vec4<f32>,
 };
 
+fn ellipsoid_normal(p: vec3<f32>) -> vec3<f32> {
+    // Viewer coordinates use radii: x=A, y=B, z=A.
+    let a: f32 = 6378137.0;
+    let b: f32 = 6356752.314245179;
+    let a2 = a * a;
+    let b2 = b * b;
+    return normalize(vec3<f32>(p.x / a2, p.y / b2, p.z / a2));
+}
+
 @vertex
 fn vs_main(
     @location(0) position: vec3<f32>,
     @location(1) lift: f32,
     @location(2) color: vec4<f32>,
 ) -> VsOut {
-    let base_r = length(position);
-    let dir = normalize(position);
-    let world_pos = dir * (base_r + lift);
+    let n = ellipsoid_normal(position);
+    let world_pos = position + n * lift;
     return VsOut(globals.view_proj * vec4<f32>(world_pos, 1.0), color);
 }
 
@@ -366,14 +394,56 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             mip_level_count: 1,
             sample_count: 1,
             dimension: ::wgpu::TextureDimension::D2,
-            format: ::wgpu::TextureFormat::Depth24Plus,
+            format: ::wgpu::TextureFormat::Depth24PlusStencil8,
             usage: ::wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats: &[],
         });
         tex.create_view(&::wgpu::TextureViewDescriptor::default())
     }
 
-    fn generate_sphere_mesh(lat_segments: u32, lon_segments: u32) -> (Vec<Vertex>, Vec<u16>) {
+    fn stencil_write_1() -> ::wgpu::StencilState {
+        ::wgpu::StencilState {
+            front: ::wgpu::StencilFaceState {
+                compare: ::wgpu::CompareFunction::Always,
+                fail_op: ::wgpu::StencilOperation::Keep,
+                depth_fail_op: ::wgpu::StencilOperation::Keep,
+                pass_op: ::wgpu::StencilOperation::Replace,
+            },
+            back: ::wgpu::StencilFaceState {
+                compare: ::wgpu::CompareFunction::Always,
+                fail_op: ::wgpu::StencilOperation::Keep,
+                depth_fail_op: ::wgpu::StencilOperation::Keep,
+                pass_op: ::wgpu::StencilOperation::Replace,
+            },
+            read_mask: 0xff,
+            write_mask: 0xff,
+        }
+    }
+
+    fn stencil_test_eq_1() -> ::wgpu::StencilState {
+        ::wgpu::StencilState {
+            front: ::wgpu::StencilFaceState {
+                compare: ::wgpu::CompareFunction::Equal,
+                fail_op: ::wgpu::StencilOperation::Keep,
+                depth_fail_op: ::wgpu::StencilOperation::Keep,
+                pass_op: ::wgpu::StencilOperation::Keep,
+            },
+            back: ::wgpu::StencilFaceState {
+                compare: ::wgpu::CompareFunction::Equal,
+                fail_op: ::wgpu::StencilOperation::Keep,
+                depth_fail_op: ::wgpu::StencilOperation::Keep,
+                pass_op: ::wgpu::StencilOperation::Keep,
+            },
+            read_mask: 0xff,
+            write_mask: 0x00,
+        }
+    }
+
+    fn generate_ellipsoid_mesh(
+        lat_segments: u32,
+        lon_segments: u32,
+        radii: [f32; 3],
+    ) -> (Vec<Vertex>, Vec<u16>) {
         let lat_segments = lat_segments.max(3);
         let lon_segments = lon_segments.max(3);
 
@@ -390,12 +460,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 let sin_p = phi.sin();
                 let cos_p = phi.cos();
 
-                let x = sin_t * cos_p;
-                let y = cos_t;
-                let z = sin_t * sin_p;
+                // Unit sphere with +Y as north axis.
+                let ux = sin_t * cos_p;
+                let uy = cos_t;
+                let uz = sin_t * sin_p;
+
+                // Scale into an oblate spheroid / ellipsoid (meters).
+                let x = ux * radii[0];
+                let y = uy * radii[1];
+                let z = uz * radii[2];
+
+                // Ellipsoid normal via gradient of implicit surface.
+                let nx = x / (radii[0] * radii[0]);
+                let ny = y / (radii[1] * radii[1]);
+                let nz = z / (radii[2] * radii[2]);
+                let nlen = (nx * nx + ny * ny + nz * nz).sqrt().max(1e-9);
                 vertices.push(Vertex {
                     position: [x, y, z],
-                    normal: [x, y, z],
+                    normal: [nx / nlen, ny / nlen, nz / nlen],
                 });
             }
         }
@@ -439,7 +521,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let samples: i32 = 128;
 
         // Lift the graticule slightly above the globe to avoid z-fighting.
-        let lift = 1.002;
+        let lift = 1.002_f32;
+
+        // WGS84 ellipsoid in viewer coordinates: equatorial radius on X/Z, polar radius on Y.
+        let radii = [WGS84_A as f32, WGS84_B as f32, WGS84_A as f32];
 
         // Meridians: lon fixed, lat varies -90..90.
         for lon_deg in (0..360).step_by(meridian_step_deg as usize) {
@@ -448,7 +533,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             for i in 0..=samples {
                 let t = i as f32 / samples as f32;
                 let lat = -90.0 + 180.0 * t;
-                let mut p = lat_lon_to_unit(lat.to_radians(), lon);
+                let u = lat_lon_to_unit(lat.to_radians(), lon);
+                let mut p = [u[0] * radii[0], u[1] * radii[1], u[2] * radii[2]];
                 p[0] *= lift;
                 p[1] *= lift;
                 p[2] *= lift;
@@ -467,7 +553,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             for i in 0..=samples {
                 let t = i as f32 / samples as f32;
                 let lon = -180.0 + 360.0 * t;
-                let mut p = lat_lon_to_unit(lat, lon.to_radians());
+                let u = lat_lon_to_unit(lat, lon.to_radians());
+                let mut p = [u[0] * radii[0], u[1] * radii[1], u[2] * radii[2]];
                 p[0] *= lift;
                 p[1] *= lift;
                 p[2] *= lift;
@@ -709,10 +796,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 conservative: false,
             },
             depth_stencil: Some(::wgpu::DepthStencilState {
-                format: ::wgpu::TextureFormat::Depth24Plus,
+                format: ::wgpu::TextureFormat::Depth24PlusStencil8,
                 depth_write_enabled: true,
                 depth_compare: ::wgpu::CompareFunction::Less,
-                stencil: ::wgpu::StencilState::default(),
+                stencil: stencil_write_1(),
                 bias: ::wgpu::DepthBiasState::default(),
             }),
             multisample: ::wgpu::MultisampleState::default(),
@@ -758,10 +845,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             },
             // Depth-test against the globe so back-side lines don't show through.
             depth_stencil: Some(::wgpu::DepthStencilState {
-                format: ::wgpu::TextureFormat::Depth24Plus,
+                format: ::wgpu::TextureFormat::Depth24PlusStencil8,
                 depth_write_enabled: false,
                 depth_compare: ::wgpu::CompareFunction::LessEqual,
-                stencil: ::wgpu::StencilState::default(),
+                stencil: stencil_test_eq_1(),
                 bias: ::wgpu::DepthBiasState::default(),
             }),
             multisample: ::wgpu::MultisampleState::default(),
@@ -823,10 +910,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 conservative: false,
             },
             depth_stencil: Some(::wgpu::DepthStencilState {
-                format: ::wgpu::TextureFormat::Depth24Plus,
+                format: ::wgpu::TextureFormat::Depth24PlusStencil8,
                 depth_write_enabled: false,
                 depth_compare: ::wgpu::CompareFunction::LessEqual,
-                stencil: ::wgpu::StencilState::default(),
+                stencil: stencil_test_eq_1(),
                 bias: ::wgpu::DepthBiasState::default(),
             }),
             multisample: ::wgpu::MultisampleState::default(),
@@ -903,10 +990,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 conservative: false,
             },
             depth_stencil: Some(::wgpu::DepthStencilState {
-                format: ::wgpu::TextureFormat::Depth24Plus,
+                format: ::wgpu::TextureFormat::Depth24PlusStencil8,
                 depth_write_enabled: false,
                 depth_compare: ::wgpu::CompareFunction::LessEqual,
-                stencil: ::wgpu::StencilState::default(),
+                stencil: stencil_test_eq_1(),
                 bias: ::wgpu::DepthBiasState::default(),
             }),
             multisample: ::wgpu::MultisampleState::default(),
@@ -963,10 +1050,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 conservative: false,
             },
             depth_stencil: Some(::wgpu::DepthStencilState {
-                format: ::wgpu::TextureFormat::Depth24Plus,
+                format: ::wgpu::TextureFormat::Depth24PlusStencil8,
                 depth_write_enabled: false,
                 depth_compare: ::wgpu::CompareFunction::LessEqual,
-                stencil: ::wgpu::StencilState::default(),
+                stencil: stencil_test_eq_1(),
                 bias: ::wgpu::DepthBiasState::default(),
             }),
             multisample: ::wgpu::MultisampleState::default(),
@@ -974,7 +1061,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             cache: None,
         });
 
-        let (vertices, indices) = generate_sphere_mesh(64, 128);
+        let radii = [WGS84_A as f32, WGS84_B as f32, WGS84_A as f32];
+        let (vertices, indices) = generate_ellipsoid_mesh(64, 128, radii);
         let vertex_buffer = device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
             label: Some("atlas-globe-vertices"),
             contents: bytemuck::cast_slice(&vertices),
@@ -1209,7 +1297,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                         load: ::wgpu::LoadOp::Clear(1.0),
                         store: ::wgpu::StoreOp::Store,
                     }),
-                    stencil_ops: None,
+                    stencil_ops: Some(::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Clear(0),
+                        store: ::wgpu::StoreOp::Store,
+                    }),
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
@@ -1218,6 +1309,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
             rpass.set_pipeline(&ctx.pipeline);
             rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            // Globe writes stencil=1 anywhere it draws.
+            rpass.set_stencil_reference(1);
             rpass.set_vertex_buffer(0, ctx.vertex_buffer.slice(..));
             rpass.set_index_buffer(ctx.index_buffer.slice(..), ::wgpu::IndexFormat::Uint16);
             rpass.draw_indexed(0..ctx.index_count, 0, 0..1);
@@ -1242,7 +1335,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                         load: ::wgpu::LoadOp::Load,
                         store: ::wgpu::StoreOp::Store,
                     }),
-                    stencil_ops: None,
+                    stencil_ops: Some(::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    }),
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
@@ -1251,6 +1347,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
             rpass.set_pipeline(&ctx.graticule_pipeline);
             rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            rpass.set_stencil_reference(1);
             rpass.set_vertex_buffer(0, ctx.graticule_vertex_buffer.slice(..));
             rpass.draw(0..ctx.graticule_vertex_count, 0..1);
         }
@@ -1274,7 +1371,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                         load: ::wgpu::LoadOp::Load,
                         store: ::wgpu::StoreOp::Store,
                     }),
-                    stencil_ops: None,
+                    stencil_ops: Some(::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    }),
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
@@ -1283,6 +1383,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
             rpass.set_pipeline(&ctx.regions_pipeline);
             rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            rpass.set_stencil_reference(1);
             rpass.set_vertex_buffer(0, ctx.regions_vertex_buffer.slice(..));
             rpass.draw(0..ctx.regions_vertex_count, 0..1);
         }
@@ -1306,7 +1407,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                         load: ::wgpu::LoadOp::Load,
                         store: ::wgpu::StoreOp::Store,
                     }),
-                    stencil_ops: None,
+                    stencil_ops: Some(::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    }),
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
@@ -1315,6 +1419,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
             rpass.set_pipeline(&ctx.corridors_pipeline);
             rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            rpass.set_stencil_reference(1);
             rpass.set_vertex_buffer(0, ctx.corridors_vertex_buffer.slice(..));
             rpass.draw(0..ctx.corridors_vertex_count, 0..1);
         }
@@ -1338,7 +1443,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                         load: ::wgpu::LoadOp::Load,
                         store: ::wgpu::StoreOp::Store,
                     }),
-                    stencil_ops: None,
+                    stencil_ops: Some(::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    }),
                 }),
                 occlusion_query_set: None,
                 timestamp_writes: None,
@@ -1347,6 +1455,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
             rpass.set_pipeline(&ctx.cities_pipeline);
             rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            rpass.set_stencil_reference(1);
             rpass.set_vertex_buffer(0, ctx.cities_vertex_buffer.slice(..));
             rpass.draw(0..ctx.cities_vertex_count, 0..1);
         }
