@@ -34,7 +34,6 @@
         position: relative;
         overflow-y: auto;
         overflow-x: hidden;
-        transition: min-width 0.2s ease;
         min-width: 280px;
         max-width: 600px;
       }
@@ -878,14 +877,25 @@
         syncMapToggles();
 
         // Panel toggle and resize functionality
+        const PANEL_DEFAULT_WIDTH = 320;
+        const PANEL_MIN_WIDTH = 280;
+        const PANEL_MAX_WIDTH = 600;
+        
         const panel = document.getElementById("side-panel");
         const panelToggle = document.getElementById("panel-toggle");
         const resizeHandle = document.getElementById("panel-resize-handle");
         const app = document.getElementById("app");
 
-        // Load saved panel width from localStorage
+        // Load saved panel state from localStorage
         const savedWidth = localStorage.getItem("panel-width");
-        if (savedWidth) {
+        const savedCollapsed = localStorage.getItem("panel-collapsed") === "true";
+        
+        if (savedCollapsed) {
+          panel.classList.add("collapsed");
+          panelToggle.textContent = "▶";
+          panelToggle.title = "Expand panel";
+          app.style.setProperty("--panel-width", "0px");
+        } else if (savedWidth) {
           app.style.setProperty("--panel-width", savedWidth + "px");
         }
 
@@ -897,9 +907,11 @@
           
           if (isCollapsed) {
             app.style.setProperty("--panel-width", "0px");
+            localStorage.setItem("panel-collapsed", "true");
           } else {
-            const width = savedWidth || "320";
+            const width = savedWidth || PANEL_DEFAULT_WIDTH;
             app.style.setProperty("--panel-width", width + "px");
+            localStorage.setItem("panel-collapsed", "false");
           }
           
           resizeCanvas(wasm);
@@ -910,6 +922,28 @@
         let startX = 0;
         let startWidth = 0;
 
+        const onMouseMove = (e) => {
+          if (!isResizing) return;
+          const delta = e.clientX - startX;
+          const newWidth = Math.max(PANEL_MIN_WIDTH, Math.min(PANEL_MAX_WIDTH, startWidth + delta));
+          app.style.setProperty("--panel-width", newWidth + "px");
+        };
+
+        const onMouseUp = () => {
+          if (!isResizing) return;
+          isResizing = false;
+          resizeHandle.classList.remove("resizing");
+          // Save the new width and resize canvas once
+          const currentWidth = panel.offsetWidth;
+          if (currentWidth > 0) {
+            localStorage.setItem("panel-width", currentWidth.toString());
+          }
+          resizeCanvas(wasm);
+          // Remove listeners to avoid unnecessary event handling
+          document.removeEventListener("mousemove", onMouseMove);
+          document.removeEventListener("mouseup", onMouseUp);
+        };
+
         resizeHandle.addEventListener("mousedown", (e) => {
           if (panel.classList.contains("collapsed")) return;
           isResizing = true;
@@ -917,25 +951,9 @@
           startWidth = panel.offsetWidth;
           resizeHandle.classList.add("resizing");
           e.preventDefault();
-        });
-
-        document.addEventListener("mousemove", (e) => {
-          if (!isResizing) return;
-          const delta = e.clientX - startX;
-          const newWidth = Math.max(280, Math.min(600, startWidth + delta));
-          app.style.setProperty("--panel-width", newWidth + "px");
-          resizeCanvas(wasm);
-        });
-
-        document.addEventListener("mouseup", () => {
-          if (!isResizing) return;
-          isResizing = false;
-          resizeHandle.classList.remove("resizing");
-          // Save the new width
-          const currentWidth = panel.offsetWidth;
-          if (currentWidth > 0) {
-            localStorage.setItem("panel-width", currentWidth.toString());
-          }
+          // Add listeners only when resizing
+          document.addEventListener("mousemove", onMouseMove);
+          document.addEventListener("mouseup", onMouseUp);
         });
 
         setStatus("Controls: LMB drag=orbit, RMB/Shift+drag=pan, wheel=zoom, R=reset, click=pick");
