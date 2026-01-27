@@ -54,6 +54,7 @@ pub struct ViewerState {
     pub canvas_height: f64,
     pub wgpu: Option<WgpuContext>,
     pub show_graticule: bool,
+    pub sun_follow_real_time: bool,
     pub city_marker_size: f32,
     pub cities_centers: Option<Vec<[f32; 3]>>,
     pub pending_cities: Option<Vec<CityVertex>>,
@@ -73,6 +74,7 @@ thread_local! {
         canvas_height: 720.0,
         wgpu: None,
         show_graticule: false,
+        sun_follow_real_time: true,
         city_marker_size: 0.02,
         cities_centers: None,
         pending_cities: None,
@@ -106,6 +108,77 @@ fn lon_lat_deg_to_world(lon_deg: f64, lat_deg: f64, lift_k: f32) -> [f32; 3] {
     p[1] *= lift_k;
     p[2] *= lift_k;
     p
+}
+
+fn current_sun_direction_world() -> Option<[f32; 3]> {
+    // Compute an approximate sun direction in the same coordinate system as the globe.
+    // This is a standard low-cost solar position approximation (good enough for lighting).
+    //
+    // Returns a unit vector pointing from Earth center toward the Sun.
+
+    fn deg_to_rad(d: f64) -> f64 {
+        d.to_radians()
+    }
+
+    fn rad_to_deg(r: f64) -> f64 {
+        r.to_degrees()
+    }
+
+    fn wrap_360(mut d: f64) -> f64 {
+        d %= 360.0;
+        if d < 0.0 {
+            d += 360.0;
+        }
+        d
+    }
+
+    fn wrap_180(mut d: f64) -> f64 {
+        d = wrap_360(d);
+        if d > 180.0 {
+            d -= 360.0;
+        }
+        d
+    }
+
+    let ms = js_sys::Date::new_0().get_time();
+    if !ms.is_finite() {
+        return None;
+    }
+
+    // Julian Day from Unix epoch (1970-01-01T00:00:00Z) == 2440587.5
+    let jd = 2440587.5 + (ms / 86_400_000.0);
+    let n = jd - 2451545.0; // days since J2000
+    let t = n / 36525.0;
+
+    // Mean longitude and anomaly (degrees)
+    let l = wrap_360(280.46 + 0.9856474 * n);
+    let g = wrap_360(357.528 + 0.9856003 * n);
+
+    // Ecliptic longitude (degrees)
+    let lambda = wrap_360(l + 1.915 * deg_to_rad(g).sin() + 0.020 * deg_to_rad(2.0 * g).sin());
+    // Obliquity of the ecliptic (degrees)
+    let eps = 23.439 - 0.0000004 * n;
+
+    // Right ascension & declination
+    let lambda_r = deg_to_rad(lambda);
+    let eps_r = deg_to_rad(eps);
+    let alpha_r = (eps_r.cos() * lambda_r.sin()).atan2(lambda_r.cos());
+    let delta_r = (eps_r.sin() * lambda_r.sin()).asin();
+
+    let alpha_deg = wrap_360(rad_to_deg(alpha_r));
+    let delta_deg = rad_to_deg(delta_r);
+
+    // Greenwich Mean Sidereal Time (degrees)
+    let gmst = wrap_360(
+        280.46061837 + 360.98564736629 * (jd - 2451545.0) + 0.000387933 * t * t
+            - (t * t * t) / 38_710_000.0,
+    );
+
+    // Subsolar longitude: alpha - GMST (degrees east).
+    let subsolar_lon = wrap_180(alpha_deg - gmst);
+    let subsolar_lat = delta_deg;
+
+    Some(lon_lat_deg_to_world(subsolar_lon, subsolar_lat, 1.0))
 }
 
 fn build_corridor_line_vertices(points: &[[f32; 3]]) -> Vec<OverlayVertex> {
@@ -374,12 +447,19 @@ fn render_scene() -> Result<(), JsValue> {
         let state = state_ref.borrow();
         if let Some(ctx) = &state.wgpu {
             let view_proj = camera_view_proj(state.camera, state.canvas_width, state.canvas_height);
+
+            let light_dir = if state.sun_follow_real_time {
+                current_sun_direction_world().unwrap_or([0.4, 0.7, 0.2])
+            } else {
+                [0.4, 0.7, 0.2]
+            };
             let show_cities = state.dataset == "cities";
             let show_corridors = state.dataset == "air_corridors";
             let show_regions = state.dataset == "regions";
             let _ = render_mesh(
                 ctx,
                 view_proj,
+                light_dir,
                 state.show_graticule,
                 show_cities,
                 show_corridors,
@@ -616,6 +696,14 @@ pub fn set_graticule_enabled(enabled: bool) -> Result<(), JsValue> {
         state.borrow_mut().show_graticule = enabled;
     });
     // Render immediately so the toggle feels responsive.
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_real_time_sun_enabled(enabled: bool) -> Result<(), JsValue> {
+    STATE.with(|state| {
+        state.borrow_mut().sun_follow_real_time = enabled;
+    });
     render_scene()
 }
 

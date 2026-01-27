@@ -96,6 +96,7 @@
         <div class="tabs">
           <button id="tab-general-btn" class="tab-btn active" type="button">General</button>
           <button id="tab-layers-btn" class="tab-btn" type="button">Layers</button>
+          <button id="tab-settings-btn" class="tab-btn" type="button">Settings</button>
         </div>
 
         <div id="tab-general" class="tab-page">
@@ -126,6 +127,19 @@
             <div class="row">
               <input id="city-size" type="range" min="0.005" max="0.08" step="0.001" value="0.02" />
               <span id="city-size-value" class="value">0.020</span>
+            </div>
+          </div>
+        </div>
+
+        <div id="tab-settings" class="tab-page hidden">
+          <div class="section">
+            <h3>Lighting</h3>
+            <label class="checkbox">
+              <input id="toggle-real-sun" type="checkbox" checked />
+              <span>Real-time sun shadows</span>
+            </label>
+            <div style="font-size:12px; color:#94a3b8; line-height:1.35;">
+              Syncs the globe lighting to the current UTC time.
             </div>
           </div>
         </div>
@@ -224,25 +238,35 @@
       function wireUi(wasm) {
         const tabGeneralBtn = document.getElementById("tab-general-btn");
         const tabLayersBtn = document.getElementById("tab-layers-btn");
+        const tabSettingsBtn = document.getElementById("tab-settings-btn");
         const tabGeneral = document.getElementById("tab-general");
         const tabLayers = document.getElementById("tab-layers");
+        const tabSettings = document.getElementById("tab-settings");
 
         const dataset = document.getElementById("dataset");
         const toggleGraticule = document.getElementById("toggle-graticule");
+        const toggleRealSun = document.getElementById("toggle-real-sun");
         const citySize = document.getElementById("city-size");
         const citySizeValue = document.getElementById("city-size-value");
         const canvas = document.getElementById("atlas-canvas-3d");
 
         function setTab(which) {
-          const general = which === "general";
-          tabGeneralBtn.classList.toggle("active", general);
-          tabLayersBtn.classList.toggle("active", !general);
-          tabGeneral.classList.toggle("hidden", !general);
-          tabLayers.classList.toggle("hidden", general);
+          const isGeneral = which === "general";
+          const isLayers = which === "layers";
+          const isSettings = which === "settings";
+
+          tabGeneralBtn.classList.toggle("active", isGeneral);
+          tabLayersBtn.classList.toggle("active", isLayers);
+          tabSettingsBtn.classList.toggle("active", isSettings);
+
+          tabGeneral.classList.toggle("hidden", !isGeneral);
+          tabLayers.classList.toggle("hidden", !isLayers);
+          tabSettings.classList.toggle("hidden", !isSettings);
         }
 
         tabGeneralBtn.addEventListener("click", () => setTab("general"));
         tabLayersBtn.addEventListener("click", () => setTab("layers"));
+        tabSettingsBtn.addEventListener("click", () => setTab("settings"));
 
         canvas.addEventListener("contextmenu", (e) => e.preventDefault());
 
@@ -326,6 +350,15 @@
             wasm.set_graticule_enabled(enabled);
           } catch (err) {
             console.error("set_graticule_enabled failed", err);
+          }
+        });
+
+        toggleRealSun.addEventListener("change", (e) => {
+          const enabled = !!e.target.checked;
+          try {
+            wasm.set_real_time_sun_enabled(enabled);
+          } catch (err) {
+            console.error("set_real_time_sun_enabled failed", err);
           }
         });
 

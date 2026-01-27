@@ -937,6 +937,7 @@ fn fs_main() -> @location(0) vec4<f32> {
     pub fn render_mesh(
         ctx: &WgpuContext,
         view_proj: [[f32; 4]; 4],
+        light_dir: [f32; 3],
         show_graticule: bool,
         show_cities: bool,
         show_corridors: bool,
@@ -952,7 +953,7 @@ fn fs_main() -> @location(0) vec4<f32> {
 
         let globals = Globals {
             view_proj,
-            light_dir: [0.4, 0.7, 0.2],
+            light_dir,
             _pad: 0.0,
         };
         ctx.queue
@@ -1190,6 +1191,7 @@ mod imp {
     pub fn render_mesh(
         _ctx: &WgpuContext,
         _view_proj: [[f32; 4]; 4],
+        _light_dir: [f32; 3],
         _show_graticule: bool,
         _show_cities: bool,
         _show_corridors: bool,

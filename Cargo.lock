@@ -1023,6 +1023,7 @@ dependencies = [
  "foundation",
  "gloo-net",
  "gpu",
+ "js-sys",
  "layers",
  "pollster",
  "runtime",
