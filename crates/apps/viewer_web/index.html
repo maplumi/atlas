@@ -57,6 +57,56 @@
         display: block;
         touch-action: none;
       }
+      #map-area {
+        position: relative;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+      }
+      .map-controls {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+        padding: 10px;
+        border: 1px solid rgba(31, 42, 68, 0.9);
+        background: rgba(15, 23, 42, 0.72);
+        backdrop-filter: blur(8px);
+        border-radius: 12px;
+        user-select: none;
+      }
+      .map-controls[data-pos="left"] {
+        left: 12px;
+        right: auto;
+      }
+      .map-controls .btn {
+        width: 38px;
+        height: 38px;
+        padding: 0;
+        margin: 0;
+        border-radius: 10px;
+        display: grid;
+        place-items: center;
+        font-weight: 800;
+        line-height: 1;
+      }
+      .map-controls .btn.small {
+        width: 38px;
+        height: 30px;
+        font-weight: 700;
+        font-size: 12px;
+      }
+      .map-controls .hint {
+        max-width: 220px;
+        font-size: 12px;
+        color: #cbd5e1;
+        line-height: 1.35;
+      }
+      .map-controls .hint.hidden {
+        display: none;
+      }
       .section {
         border: 1px solid #1f2a44;
         border-radius: 8px;
@@ -282,7 +332,24 @@
           </div>
         </div>
       </div>
-      <canvas id="atlas-canvas-3d" width="1280" height="720"></canvas>
+      <div id="map-area">
+        <canvas id="atlas-canvas-3d" width="1280" height="720"></canvas>
+        <div id="map-controls" class="map-controls" data-pos="right" aria-label="Map controls">
+          <button id="map-home" class="btn" type="button" title="Reset camera (R)">⌂</button>
+          <button id="map-zoom-in" class="btn" type="button" title="Zoom in">+</button>
+          <button id="map-zoom-out" class="btn" type="button" title="Zoom out">−</button>
+          <button id="map-mode" class="btn small" type="button" title="Lock drag mode">Auto</button>
+          <button id="map-graticule" class="btn small" type="button" title="Toggle graticule">Grid</button>
+          <button id="map-sun" class="btn small" type="button" title="Toggle real-time sun">Sun</button>
+          <button id="map-help" class="btn small" type="button" title="Show controls">?</button>
+          <div id="map-help-text" class="hint hidden">
+            LMB drag: orbit<br />
+            RMB/Shift+drag: pan<br />
+            Wheel: zoom • Click: pick<br />
+            R: reset
+          </div>
+        </div>
+      </div>
     </div>
     <script type="module">
       function main(wasm) {
@@ -392,6 +459,15 @@
         const lineWidthValue = document.getElementById("line-width-value");
         const canvas = document.getElementById("atlas-canvas-3d");
 
+        const mapHome = document.getElementById("map-home");
+        const mapZoomIn = document.getElementById("map-zoom-in");
+        const mapZoomOut = document.getElementById("map-zoom-out");
+        const mapMode = document.getElementById("map-mode");
+        const mapGraticule = document.getElementById("map-graticule");
+        const mapSun = document.getElementById("map-sun");
+        const mapHelp = document.getElementById("map-help");
+        const mapHelpText = document.getElementById("map-help-text");
+
         const cursorText = document.getElementById("cursor-text");
         const pickText = document.getElementById("pick-text");
 
@@ -490,6 +566,7 @@
 
         let dragging = false;
         let dragMode = "orbit"; // orbit | pan
+        let lockMode = "auto"; // auto | orbit | pan
         let lastX = 0;
         let lastY = 0;
         let downX = 0;
@@ -505,8 +582,12 @@
           downY = e.clientY;
           downButton = e.button;
 
-          // left = orbit, right = pan, shift+left = pan
-          if (e.button === 2 || e.shiftKey) {
+          // If a mode is locked, use it; otherwise: left=orbit, right/shift=pan.
+          if (lockMode === "pan") {
+            dragMode = "pan";
+          } else if (lockMode === "orbit") {
+            dragMode = "orbit";
+          } else if (e.button === 2 || e.shiftKey) {
             dragMode = "pan";
           } else {
             dragMode = "orbit";
@@ -592,6 +673,41 @@
           }
         });
 
+        function syncMapToggles() {
+          mapGraticule?.classList.toggle("active", !!toggleGraticule.checked);
+          mapSun?.classList.toggle("active", !!toggleRealSun.checked);
+          if (lockMode === "auto") mapMode.textContent = "Auto";
+          if (lockMode === "orbit") mapMode.textContent = "Orbit";
+          if (lockMode === "pan") mapMode.textContent = "Pan";
+        }
+
+        mapHome?.addEventListener("click", () => {
+          try { wasm.camera_reset(); } catch (err) { console.error("camera_reset failed", err); }
+        });
+        mapZoomIn?.addEventListener("click", () => {
+          try { wasm.camera_zoom(-180); } catch (err) { console.error("camera_zoom failed", err); }
+        });
+        mapZoomOut?.addEventListener("click", () => {
+          try { wasm.camera_zoom(180); } catch (err) { console.error("camera_zoom failed", err); }
+        });
+        mapMode?.addEventListener("click", () => {
+          lockMode = lockMode === "auto" ? "orbit" : lockMode === "orbit" ? "pan" : "auto";
+          syncMapToggles();
+        });
+        mapGraticule?.addEventListener("click", () => {
+          toggleGraticule.checked = !toggleGraticule.checked;
+          toggleGraticule.dispatchEvent(new Event("change"));
+          syncMapToggles();
+        });
+        mapSun?.addEventListener("click", () => {
+          toggleRealSun.checked = !toggleRealSun.checked;
+          toggleRealSun.dispatchEvent(new Event("change"));
+          syncMapToggles();
+        });
+        mapHelp?.addEventListener("click", () => {
+          mapHelpText?.classList.toggle("hidden");
+        });
+
         dataset.addEventListener("change", (e) => {
           const value = e.target.value;
           if (!value) return;
@@ -657,6 +773,7 @@
           } catch (err) {
             console.error("set_graticule_enabled failed", err);
           }
+          syncMapToggles();
         });
 
         toggleRealSun.addEventListener("change", (e) => {
@@ -666,6 +783,7 @@
           } catch (err) {
             console.error("set_real_time_sun_enabled failed", err);
           }
+          syncMapToggles();
         });
 
         function applyCitySize() {
@@ -694,6 +812,8 @@
 
         lineWidth.addEventListener("input", applyLineWidth);
         applyLineWidth();
+
+        syncMapToggles();
 
         setStatus("Controls: LMB drag=orbit, RMB/Shift+drag=pan, wheel=zoom, R=reset, click=pick");
       }
