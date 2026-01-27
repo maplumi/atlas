@@ -203,7 +203,7 @@
   <body>
     <div id="app">
       <div id="side-panel">
-        <button id="panel-toggle" type="button" title="Toggle panel">◀</button>
+        <button id="panel-toggle" type="button" title="Collapse panel">◀</button>
         <div id="panel-resize-handle"></div>
         <div class="tabs">
           <button id="tab-general-btn" class="tab-btn active" type="button">General</button>
@@ -897,6 +897,9 @@
           app.style.setProperty("--panel-width", "0px");
         } else if (savedWidth) {
           app.style.setProperty("--panel-width", savedWidth + "px");
+        } else {
+          // Set default width explicitly for consistency
+          app.style.setProperty("--panel-width", PANEL_DEFAULT_WIDTH + "px");
         }
 
         // Toggle panel collapse/expand
@@ -909,7 +912,9 @@
             app.style.setProperty("--panel-width", "0px");
             localStorage.setItem("panel-collapsed", "true");
           } else {
-            const width = savedWidth || PANEL_DEFAULT_WIDTH;
+            // Get the most recent width from localStorage
+            const currentSavedWidth = localStorage.getItem("panel-width");
+            const width = currentSavedWidth || PANEL_DEFAULT_WIDTH;
             app.style.setProperty("--panel-width", width + "px");
             localStorage.setItem("panel-collapsed", "false");
           }
