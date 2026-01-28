@@ -1,5 +1,6 @@
 use crate::vector_chunk::{GeoPoint, VectorChunk, VectorFeature, VectorGeometry};
 use serde_json::{Map, Value};
+use std::io::{Read, Write};
 
 const MAGIC: [u8; 4] = *b"ATVC";
 const VERSION_V1: u16 = 1;
@@ -12,6 +13,7 @@ const DEG_Q: f64 = 1_000_000.0;
 #[derive(Debug)]
 pub enum AvcError {
     UnexpectedEof,
+    Io { source: String },
     InvalidMagic,
     UnsupportedVersion { found: u16 },
     InvalidVarint,
@@ -24,6 +26,7 @@ impl std::fmt::Display for AvcError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AvcError::UnexpectedEof => write!(f, "unexpected EOF"),
+            AvcError::Io { source } => write!(f, "I/O error: {source}"),
             AvcError::InvalidMagic => write!(f, "invalid ATVC magic"),
             AvcError::UnsupportedVersion { found } => {
                 write!(f, "unsupported ATVC version: {found}")
@@ -51,14 +54,20 @@ enum GeomTag {
 
 pub fn encode_avc(chunk: &VectorChunk) -> Result<Vec<u8>, AvcError> {
     let mut out: Vec<u8> = Vec::new();
+    encode_avc_to_writer(chunk, &mut out)?;
+    Ok(out)
+}
 
-    out.extend_from_slice(&MAGIC);
-    out.extend_from_slice(&VERSION_LATEST.to_le_bytes());
+pub fn encode_avc_to_writer<W: Write>(chunk: &VectorChunk, w: &mut W) -> Result<(), AvcError> {
+    w.write_all(&MAGIC).map_err(|e| AvcError::Io {
+        source: e.to_string(),
+    })?;
+    write_u16_le(w, VERSION_LATEST)?;
 
     // flags (reserved)
-    out.extend_from_slice(&0u16.to_le_bytes());
+    write_u16_le(w, 0)?;
 
-    out.extend_from_slice(&(chunk.features.len() as u32).to_le_bytes());
+    write_u32_le(w, chunk.features.len() as u32)?;
 
     // v2 baked metadata (for fast pruning / indexing)
     // lon/lat quantized bounds: [min_lon_q, max_lon_q, min_lat_q, max_lat_q]
@@ -96,98 +105,108 @@ pub fn encode_avc(chunk: &VectorChunk) -> Result<Vec<u8>, AvcError> {
         max_end_us = i64::MAX;
     }
 
-    out.extend_from_slice(&min_lon_q.to_le_bytes());
-    out.extend_from_slice(&max_lon_q.to_le_bytes());
-    out.extend_from_slice(&min_lat_q.to_le_bytes());
-    out.extend_from_slice(&max_lat_q.to_le_bytes());
-    out.extend_from_slice(&min_start_us.to_le_bytes());
-    out.extend_from_slice(&max_end_us.to_le_bytes());
+    write_i32_le(w, min_lon_q)?;
+    write_i32_le(w, max_lon_q)?;
+    write_i32_le(w, min_lat_q)?;
+    write_i32_le(w, max_lat_q)?;
+    write_i64_le(w, min_start_us)?;
+    write_i64_le(w, max_end_us)?;
 
     for feat in &chunk.features {
         let (tag, geom_bytes) = encode_geometry(&feat.geometry)?;
-        out.push(tag as u8);
+        write_u8(w, tag as u8)?;
 
         // id
         match &feat.id {
             Some(s) => {
-                write_var_u64(&mut out, s.len() as u64);
-                out.extend_from_slice(s.as_bytes());
+                write_var_u64_to_writer(w, s.len() as u64)?;
+                w.write_all(s.as_bytes()).map_err(|e| AvcError::Io {
+                    source: e.to_string(),
+                })?;
             }
             None => {
-                write_var_u64(&mut out, 0);
+                write_var_u64_to_writer(w, 0)?;
             }
         }
 
         // time span micros (inferred, but properties preserved as-is)
         let (start_us, end_us) = infer_time_span_micros(&feat.properties);
-        out.extend_from_slice(&start_us.to_le_bytes());
-        out.extend_from_slice(&end_us.to_le_bytes());
+        write_i64_le(w, start_us)?;
+        write_i64_le(w, end_us)?;
 
         // properties JSON bytes (semantic round-trip)
-        let props_bytes =
-            serde_json::to_vec(&feat.properties).map_err(|_| AvcError::InvalidJson)?;
-        write_var_u64(&mut out, props_bytes.len() as u64);
-        out.extend_from_slice(&props_bytes);
+        let props_val = canonicalize_json_value(&Value::Object(feat.properties.clone()));
+        let props_bytes = serde_json::to_vec(&props_val).map_err(|_| AvcError::InvalidJson)?;
+        write_var_u64_to_writer(w, props_bytes.len() as u64)?;
+        w.write_all(&props_bytes).map_err(|e| AvcError::Io {
+            source: e.to_string(),
+        })?;
 
         // geometry payload
-        write_var_u64(&mut out, geom_bytes.len() as u64);
-        out.extend_from_slice(&geom_bytes);
+        write_var_u64_to_writer(w, geom_bytes.len() as u64)?;
+        w.write_all(&geom_bytes).map_err(|e| AvcError::Io {
+            source: e.to_string(),
+        })?;
     }
 
-    Ok(out)
+    Ok(())
 }
 
 pub fn decode_avc(bytes: &[u8]) -> Result<VectorChunk, AvcError> {
-    let mut r = Reader::new(bytes);
+    let mut cursor = std::io::Cursor::new(bytes);
+    decode_avc_from_reader(&mut cursor)
+}
 
-    let magic = r.read_exact(4)?;
+pub fn decode_avc_from_reader<R: Read>(r: &mut R) -> Result<VectorChunk, AvcError> {
+    let magic = read_exact_io::<4>(r)?;
     if magic.as_slice() != MAGIC.as_slice() {
         return Err(AvcError::InvalidMagic);
     }
 
-    let version = u16::from_le_bytes(r.read_exact(2)?.try_into().unwrap());
+    let version = read_u16_le_io(r)?;
     if version != VERSION_V1 && version != VERSION_V2 {
         return Err(AvcError::UnsupportedVersion { found: version });
     }
 
-    let _flags = u16::from_le_bytes(r.read_exact(2)?.try_into().unwrap());
-    let feature_count = u32::from_le_bytes(r.read_exact(4)?.try_into().unwrap()) as usize;
+    let _flags = read_u16_le_io(r)?;
+    let feature_count = read_u32_le_io(r)? as usize;
 
     if version == VERSION_V2 {
         // baked metadata (currently ignored by the loader)
-        let _min_lon_q = i32::from_le_bytes(r.read_exact(4)?.try_into().unwrap());
-        let _max_lon_q = i32::from_le_bytes(r.read_exact(4)?.try_into().unwrap());
-        let _min_lat_q = i32::from_le_bytes(r.read_exact(4)?.try_into().unwrap());
-        let _max_lat_q = i32::from_le_bytes(r.read_exact(4)?.try_into().unwrap());
-        let _min_start_us = i64::from_le_bytes(r.read_exact(8)?.try_into().unwrap());
-        let _max_end_us = i64::from_le_bytes(r.read_exact(8)?.try_into().unwrap());
+        let _min_lon_q = read_i32_le_io(r)?;
+        let _max_lon_q = read_i32_le_io(r)?;
+        let _min_lat_q = read_i32_le_io(r)?;
+        let _max_lat_q = read_i32_le_io(r)?;
+        let _min_start_us = read_i64_le_io(r)?;
+        let _max_end_us = read_i64_le_io(r)?;
     }
 
     let mut features: Vec<VectorFeature> = Vec::with_capacity(feature_count);
     for _ in 0..feature_count {
-        let tag = r.read_u8()?;
+        let tag = read_u8_io(r)?;
 
-        let id_len = r.read_var_u64()? as usize;
+        let id_len = read_var_u64_io(r)? as usize;
         let id = if id_len == 0 {
             None
         } else {
-            let b = r.read_exact(id_len)?;
+            let b = read_exact_io_dyn(r, id_len)?;
             let s = std::str::from_utf8(&b).map_err(|_| AvcError::InvalidUtf8)?;
             Some(s.to_string())
         };
 
-        let start_us = i64::from_le_bytes(r.read_exact(8)?.try_into().unwrap());
-        let end_us = i64::from_le_bytes(r.read_exact(8)?.try_into().unwrap());
+        let start_us = read_i64_le_io(r)?;
+        let end_us = read_i64_le_io(r)?;
         let _time = (start_us, end_us);
 
-        let props_len = r.read_var_u64()? as usize;
-        let props_bytes = r.read_exact(props_len)?;
+        let props_len = read_var_u64_io(r)? as usize;
+        let props_bytes = read_exact_io_dyn(r, props_len)?;
         let props_val: Value =
             serde_json::from_slice(&props_bytes).map_err(|_| AvcError::InvalidJson)?;
-        let properties: Map<String, Value> = props_val.as_object().cloned().unwrap_or_default();
+        let properties: Map<String, Value> =
+            canonicalize_json_map(&props_val.as_object().cloned().unwrap_or_default());
 
-        let geom_len = r.read_var_u64()? as usize;
-        let geom_bytes = r.read_exact(geom_len)?;
+        let geom_len = read_var_u64_io(r)? as usize;
+        let geom_bytes = read_exact_io_dyn(r, geom_len)?;
         let geometry = decode_geometry(tag, &geom_bytes)?;
 
         features.push(VectorFeature {
@@ -198,6 +217,133 @@ pub fn decode_avc(bytes: &[u8]) -> Result<VectorChunk, AvcError> {
     }
 
     Ok(VectorChunk { features })
+}
+
+fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(obj) => Value::Object(canonicalize_json_map(obj)),
+        Value::Array(arr) => Value::Array(arr.iter().map(canonicalize_json_value).collect()),
+        other => other.clone(),
+    }
+}
+
+fn canonicalize_json_map(map: &Map<String, Value>) -> Map<String, Value> {
+    if map.is_empty() {
+        return Map::new();
+    }
+
+    let mut keys: Vec<&String> = map.keys().collect();
+    keys.sort();
+
+    let mut out = Map::new();
+    for k in keys {
+        if let Some(v) = map.get(k) {
+            out.insert(k.clone(), canonicalize_json_value(v));
+        }
+    }
+    out
+}
+
+fn map_io_err(e: std::io::Error) -> AvcError {
+    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+        AvcError::UnexpectedEof
+    } else {
+        AvcError::Io {
+            source: e.to_string(),
+        }
+    }
+}
+
+fn read_exact_io<const N: usize>(r: &mut impl Read) -> Result<[u8; N], AvcError> {
+    let mut buf = [0u8; N];
+    r.read_exact(&mut buf).map_err(map_io_err)?;
+    Ok(buf)
+}
+
+fn read_exact_io_dyn(r: &mut impl Read, n: usize) -> Result<Vec<u8>, AvcError> {
+    let mut buf = vec![0u8; n];
+    r.read_exact(&mut buf).map_err(map_io_err)?;
+    Ok(buf)
+}
+
+fn read_u8_io(r: &mut impl Read) -> Result<u8, AvcError> {
+    Ok(read_exact_io::<1>(r)?[0])
+}
+
+fn read_u16_le_io(r: &mut impl Read) -> Result<u16, AvcError> {
+    Ok(u16::from_le_bytes(read_exact_io::<2>(r)?))
+}
+
+fn read_u32_le_io(r: &mut impl Read) -> Result<u32, AvcError> {
+    Ok(u32::from_le_bytes(read_exact_io::<4>(r)?))
+}
+
+fn read_i32_le_io(r: &mut impl Read) -> Result<i32, AvcError> {
+    Ok(i32::from_le_bytes(read_exact_io::<4>(r)?))
+}
+
+fn read_i64_le_io(r: &mut impl Read) -> Result<i64, AvcError> {
+    Ok(i64::from_le_bytes(read_exact_io::<8>(r)?))
+}
+
+fn read_var_u64_io(r: &mut impl Read) -> Result<u64, AvcError> {
+    let mut out: u64 = 0;
+    let mut shift = 0;
+    for _ in 0..10 {
+        let b = read_u8_io(r)?;
+        out |= ((b & 0x7F) as u64) << shift;
+        if (b & 0x80) == 0 {
+            return Ok(out);
+        }
+        shift += 7;
+    }
+    Err(AvcError::InvalidVarint)
+}
+
+fn write_u8(w: &mut impl Write, v: u8) -> Result<(), AvcError> {
+    w.write_all(&[v]).map_err(|e| AvcError::Io {
+        source: e.to_string(),
+    })
+}
+
+fn write_u16_le(w: &mut impl Write, v: u16) -> Result<(), AvcError> {
+    w.write_all(&v.to_le_bytes()).map_err(|e| AvcError::Io {
+        source: e.to_string(),
+    })
+}
+
+fn write_u32_le(w: &mut impl Write, v: u32) -> Result<(), AvcError> {
+    w.write_all(&v.to_le_bytes()).map_err(|e| AvcError::Io {
+        source: e.to_string(),
+    })
+}
+
+fn write_i32_le(w: &mut impl Write, v: i32) -> Result<(), AvcError> {
+    w.write_all(&v.to_le_bytes()).map_err(|e| AvcError::Io {
+        source: e.to_string(),
+    })
+}
+
+fn write_i64_le(w: &mut impl Write, v: i64) -> Result<(), AvcError> {
+    w.write_all(&v.to_le_bytes()).map_err(|e| AvcError::Io {
+        source: e.to_string(),
+    })
+}
+
+fn write_var_u64_to_writer(w: &mut impl Write, mut v: u64) -> Result<(), AvcError> {
+    let mut buf: [u8; 10] = [0; 10];
+    let mut i = 0;
+    while v >= 0x80 {
+        buf[i] = ((v as u8) & 0x7F) | 0x80;
+        i += 1;
+        v >>= 7;
+    }
+    buf[i] = v as u8;
+    i += 1;
+
+    w.write_all(&buf[..i]).map_err(|e| AvcError::Io {
+        source: e.to_string(),
+    })
 }
 
 fn update_bounds_for_geometry(
@@ -503,8 +649,10 @@ impl<'a> Reader<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_avc, encode_avc};
-    use crate::VectorChunk;
+    use super::{decode_avc, decode_avc_from_reader, encode_avc, encode_avc_to_writer};
+    use crate::{GeoPoint, VectorChunk, VectorFeature, VectorGeometry};
+    use serde_json::{Map, Value};
+    use std::io::Cursor;
 
     fn assert_close(a: f64, b: f64, eps: f64) {
         let d = (a - b).abs();
@@ -531,5 +679,53 @@ mod tests {
                 assert_close(pa.lat_deg, pb.lat_deg, 1e-6);
             }
         }
+    }
+
+    #[test]
+    fn avc_round_trip_via_io_reader_writer() {
+        let payload = include_str!("../../apps/viewer_web/assets/chunks/cities.json");
+        let chunk = VectorChunk::from_geojson_str(payload).expect("parse");
+
+        let mut bytes: Vec<u8> = Vec::new();
+        encode_avc_to_writer(&chunk, &mut bytes).expect("encode to writer");
+
+        let mut cursor = Cursor::new(bytes);
+        let rt = decode_avc_from_reader(&mut cursor).expect("decode from reader");
+
+        assert_eq!(rt.features.len(), chunk.features.len());
+        assert_eq!(rt.features[0].properties, chunk.features[0].properties);
+    }
+
+    #[test]
+    fn avc_encoding_is_canonical_over_property_order() {
+        let mut props_a_then_b: Map<String, Value> = Map::new();
+        props_a_then_b.insert("a".to_string(), Value::String("1".to_string()));
+        props_a_then_b.insert("b".to_string(), Value::String("2".to_string()));
+
+        let mut props_b_then_a: Map<String, Value> = Map::new();
+        props_b_then_a.insert("b".to_string(), Value::String("2".to_string()));
+        props_b_then_a.insert("a".to_string(), Value::String("1".to_string()));
+
+        let feat1 = VectorFeature {
+            id: None,
+            properties: props_a_then_b,
+            geometry: VectorGeometry::Point(GeoPoint::new(0.0, 0.0)),
+        };
+        let feat2 = VectorFeature {
+            id: None,
+            properties: props_b_then_a,
+            geometry: VectorGeometry::Point(GeoPoint::new(0.0, 0.0)),
+        };
+
+        let bytes1 = encode_avc(&VectorChunk {
+            features: vec![feat1],
+        })
+        .expect("encode 1");
+        let bytes2 = encode_avc(&VectorChunk {
+            features: vec![feat2],
+        })
+        .expect("encode 2");
+
+        assert_eq!(bytes1, bytes2);
     }
 }

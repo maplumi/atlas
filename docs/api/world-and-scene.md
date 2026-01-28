@@ -8,6 +8,9 @@ The `scene::World` is the canonical in-memory representation of standardized spa
 - properties
 - vector geometry
 
-## Planned
-- selection sets
-- spatial + temporal indices
+## Implemented
+- selection sets: `scene::selection::SelectionSet`
+- indices: `scene::spatial::Bvh`, `scene::temporal::IntervalTree`
+- unified query API: `scene::query::VectorEntityQuery` + `scene::query::query_vector_entities`
+- picking: `scene::picking::pick_ray` + `scene::picking::pick_screen`
+- visibility culling: `scene::visibility::Frustum` + `scene::visibility::cull_vector_entities_in_frustum`

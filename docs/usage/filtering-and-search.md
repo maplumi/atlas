@@ -9,4 +9,4 @@ Filtering/search are engine-level APIs.
 
 ## Outputs
 - Deterministic result ordering
-- Selection sets (planned) and/or stable entity lists
+- Selection sets (`scene::selection::SelectionSet`) and/or stable entity lists

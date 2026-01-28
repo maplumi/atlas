@@ -1,7 +1,9 @@
 use foundation::bounds::Aabb3;
 use foundation::time::{Time, TimeSpan};
 use scene::components::VectorGeometryKind;
+use scene::spatial::{Bvh, Item as BvhItem};
 use scene::{World, entity::EntityId};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PropertyOp {
@@ -54,22 +56,6 @@ fn time_allows(span: Option<TimeSpan>, time: Option<Time>) -> bool {
     !(time.0 < span.start.0 || time.0 > span.end.0)
 }
 
-fn bounds_intersect_query(world: &World, entity: EntityId, query_aabb: Aabb3) -> bool {
-    let Some(b) = world.bounds(entity) else {
-        // Performance + correctness choice: bbox queries only consider entities that have
-        // explicit bounds.
-        return false;
-    };
-
-    // Direct overlap test (avoids constructing intermediate Aabb types).
-    !(b.max.x < query_aabb.min[0]
-        || b.min.x > query_aabb.max[0]
-        || b.max.y < query_aabb.min[1]
-        || b.min.y > query_aabb.max[1]
-        || b.max.z < query_aabb.min[2]
-        || b.min.z > query_aabb.max[2])
-}
-
 fn properties_match(world: &World, entity: EntityId, filters: &[PropertyFilter]) -> bool {
     if filters.is_empty() {
         return true;
@@ -103,7 +89,58 @@ fn properties_match(world: &World, entity: EntityId, filters: &[PropertyFilter])
 pub fn query_vector(world: &World, query: &VectorQuery) -> Vec<VectorQueryHit> {
     let mut out: Vec<VectorQueryHit> = Vec::new();
 
-    for (entity, _transform, component) in world.vector_geometries_by_entity() {
+    let geoms = world.vector_geometries_by_entity();
+
+    if let Some(aabb) = query.bbox_world_ecef {
+        // Build deterministic lookup for candidate retrieval.
+        let mut by_index: BTreeMap<u32, (EntityId, VectorGeometryKind)> = BTreeMap::new();
+        let mut bvh_items: Vec<BvhItem> = Vec::new();
+
+        for (entity, _transform, component) in &geoms {
+            by_index.insert(entity.index(), (*entity, component.kind));
+
+            let Some(b) = world.bounds(*entity) else {
+                continue;
+            };
+            bvh_items.push(BvhItem {
+                entity: *entity,
+                bounds: Aabb3::new([b.min.x, b.min.y, b.min.z], [b.max.x, b.max.y, b.max.z]),
+            });
+        }
+
+        let bvh = Bvh::build(bvh_items);
+        for entity in bvh.query_aabb(&aabb) {
+            let Some((_e, kind)) = by_index.get(&entity.index()) else {
+                continue;
+            };
+
+            if let Some(k) = query.kind
+                && *kind != k
+            {
+                continue;
+            }
+
+            if !time_allows(world.time_span(entity), query.time) {
+                continue;
+            }
+
+            if !properties_match(world, entity, &query.properties) {
+                continue;
+            }
+
+            out.push(VectorQueryHit {
+                entity,
+                kind: *kind,
+            });
+            if out.len() >= query.limit {
+                break;
+            }
+        }
+
+        return out;
+    }
+
+    for (entity, _transform, component) in geoms {
         if let Some(kind) = query.kind
             && component.kind != kind
         {
@@ -115,12 +152,6 @@ pub fn query_vector(world: &World, query: &VectorQuery) -> Vec<VectorQueryHit> {
         }
 
         if !properties_match(world, entity, &query.properties) {
-            continue;
-        }
-
-        if let Some(aabb) = query.bbox_world_ecef
-            && !bounds_intersect_query(world, entity, aabb)
-        {
             continue;
         }
 

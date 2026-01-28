@@ -1,5 +1,39 @@
 use serde_json::{Map, Value};
 
+fn canonicalize_json_value(value: &Value) -> Value {
+    match value {
+        Value::Object(obj) => {
+            let mut keys: Vec<&String> = obj.keys().collect();
+            keys.sort();
+            let mut out = Map::new();
+            for k in keys {
+                if let Some(v) = obj.get(k) {
+                    out.insert(k.clone(), canonicalize_json_value(v));
+                }
+            }
+            Value::Object(out)
+        }
+        Value::Array(arr) => Value::Array(arr.iter().map(canonicalize_json_value).collect()),
+        other => other.clone(),
+    }
+}
+
+fn canonicalize_properties(props: &Map<String, Value>) -> Map<String, Value> {
+    if props.is_empty() {
+        return Map::new();
+    }
+
+    let mut keys: Vec<&String> = props.keys().collect();
+    keys.sort();
+    let mut out = Map::new();
+    for k in keys {
+        if let Some(v) = props.get(k) {
+            out.insert(k.clone(), canonicalize_json_value(v));
+        }
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GeoPoint {
     pub lon_deg: f64,
@@ -115,6 +149,7 @@ impl VectorChunk {
                 .and_then(|v| v.as_object())
                 .cloned()
                 .unwrap_or_default();
+            let properties = canonicalize_properties(&properties);
 
             let geometry_val =
                 feat_obj
@@ -181,8 +216,21 @@ impl VectorChunk {
         crate::vector_chunk_avc::encode_avc(self)
     }
 
+    pub fn to_avc_writer<W: std::io::Write>(
+        &self,
+        w: &mut W,
+    ) -> Result<(), crate::vector_chunk_avc::AvcError> {
+        crate::vector_chunk_avc::encode_avc_to_writer(self, w)
+    }
+
     pub fn from_avc_bytes(bytes: &[u8]) -> Result<Self, crate::vector_chunk_avc::AvcError> {
         crate::vector_chunk_avc::decode_avc(bytes)
+    }
+
+    pub fn from_avc_reader<R: std::io::Read>(
+        r: &mut R,
+    ) -> Result<Self, crate::vector_chunk_avc::AvcError> {
+        crate::vector_chunk_avc::decode_avc_from_reader(r)
     }
 }
 

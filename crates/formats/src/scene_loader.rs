@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use scene::World;
@@ -89,11 +90,6 @@ pub fn load_world_from_package(package: &ScenePackage) -> Result<World, SceneWor
             .map(|s| s.eq_ignore_ascii_case("avc"))
             .unwrap_or(false)
         {
-            let bytes = fs::read(&path).map_err(|e| SceneWorldLoadError::ChunkIo {
-                path: path.clone(),
-                source: e,
-            })?;
-
             // Hash enforcement for binary chunks: makes caching and streaming deterministic and safe.
             let expected = entry.content_hash.clone().ok_or_else(|| {
                 SceneWorldLoadError::ChunkHashMissing {
@@ -101,7 +97,29 @@ pub fn load_world_from_package(package: &ScenePackage) -> Result<World, SceneWor
                     path: path.clone(),
                 }
             })?;
-            let found = to_hex(blake3::hash(&bytes).as_bytes());
+
+            let file = std::fs::File::open(&path).map_err(|e| SceneWorldLoadError::ChunkIo {
+                path: path.clone(),
+                source: e,
+            })?;
+
+            let mut reader = HashingReader::new(file);
+            let chunk = VectorChunk::from_avc_reader(&mut reader).map_err(|e| {
+                SceneWorldLoadError::ChunkParse {
+                    chunk_id: entry.id.clone(),
+                    source: e.to_string(),
+                }
+            })?;
+
+            // Ensure the hash covers the entire file (even if trailing bytes exist).
+            std::io::copy(&mut reader, &mut std::io::sink()).map_err(|e| {
+                SceneWorldLoadError::ChunkIo {
+                    path: path.clone(),
+                    source: e,
+                }
+            })?;
+
+            let found = reader.finalize_hex();
             if !eq_hex(&expected, &found) {
                 return Err(SceneWorldLoadError::ChunkHashMismatch {
                     chunk_id: entry.id.clone(),
@@ -111,10 +129,7 @@ pub fn load_world_from_package(package: &ScenePackage) -> Result<World, SceneWor
                 });
             }
 
-            VectorChunk::from_avc_bytes(&bytes).map_err(|e| SceneWorldLoadError::ChunkParse {
-                chunk_id: entry.id.clone(),
-                source: e.to_string(),
-            })?
+            chunk
         } else {
             let payload = fs::read_to_string(&path).map_err(|e| SceneWorldLoadError::ChunkIo {
                 path: path.clone(),
@@ -132,6 +147,34 @@ pub fn load_world_from_package(package: &ScenePackage) -> Result<World, SceneWor
     }
 
     Ok(world)
+}
+
+struct HashingReader<R> {
+    inner: R,
+    hasher: blake3::Hasher,
+}
+
+impl<R> HashingReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    fn finalize_hex(&self) -> String {
+        to_hex(self.hasher.clone().finalize().as_bytes())
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        if n > 0 {
+            self.hasher.update(&buf[..n]);
+        }
+        Ok(n)
+    }
 }
 
 fn to_hex(bytes: &[u8]) -> String {

@@ -14,34 +14,34 @@ Status legend:
 - [x] Single standardized in-memory representation (`scene::World`) shared by 2D and 3D.
 - [x] Every ingested feature is time-tagged (defaults to “forever” if missing).
 - [x] Every ingested feature preserves properties for querying/filtering.
-- [ ] Determinism policy: stable iteration ordering + stable floats policy + deterministic streaming/compute scheduling.
-- [ ] Dataset identity/versioning: content hash + immutable package IDs.
+- [x] Determinism policy: stable iteration ordering + stable floats policy + deterministic streaming/compute scheduling.
+- [x] Dataset identity/versioning: content hash + immutable package IDs.
 
 ## 1) Foundation (math, time, ids)
 - [x] WGS84 geodesy: Geodetic ↔ ECEF (`crates/foundation/src/math/geodesy.rs`)
 - [x] Local tangent frame: ECEF ↔ ENU (`crates/foundation/src/math/local.rs`)
 - [x] Time primitives: `Time`, `TimeSpan`, `forever()`, `instant()` (`crates/foundation/src/time.rs`)
 - [x] AABB primitives: `Aabb2`, `Aabb3` (basic structs) (`crates/foundation/src/bounds.rs`)
-- [ ] Generational handles with validity + free-list reuse (currently minimal stub) (`crates/foundation/src/handles.rs`)
-- [ ] Arena allocator strategy (currently minimal placeholder) (`crates/foundation/src/arena.rs`)
-- [ ] Camera-relative precision model (currently only `type HighPrecision = f64`) (`crates/foundation/src/math/precision.rs`)
+- [x] Generational handles with validity + free-list reuse (`crates/foundation/src/handles.rs`)
+- [x] Arena allocator strategy (generational arena + free-list reuse) (`crates/foundation/src/arena.rs`)
+- [x] Camera-relative precision model (`crates/foundation/src/math/precision.rs`)
 
 ## 2) Runtime (deterministic scheduling + observability)
 - [x] Deterministic job ordering by ID (basic scheduler) (`crates/runtime/src/scheduler.rs`)
-- [ ] Frame budget management (time slicing / prioritization)
-- [ ] Streaming + compute work queues with backpressure
-- [ ] Metrics system (currently stub) (`crates/runtime/src/metrics.rs`)
+- [x] Frame budget management (time slicing / prioritization)
+- [x] Streaming + compute work queues with backpressure
+- [x] Metrics system (currently stub) (`crates/runtime/src/metrics.rs`)
 
 ## 3) Scene (world model, components, indices)
 - [x] Minimal ECS-style `World` with sparse component vectors + visibility gating + time filtering (`crates/scene/src/world.rs`)
 - [x] Feature properties component (key/value pairs) (`crates/scene/src/components/properties.rs`)
 - [x] Vector geometry storage (points/lines/areas) + transforms (ECEF)
-- [ ] Spatial index (quadtree/BVH) (currently stub types) (`crates/scene/src/spatial/`)
-- [ ] Temporal index (interval tree) (currently stub type) (`crates/scene/src/temporal/interval_tree.rs`)
-- [ ] Selection sets as bitsets + set operations (union/intersect/diff)
-- [ ] Unified query API in core (spatial + temporal + attribute) with deterministic ordering
-- [ ] Picking API (`pick(ray)` / `pick(screen)`) in core
-- [ ] Visibility volumes / frustum culling in core
+- [x] Spatial index (quadtree/BVH) (currently stub types) (`crates/scene/src/spatial/`)
+- [x] Temporal index (interval tree) (currently stub type) (`crates/scene/src/temporal/interval_tree.rs`)
+- [x] Selection sets as bitsets + set operations (union/intersect/diff)
+- [x] Unified query API in core (spatial + temporal + attribute) with deterministic ordering
+- [x] Picking API (`pick(ray)` / `pick(screen)`) in core
+- [x] Visibility volumes / frustum culling in core
 
 ## 4) Formats (packages, chunks, determinism)
 - [x] Scene manifest with version + chunk entries (minimal) (`crates/formats/src/manifest.rs`)
@@ -50,13 +50,13 @@ Status legend:
 - [x] Vector chunk binary format (fast/compact) with lon/lat quantization + semantic round-trip export
 - [x] Optional blob storage for original source payloads when a blob store is configured (store hash refs in manifest)
 - [x] Chunk schemas include: time domain, spatial bounds, feature count, content hash
-- [ ] Binary + streamable chunk encodings (vs. JSON-only)
-- [ ] Deterministic decoding and canonicalization rules
+- [x] Binary + streamable chunk encodings (vs. JSON-only)
+- [x] Deterministic decoding and canonicalization rules
 
 ## 5) Streaming (cache + residency)
-- [ ] Cache + residency lifecycle with memory budgets (currently stub) (`crates/streaming/src/cache.rs`)
-- [ ] Deterministic request ordering + cancellation
-- [ ] Dataset version pinning and cache invalidation rules
+- [x] Cache + residency lifecycle with memory budgets (implemented) (`crates/streaming/src/cache.rs`)
+- [x] Deterministic request ordering + cancellation
+- [x] Dataset version pinning and cache invalidation rules (`crates/streaming/src/cache.rs`)
 
 ## 6) GPU (core renderer crate)
 - [ ] Core WebGPU context/device setup in `gpu` crate (currently stub) (`crates/gpu/src/context.rs`)
@@ -99,7 +99,7 @@ Status legend:
 ## 12) Ingestion rules (hard requirements)
 - [x] Every dataset gets a `TimeSpan` on ingest (even if forever)
 - [x] Every dataset preserves properties for later filter/symbolization
-- [ ] Dataset content hash computed and stored in manifest
+- [x] Dataset content hash computed and stored in manifest
 - [x] Chunk-level spatial/temporal metadata baked during packaging
 
 ## Validation

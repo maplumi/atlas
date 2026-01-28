@@ -50,6 +50,7 @@ fn properties_to_pairs(feature: &VectorFeature) -> Vec<(String, String)> {
         };
         out.push((k.clone(), s));
     }
+    out.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     out
 }
 

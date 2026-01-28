@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 
 fn main() {
@@ -20,9 +21,104 @@ fn real_main() -> Result<(), String> {
 
     match cmd.as_str() {
         "pack" => cmd_pack(args),
+        "manifest" => cmd_manifest(args),
         "unpack" => cmd_unpack(args),
         _ => Err(usage()),
     }
+}
+
+fn cmd_manifest(args: Vec<String>) -> Result<(), String> {
+    // atlas manifest <output_dir> <chunk.avc> [chunk2.avc ...] [--name NAME]
+    if args.len() < 2 {
+        return Err(usage());
+    }
+
+    let out_dir = PathBuf::from(&args[0]);
+    let mut name: Option<String> = None;
+    let mut chunk_paths: Vec<PathBuf> = Vec::new();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--name" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--name requires a value".to_string());
+                }
+                name = Some(args[i].clone());
+            }
+            s if s.starts_with('-') => {
+                return Err(format!("unknown arg: {s}\n\n{}", usage()));
+            }
+            _ => {
+                chunk_paths.push(PathBuf::from(&args[i]));
+            }
+        }
+        i += 1;
+    }
+
+    if chunk_paths.is_empty() {
+        return Err("manifest requires at least one chunk path".to_string());
+    }
+
+    fs::create_dir_all(&out_dir).map_err(|e| format!("create {out_dir:?}: {e}"))?;
+
+    let mut manifest = formats::SceneManifest::new("placeholder");
+    manifest.name = name;
+
+    for p in chunk_paths {
+        let bytes = fs::read(&p).map_err(|e| format!("read {p:?}: {e}"))?;
+        let chunk_hash = blake3::hash(&bytes);
+        let chunk_hash_hex = to_hex(chunk_hash.as_bytes());
+
+        let chunk =
+            formats::VectorChunk::from_avc_bytes(&bytes).map_err(|e| format!("decode avc: {e}"))?;
+        let kind = infer_manifest_kind(&chunk);
+        let (lon_lat_bounds_q, time_bounds_us) = compute_chunk_bounds_q_and_time_us(&chunk);
+        let feature_count = chunk.features.len() as u32;
+
+        let file_name = p
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("invalid chunk filename: {p:?}"))?
+            .to_string();
+        let id = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("chunk")
+            .to_string();
+
+        let out_path = out_dir.join(&file_name);
+        if out_path.exists() {
+            return Err(format!("output chunk already exists: {out_path:?}"));
+        }
+        fs::write(&out_path, &bytes).map_err(|e| format!("write {out_path:?}: {e}"))?;
+
+        manifest.chunks.push(formats::ChunkEntry {
+            id,
+            kind,
+            path: file_name,
+            content_hash: Some(chunk_hash_hex),
+            source_blob_hash: None,
+            lon_lat_bounds_q: Some(lon_lat_bounds_q),
+            time_bounds_us: Some(time_bounds_us),
+            feature_count: Some(feature_count),
+        });
+    }
+
+    manifest.compute_and_set_identity();
+
+    let manifest_path = out_dir.join(formats::scene_package::MANIFEST_FILE_NAME);
+    let payload = serde_json::to_string_pretty(&manifest).map_err(|e| format!("json: {e}"))?;
+    fs::write(&manifest_path, payload).map_err(|e| format!("write {manifest_path:?}: {e}"))?;
+
+    eprintln!(
+        "wrote {} (package_id={}, content_hash={})",
+        manifest_path.display(),
+        manifest.package_id,
+        manifest.content_hash.clone().unwrap_or_default()
+    );
+    Ok(())
 }
 
 fn cmd_pack(args: Vec<String>) -> Result<(), String> {
@@ -63,13 +159,16 @@ fn cmd_pack(args: Vec<String>) -> Result<(), String> {
     let chunk = formats::VectorChunk::from_geojson_str(input_str)
         .map_err(|e| format!("parse geojson: {e}"))?;
 
-    let avc = chunk
-        .to_avc_bytes()
+    let file = fs::File::create(&output).map_err(|e| format!("create {output:?}: {e}"))?;
+    let mut writer = HashingWriter::new(file);
+    chunk
+        .to_avc_writer(&mut writer)
         .map_err(|e| format!("encode avc: {e}"))?;
-    fs::write(&output, &avc).map_err(|e| format!("write {output:?}: {e}"))?;
+    writer
+        .flush()
+        .map_err(|e| format!("flush {output:?}: {e}"))?;
 
-    let chunk_hash = blake3::hash(&avc);
-    let chunk_hash_hex = to_hex(chunk_hash.as_bytes());
+    let chunk_hash_hex = writer.finalize_hex();
 
     let mut source_blob_hash_hex: Option<String> = None;
     if let Some(dir) = blob_dir {
@@ -152,6 +251,38 @@ fn cmd_pack(args: Vec<String>) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+struct HashingWriter<W> {
+    inner: W,
+    hasher: blake3::Hasher,
+}
+
+impl<W> HashingWriter<W> {
+    fn new(inner: W) -> Self {
+        Self {
+            inner,
+            hasher: blake3::Hasher::new(),
+        }
+    }
+
+    fn finalize_hex(&self) -> String {
+        to_hex(self.hasher.clone().finalize().as_bytes())
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for HashingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        if n > 0 {
+            self.hasher.update(&buf[..n]);
+        }
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 fn infer_manifest_kind(chunk: &formats::VectorChunk) -> String {
@@ -341,6 +472,6 @@ fn to_hex(bytes: &[u8]) -> String {
 fn usage() -> String {
     let exe = env::args().next().unwrap_or_else(|| "atlas".to_string());
     format!(
-        "Usage:\n  {exe} pack <input.geojson> <output.avc> [--blob-dir DIR] [--print-chunk-entry]\n  {exe} unpack <input.avc> <output.geojson>\n\nNotes:\n- Uses lon/lat quantization (1e-6 degrees).\n- Semantic round-trip: unpacked GeoJSON preserves geometry + properties, but JSON ordering may differ.\n- Blob storage is only active when --blob-dir is provided (stores original source bytes by content hash).\n"
+        "Usage:\n  {exe} pack <input.geojson> <output.avc> [--blob-dir DIR] [--print-chunk-entry]\n  {exe} manifest <output_dir> <chunk.avc> [chunk2.avc ...] [--name NAME]\n  {exe} unpack <input.avc> <output.geojson>\n\nNotes:\n- Uses lon/lat quantization (1e-6 degrees).\n- Semantic round-trip: unpacked GeoJSON preserves geometry + properties, but JSON ordering may differ.\n- Blob storage is only active when --blob-dir is provided (stores original source bytes by content hash).\n- `manifest` writes a self-contained scene package directory with `scene.manifest.json`.\n"
     )
 }

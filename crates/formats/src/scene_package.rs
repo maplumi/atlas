@@ -16,7 +16,14 @@ pub struct ScenePackage {
 pub enum ScenePackageError {
     Io(std::io::Error),
     Parse(serde_json::Error),
-    UnsupportedVersion { found: String },
+    UnsupportedVersion {
+        found: String,
+    },
+    InvalidIdentity {
+        expected_content_hash: String,
+        found_content_hash: String,
+        found_package_id: String,
+    },
 }
 
 impl fmt::Display for ScenePackageError {
@@ -27,6 +34,14 @@ impl fmt::Display for ScenePackageError {
             ScenePackageError::UnsupportedVersion { found } => {
                 write!(f, "Unsupported manifest version: {found}")
             }
+            ScenePackageError::InvalidIdentity {
+                expected_content_hash,
+                found_content_hash,
+                found_package_id,
+            } => write!(
+                f,
+                "Invalid manifest identity: expected content_hash={expected_content_hash}, found content_hash={found_content_hash}, package_id={found_package_id}"
+            ),
         }
     }
 }
@@ -45,6 +60,20 @@ impl ScenePackage {
             return Err(ScenePackageError::UnsupportedVersion {
                 found: manifest.version,
             });
+        }
+
+        // Optional integrity + immutability check.
+        // If a manifest declares a content hash, it must match our canonical computation,
+        // and the package id must equal the content hash.
+        if let Some(found) = &manifest.content_hash {
+            let expected = manifest.compute_content_hash_hex();
+            if &expected != found || manifest.package_id != *found {
+                return Err(ScenePackageError::InvalidIdentity {
+                    expected_content_hash: expected,
+                    found_content_hash: found.clone(),
+                    found_package_id: manifest.package_id.clone(),
+                });
+            }
         }
 
         Ok(Self { root, manifest })
@@ -97,6 +126,37 @@ mod tests {
         let package = ScenePackage::load(&root).expect("load package");
         assert_eq!(package.root(), root.as_path());
         assert_eq!(package.manifest(), &manifest);
+    }
+
+    #[test]
+    fn accepts_manifest_with_valid_identity() {
+        let root = temp_dir("identity_ok");
+        let mut manifest = SceneManifest::new("placeholder");
+        manifest.name = Some("Demo".to_string());
+        manifest.compute_and_set_identity();
+
+        let payload = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
+        fs::write(root.join(MANIFEST_FILE_NAME), payload).expect("write manifest");
+
+        let package = ScenePackage::load(&root).expect("load package");
+        assert_eq!(package.manifest(), &manifest);
+    }
+
+    #[test]
+    fn rejects_manifest_with_mismatched_identity() {
+        let root = temp_dir("identity_bad");
+        let mut manifest = SceneManifest::new("not-a-hash");
+        manifest.name = Some("Demo".to_string());
+        manifest.content_hash = Some("deadbeef".to_string());
+
+        let payload = serde_json::to_string_pretty(&manifest).expect("serialize manifest");
+        fs::write(root.join(MANIFEST_FILE_NAME), payload).expect("write manifest");
+
+        let err = ScenePackage::load(&root).expect_err("expect identity error");
+        match err {
+            ScenePackageError::InvalidIdentity { .. } => {}
+            other => panic!("unexpected error: {other}"),
+        }
     }
 
     #[test]
