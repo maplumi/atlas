@@ -1,6 +1,6 @@
 [book]
 # Standard mdBook layout.
-src = "src"
+src = "."
 title = "Atlas"
 
 [build]

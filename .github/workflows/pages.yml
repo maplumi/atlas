@@ -51,9 +51,8 @@ jobs:
 
       - name: Sync releases into docs
         run: |
-          mkdir -p docs
-          mkdir -p docs/src
-          cp CHANGELOG.md docs/src/releases.md
+          mkdir -p docs/development
+          cp CHANGELOG.md docs/development/release-notes.md
 
       - name: Build mdBook
         run: |

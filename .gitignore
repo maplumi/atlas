@@ -15,6 +15,9 @@
 /crates/apps/viewer_web/dist/
 /crates/apps/viewer_web/.trunk/
 
+# mdBook output
+/docs/book/
+
 # Editor directories and system files
 .vscode/
 .idea/

@@ -193,24 +193,21 @@ fn ellipsoid_normal(p: vec3<f32>) -> vec3<f32> {
 fn vs_main(
     @location(0) center: vec3<f32>,
     @location(1) lift: f32,
-    // Half-size offset in meters (constant physical size).
-    @location(2) offset_m: vec2<f32>,
+    // Half-size offset in screen pixels.
+    @location(2) offset_px: vec2<f32>,
     @location(3) color: vec4<f32>,
 ) -> VsOut {
     let n = ellipsoid_normal(center);
     let world_center = center + n * lift;
 
-    // Tangent basis.
-    let up = select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(n.y) > 0.99);
-    let east = normalize(cross(up, n));
-    let north = normalize(cross(n, east));
-
-    // World units are meters.
-    let offset_world = (east * offset_m.x) + (north * offset_m.y);
-
-    // Place marker corners in the local tangent plane.
-    let world_pos = world_center + offset_world;
-    let clip = globals.view_proj * vec4<f32>(world_pos, 1.0);
+    // Project the center, then offset in clip space so size stays constant in pixels.
+    let clip_center = globals.view_proj * vec4<f32>(world_center, 1.0);
+    let vp = max(globals.viewport, vec2<f32>(1.0, 1.0));
+    let ndc_offset = vec2<f32>(
+        (offset_px.x * 2.0) / vp.x,
+        (-offset_px.y * 2.0) / vp.y,
+    );
+    let clip = clip_center + vec4<f32>(ndc_offset * clip_center.w, 0.0, 0.0);
     return VsOut(clip, color);
 }
 

@@ -6,9 +6,11 @@ pub mod scene_loader;
 pub mod scene_package;
 pub mod terrain_chunk;
 pub mod vector_chunk;
+pub mod vector_chunk_avc;
 
 pub use manifest::*;
 pub use scene_ingest::*;
 pub use scene_loader::*;
 pub use scene_package::*;
 pub use vector_chunk::*;
+pub use vector_chunk_avc::*;

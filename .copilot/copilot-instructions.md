@@ -1,6 +1,6 @@
 # Copilot Instructions — atlas
 
-This file documents the expected programming paradigms, code organization, formatting/linting workflow, and testing strategy for the `atlas` workspace. Refer to the overall project governance and high-level direction in the preamble: [docs/preamble.md](docs/preamble.md).
+This file documents the expected programming paradigms, code organization, formatting/linting workflow, and testing strategy for the `atlas` workspace. Refer to the overall project governance and high-level direction in the constitution: [docs/technical/architecture/engine-constitution.md](../docs/technical/architecture/engine-constitution.md).
 
 **Programming paradigms**
 - Prefer idiomatic Rust: ownership, borrowing, and explicit `Result`/`Option` handling.
@@ -71,7 +71,7 @@ This file documents the expected programming paradigms, code organization, forma
 - Run a single crate tests: `cargo test -p crate_name`
 
 **Where to look for project intent**
-Refer to the high-level governance and project purpose in the preamble: [docs/preamble.md](docs/preamble.md).
+Refer to the high-level governance and project purpose in the constitution: [docs/technical/architecture/engine-constitution.md](../docs/technical/architecture/engine-constitution.md).
 
 ---
 If you want, I can also add a simple GitHub Actions CI workflow that runs the CI checklist above, and/or add a sample `pre-commit` hook for `cargo fmt` and `cargo clippy`.

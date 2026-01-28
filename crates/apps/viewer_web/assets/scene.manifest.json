@@ -3,8 +3,32 @@
   "package_id": "atlas-demo-world",
   "name": "Atlas Demo World",
   "chunks": [
-    { "id": "cities", "kind": "points", "path": "chunks/cities.json" },
-    { "id": "air_corridors", "kind": "lines", "path": "chunks/air_corridors.json" },
-    { "id": "regions", "kind": "areas", "path": "chunks/regions.json" }
+    {
+      "id": "cities",
+      "kind": "points",
+      "path": "chunks/cities.avc",
+      "content_hash": "721cba70f7fdf7010512689d7d3e553f7c17ee8c037fa5eb85f81e19f0b8f699",
+      "feature_count": 6,
+      "lon_lat_bounds_q": [-74006000, -33868800, 151209300, 51507400],
+      "time_bounds_us": [-9223372036854775808, 9223372036854775807]
+    },
+    {
+      "id": "air_corridors",
+      "kind": "lines",
+      "path": "chunks/air_corridors.avc",
+      "content_hash": "d8ed4eac54b42cf1579c3d4189f9ad22b844a509afa3cec43ac398d0d021b982",
+      "feature_count": 3,
+      "lon_lat_bounds_q": [-74006000, -33868800, 151209300, 51507400],
+      "time_bounds_us": [-9223372036854775808, 9223372036854775807]
+    },
+    {
+      "id": "regions",
+      "kind": "areas",
+      "path": "chunks/regions.avc",
+      "content_hash": "04cb791f0b211f87c88492cfadd7a8bc52fa26b928ac49be071711f3d967065f",
+      "feature_count": 3,
+      "lon_lat_bounds_q": [-6000000, -5000000, 146000000, 59000000],
+      "time_bounds_us": [-9223372036854775808, 9223372036854775807]
+    }
   ]
 }

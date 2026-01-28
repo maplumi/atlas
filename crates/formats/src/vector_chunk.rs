@@ -135,6 +135,123 @@ impl VectorChunk {
 
         Ok(Self { features })
     }
+
+    /// Semantic round-trip exporter: emits a GeoJSON FeatureCollection.
+    /// (Property ordering may differ from the original input.)
+    pub fn to_geojson_value(&self) -> Value {
+        let mut root = Map::new();
+        root.insert(
+            "type".to_string(),
+            Value::String("FeatureCollection".to_string()),
+        );
+
+        let mut features: Vec<Value> = Vec::with_capacity(self.features.len());
+        for feat in &self.features {
+            let mut fobj = Map::new();
+            fobj.insert("type".to_string(), Value::String("Feature".to_string()));
+            if let Some(id) = &feat.id {
+                fobj.insert("id".to_string(), Value::String(id.clone()));
+            }
+
+            fobj.insert(
+                "properties".to_string(),
+                Value::Object(feat.properties.clone()),
+            );
+
+            fobj.insert(
+                "geometry".to_string(),
+                geometry_to_geojson_value(&feat.geometry),
+            );
+            features.push(Value::Object(fobj));
+        }
+
+        root.insert("features".to_string(), Value::Array(features));
+        Value::Object(root)
+    }
+
+    pub fn to_geojson_string(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string(&self.to_geojson_value())
+    }
+
+    pub fn to_geojson_string_pretty(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(&self.to_geojson_value())
+    }
+
+    pub fn to_avc_bytes(&self) -> Result<Vec<u8>, crate::vector_chunk_avc::AvcError> {
+        crate::vector_chunk_avc::encode_avc(self)
+    }
+
+    pub fn from_avc_bytes(bytes: &[u8]) -> Result<Self, crate::vector_chunk_avc::AvcError> {
+        crate::vector_chunk_avc::decode_avc(bytes)
+    }
+}
+
+fn geometry_to_geojson_value(geom: &VectorGeometry) -> Value {
+    let mut obj = Map::new();
+    match geom {
+        VectorGeometry::Point(p) => {
+            obj.insert("type".to_string(), Value::String("Point".to_string()));
+            obj.insert(
+                "coordinates".to_string(),
+                Value::Array(vec![Value::from(p.lon_deg), Value::from(p.lat_deg)]),
+            );
+        }
+        VectorGeometry::MultiPoint(ps) => {
+            obj.insert("type".to_string(), Value::String("MultiPoint".to_string()));
+            obj.insert(
+                "coordinates".to_string(),
+                Value::Array(ps.iter().map(point_coords).collect()),
+            );
+        }
+        VectorGeometry::LineString(ps) => {
+            obj.insert("type".to_string(), Value::String("LineString".to_string()));
+            obj.insert(
+                "coordinates".to_string(),
+                Value::Array(ps.iter().map(point_coords).collect()),
+            );
+        }
+        VectorGeometry::MultiLineString(lines) => {
+            obj.insert(
+                "type".to_string(),
+                Value::String("MultiLineString".to_string()),
+            );
+            let coords = lines
+                .iter()
+                .map(|line| Value::Array(line.iter().map(point_coords).collect()))
+                .collect();
+            obj.insert("coordinates".to_string(), Value::Array(coords));
+        }
+        VectorGeometry::Polygon(rings) => {
+            obj.insert("type".to_string(), Value::String("Polygon".to_string()));
+            let coords = rings
+                .iter()
+                .map(|ring| Value::Array(ring.iter().map(point_coords).collect()))
+                .collect();
+            obj.insert("coordinates".to_string(), Value::Array(coords));
+        }
+        VectorGeometry::MultiPolygon(polys) => {
+            obj.insert(
+                "type".to_string(),
+                Value::String("MultiPolygon".to_string()),
+            );
+            let coords = polys
+                .iter()
+                .map(|poly| {
+                    let rings = poly
+                        .iter()
+                        .map(|ring| Value::Array(ring.iter().map(point_coords).collect()))
+                        .collect();
+                    Value::Array(rings)
+                })
+                .collect();
+            obj.insert("coordinates".to_string(), Value::Array(coords));
+        }
+    }
+    Value::Object(obj)
+}
+
+fn point_coords(p: &GeoPoint) -> Value {
+    Value::Array(vec![Value::from(p.lon_deg), Value::from(p.lat_deg)])
 }
 
 fn parse_geometry(value: &Value) -> Result<VectorGeometry, String> {

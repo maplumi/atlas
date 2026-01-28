@@ -103,11 +103,18 @@
         border-color: #3b82f6;
       }
       .tab-page.hidden { display: none; }
+      #atlas-canvas-2d,
       #atlas-canvas-3d {
+        position: absolute;
+        inset: 0;
         width: 100%;
         height: 100%;
         display: block;
         touch-action: none;
+      }
+      #atlas-canvas-2d.hidden,
+      #atlas-canvas-3d.hidden {
+        display: none;
       }
       #map-area {
         position: relative;
@@ -129,6 +136,15 @@
         border-radius: 12px;
         user-select: none;
       }
+      .map-controls-row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+        justify-content: flex-end;
+        padding-bottom: 4px;
+        border-bottom: 1px solid rgba(31, 42, 68, 0.75);
+        margin-bottom: 2px;
+      }
       .map-controls[data-pos="left"] {
         left: 12px;
         right: auto;
@@ -149,6 +165,36 @@
         height: 30px;
         font-weight: 700;
         font-size: 12px;
+      }
+      #map-compass {
+        width: 38px;
+        height: 38px;
+        border-radius: 999px;
+        position: relative;
+        padding: 0;
+      }
+      #map-compass .compass-label {
+        position: absolute;
+        top: 6px;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 11px;
+        font-weight: 900;
+        color: #e5e7eb;
+        letter-spacing: 0.5px;
+        pointer-events: none;
+      }
+      #compass-needle {
+        position: absolute;
+        left: 50%;
+        top: 50%;
+        width: 2px;
+        height: 13px;
+        background: #ef4444;
+        border-radius: 2px;
+        transform-origin: 50% 100%;
+        transform: translate(-50%, -100%) rotate(0deg);
+        pointer-events: none;
       }
       .map-controls .hint {
         max-width: 220px;
@@ -213,6 +259,17 @@
 
         <div id="tab-general" class="tab-page">
           <div class="section">
+            <h3>Mode</h3>
+            <div class="tabs">
+              <button id="mode-2d" class="tab-btn" type="button">2D</button>
+              <button id="mode-3d" class="tab-btn active" type="button">3D</button>
+            </div>
+            <div style="font-size:12px; color:#94a3b8; line-height:1.35; margin-top:8px;">
+              Switches the active surface. Layers and dataset stay the same.
+            </div>
+          </div>
+
+          <div class="section">
             <h3>Datasets</h3>
             <label for="dataset">Choose dataset</label>
             <select id="dataset">
@@ -249,10 +306,10 @@
         <div id="tab-layers" class="tab-page hidden">
           <div class="section">
             <h3>Points</h3>
-            <label for="city-size">Point size (m)</label>
+            <label for="city-size">Point size (px)</label>
             <div class="row">
-              <input id="city-size" type="range" min="100" max="50000" step="100" value="6000" />
-              <span id="city-size-value" class="value">6000</span>
+              <input id="city-size" type="range" min="1" max="24" step="1" value="4" />
+              <span id="city-size-value" class="value">4</span>
             </div>
           </div>
 
@@ -387,8 +444,16 @@
         </div>
       </div>
       <div id="map-area">
+        <canvas id="atlas-canvas-2d" width="1280" height="720" class="hidden"></canvas>
         <canvas id="atlas-canvas-3d" width="1280" height="720"></canvas>
         <div id="map-controls" class="map-controls" data-pos="right" aria-label="Map controls">
+          <div class="map-controls-row" aria-label="View and compass">
+            <button id="map-view" class="btn small" type="button" title="Toggle 2D/3D view">3D</button>
+            <button id="map-compass" class="btn" type="button" title="North/South orientation">
+              <span id="compass-needle" aria-hidden="true"></span>
+              <span class="compass-label" aria-hidden="true">N</span>
+            </button>
+          </div>
           <button id="map-home" class="btn" type="button" title="Reset camera (R)">⌂</button>
           <button id="map-zoom-in" class="btn" type="button" title="Zoom in">+</button>
           <button id="map-zoom-out" class="btn" type="button" title="Zoom out">−</button>
@@ -397,8 +462,8 @@
           <button id="map-sun" class="btn small" type="button" title="Toggle real-time sun">Sun</button>
           <button id="map-help" class="btn small" type="button" title="Show controls">?</button>
           <div id="map-help-text" class="hint hidden">
-            LMB drag: orbit<br />
-            RMB/Shift+drag: pan<br />
+            3D: LMB drag orbit • RMB/Shift pan<br />
+            2D: drag pan<br />
             Wheel: zoom • Click: pick<br />
             R: reset
           </div>
@@ -410,6 +475,7 @@
         wireUi(wasm);
         resizeCanvas(wasm);
         window.addEventListener("resize", () => resizeCanvas(wasm));
+        wasm.init_canvas_2d();
         wasm.init_wgpu();
         // preload built-in dataset
         const manifestUrl = new URL("./assets/scene.manifest.json", import.meta.url).toString();
@@ -471,6 +537,7 @@
         function loop() {
           try {
             wasm.advance_frame();
+            if (window.__atlasUpdateCompass) window.__atlasUpdateCompass();
           } catch (e) {
             console.error("advance_frame failed", e);
             return;
@@ -484,7 +551,10 @@
         const panel = document.getElementById("side-panel");
         const width = window.innerWidth - panel.offsetWidth;
         const height = window.innerHeight;
+        const canvas2d = document.getElementById("atlas-canvas-2d");
         const canvas3d = document.getElementById("atlas-canvas-3d");
+        canvas2d.width = width;
+        canvas2d.height = height;
         canvas3d.width = width;
         canvas3d.height = height;
         wasm.set_canvas_sizes(width, height);
@@ -511,11 +581,18 @@
         const citySizeValue = document.getElementById("city-size-value");
         const lineWidth = document.getElementById("line-width");
         const lineWidthValue = document.getElementById("line-width-value");
-        const canvas = document.getElementById("atlas-canvas-3d");
+        const canvas2d = document.getElementById("atlas-canvas-2d");
+        const canvas3d = document.getElementById("atlas-canvas-3d");
+
+        const mode2dBtn = document.getElementById("mode-2d");
+        const mode3dBtn = document.getElementById("mode-3d");
 
         const mapHome = document.getElementById("map-home");
         const mapZoomIn = document.getElementById("map-zoom-in");
         const mapZoomOut = document.getElementById("map-zoom-out");
+        const mapView = document.getElementById("map-view");
+        const mapCompass = document.getElementById("map-compass");
+        const compassNeedle = document.getElementById("compass-needle");
         const mapMode = document.getElementById("map-mode");
         const mapGraticule = document.getElementById("map-graticule");
         const mapSun = document.getElementById("map-sun");
@@ -623,7 +700,58 @@
         tabLayersBtn.addEventListener("click", () => setTab("layers"));
         tabSettingsBtn.addEventListener("click", () => setTab("settings"));
 
-        canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+        let viewMode = "3d"; // 2d | 3d
+
+        function applyViewMode(next) {
+          viewMode = next === "2d" ? "2d" : "3d";
+          canvas2d.classList.toggle("hidden", viewMode !== "2d");
+          canvas3d.classList.toggle("hidden", viewMode !== "3d");
+          mode2dBtn?.classList.toggle("active", viewMode === "2d");
+          mode3dBtn?.classList.toggle("active", viewMode === "3d");
+          if (mapView) mapView.textContent = viewMode.toUpperCase();
+          try { wasm.set_view_mode(viewMode); } catch (err) { console.error("set_view_mode failed", err); }
+          updateCompass();
+        }
+
+        mode2dBtn?.addEventListener("click", () => applyViewMode("2d"));
+        mode3dBtn?.addEventListener("click", () => applyViewMode("3d"));
+        mapView?.addEventListener("click", () => applyViewMode(viewMode === "3d" ? "2d" : "3d"));
+
+        function activeCanvas() {
+          return viewMode === "2d" ? canvas2d : canvas3d;
+        }
+
+        for (const c of [canvas2d, canvas3d]) {
+          c.addEventListener("contextmenu", (e) => e.preventDefault());
+        }
+
+        function updateCompass() {
+          if (!compassNeedle) return;
+          let yawDeg = 0;
+          if (viewMode === "3d") {
+            try {
+              yawDeg = Number(wasm.get_camera_yaw_deg?.() ?? 0);
+            } catch (err) {
+              yawDeg = 0;
+            }
+          }
+          // Rotate needle opposite to yaw so it represents North on screen.
+          const rot = -yawDeg;
+          compassNeedle.style.transform = `translate(-50%, -100%) rotate(${rot}deg)`;
+        }
+
+        // Expose to the animation loop.
+        window.__atlasUpdateCompass = updateCompass;
+
+        mapCompass?.addEventListener("click", () => {
+          // Reset yaw to a north-up orientation without resetting distance/pitch.
+          try {
+            wasm.set_camera_yaw_deg(0);
+          } catch (err) {
+            // ignore
+          }
+          updateCompass();
+        });
 
         let dragging = false;
         let dragMode = "orbit"; // orbit | pan
@@ -634,7 +762,8 @@
         let downY = 0;
         let downButton = 0;
 
-        canvas.addEventListener("pointerdown", (e) => {
+        function onPointerDown(e) {
+          const canvas = activeCanvas();
           canvas.setPointerCapture(e.pointerId);
           dragging = true;
           lastX = e.clientX;
@@ -653,9 +782,9 @@
           } else {
             dragMode = "orbit";
           }
-        });
+        }
 
-        canvas.addEventListener("pointermove", (e) => {
+        function onPointerMove(e) {
           if (!dragging) {
             try {
               const info = wasm.cursor_move(e.offsetX, e.offsetY);
@@ -680,15 +809,16 @@
             } else {
               wasm.camera_orbit(dx, dy);
             }
+            updateCompass();
           } catch (err) {
             console.error("camera input failed", err);
           }
-        });
+        }
 
         function stopDrag() {
           dragging = false;
         }
-        canvas.addEventListener("pointerup", (e) => {
+        function onPointerUp(e) {
           // If it was a click (not a drag), run picking.
           const dx = e.clientX - downX;
           const dy = e.clientY - downY;
@@ -707,27 +837,32 @@
             }
           }
           stopDrag();
-        });
-        canvas.addEventListener("pointercancel", stopDrag);
-        canvas.addEventListener("pointerleave", stopDrag);
+        }
 
-        canvas.addEventListener(
-          "wheel",
-          (e) => {
-            e.preventDefault();
-            try {
-              wasm.camera_zoom(e.deltaY);
-            } catch (err) {
-              console.error("camera_zoom failed", err);
-            }
-          },
-          { passive: false }
-        );
+        function onWheel(e) {
+          e.preventDefault();
+          try {
+            wasm.camera_zoom(e.deltaY);
+            updateCompass();
+          } catch (err) {
+            console.error("camera_zoom failed", err);
+          }
+        }
+
+        for (const c of [canvas2d, canvas3d]) {
+          c.addEventListener("pointerdown", onPointerDown);
+          c.addEventListener("pointermove", onPointerMove);
+          c.addEventListener("pointerup", onPointerUp);
+          c.addEventListener("pointercancel", stopDrag);
+          c.addEventListener("pointerleave", stopDrag);
+          c.addEventListener("wheel", onWheel, { passive: false });
+        }
 
         window.addEventListener("keydown", (e) => {
           if (e.key === "r" || e.key === "R") {
             try {
               wasm.camera_reset();
+              updateCompass();
             } catch (err) {
               console.error("camera_reset failed", err);
             }
@@ -743,7 +878,7 @@
         }
 
         mapHome?.addEventListener("click", () => {
-          try { wasm.camera_reset(); } catch (err) { console.error("camera_reset failed", err); }
+          try { wasm.camera_reset(); updateCompass(); } catch (err) { console.error("camera_reset failed", err); }
         });
         mapZoomIn?.addEventListener("click", () => {
           try { wasm.camera_zoom(-180); } catch (err) { console.error("camera_zoom failed", err); }
@@ -962,6 +1097,9 @@
         });
 
         setStatus("Controls: LMB drag=orbit, RMB/Shift+drag=pan, wheel=zoom, R=reset, click=pick");
+
+        // Default view mode.
+        applyViewMode("3d");
       }
 
       function bootstrap() {

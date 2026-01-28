@@ -9,6 +9,17 @@ pub struct TimeSpan {
 }
 
 impl TimeSpan {
+    pub fn forever() -> Self {
+        Self {
+            start: Time(f64::NEG_INFINITY),
+            end: Time(f64::INFINITY),
+        }
+    }
+
+    pub fn instant(t: Time) -> Self {
+        Self { start: t, end: t }
+    }
+
     pub fn duration(&self) -> f64 {
         (self.end.0 - self.start.0).max(0.0)
     }

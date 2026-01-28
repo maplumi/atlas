@@ -84,6 +84,11 @@ mod tests {
             id: "chunk-1".to_string(),
             kind: "terrain".to_string(),
             path: "chunks/terrain-1.bin".to_string(),
+            content_hash: None,
+            source_blob_hash: None,
+            lon_lat_bounds_q: None,
+            time_bounds_us: None,
+            feature_count: None,
         });
 
         let payload = serde_json::to_string_pretty(&manifest).expect("serialize manifest");

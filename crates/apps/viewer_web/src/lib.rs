@@ -1,11 +1,14 @@
 use console_error_panic_hook::set_once;
 use gloo_net::http::Request;
 use std::cell::RefCell;
+use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::spawn_local;
+use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
 use formats::SceneManifest;
 use foundation::math::{WGS84_A, WGS84_B, ecef_to_geodetic};
+use layers::symbology::LayerStyle;
 use layers::vector::VectorLayer;
 use scene::components::VectorGeometryKind;
 mod wgpu;
@@ -14,12 +17,37 @@ use wgpu::{
     resize_wgpu, set_cities_points, set_corridors_points, set_regions_points,
 };
 
-#[derive(Debug, Copy, Clone)]
-struct LayerStyle {
-    visible: bool,
-    color: [f32; 4],
-    // UI lift is a fraction of Earth radius (legacy semantics).
-    lift: f32,
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum ViewMode {
+    TwoD,
+    ThreeD,
+}
+
+impl ViewMode {
+    fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "2d" | "two_d" | "two" => ViewMode::TwoD,
+            _ => ViewMode::ThreeD,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct Camera2DState {
+    pub center_lon_deg: f64,
+    pub center_lat_deg: f64,
+    /// Zoom multiplier: 1.0 roughly fits the world into the viewport.
+    pub zoom: f64,
+}
+
+impl Default for Camera2DState {
+    fn default() -> Self {
+        Self {
+            center_lon_deg: 0.0,
+            center_lat_deg: 0.0,
+            zoom: 1.0,
+        }
+    }
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -46,6 +74,9 @@ struct ViewerState {
     dataset: String,
     canvas_width: f64,
     canvas_height: f64,
+    view_mode: ViewMode,
+    canvas_2d: Option<HtmlCanvasElement>,
+    ctx_2d: Option<CanvasRenderingContext2d>,
     wgpu: Option<WgpuContext>,
     show_graticule: bool,
     sun_follow_real_time: bool,
@@ -97,6 +128,7 @@ struct ViewerState {
     time_s: f64,
     time_end_s: f64,
     camera: CameraState,
+    camera_2d: Camera2DState,
 }
 
 thread_local! {
@@ -104,10 +136,13 @@ thread_local! {
         dataset: "cities".to_string(),
         canvas_width: 1280.0,
         canvas_height: 720.0,
+        view_mode: ViewMode::ThreeD,
+        canvas_2d: None,
+        ctx_2d: None,
         wgpu: None,
         show_graticule: false,
         sun_follow_real_time: true,
-        city_marker_size: 6.0,
+        city_marker_size: 4.0,
         line_width_px: 2.5,
 
         cities_style: LayerStyle { visible: false, color: [1.0, 0.25, 0.25, 0.95], lift: 0.02 },
@@ -146,11 +181,72 @@ thread_local! {
         time_s: 0.0,
         time_end_s: 10.0,
         camera: CameraState::default(),
+        camera_2d: Camera2DState::default(),
     });
 }
 
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
     v.max(lo).min(hi)
+}
+
+fn wrap_lon_deg(mut lon: f64) -> f64 {
+    lon = (lon + 180.0).rem_euclid(360.0) - 180.0;
+    lon
+}
+
+fn wrap_delta_lon_deg(d: f64) -> f64 {
+    wrap_lon_deg(d)
+}
+
+fn camera2d_scale_px_per_deg(cam: Camera2DState, w: f64, h: f64) -> f64 {
+    let base = (w / 360.0).min(h / 180.0);
+    (base * cam.zoom).max(1e-6)
+}
+
+fn project_lon_lat_to_screen(
+    lon_deg: f64,
+    lat_deg: f64,
+    cam: Camera2DState,
+    w: f64,
+    h: f64,
+) -> (f64, f64) {
+    let s = camera2d_scale_px_per_deg(cam, w, h);
+    let dx = wrap_delta_lon_deg(lon_deg - cam.center_lon_deg);
+    let dy = lat_deg - cam.center_lat_deg;
+    let x = w * 0.5 + dx * s;
+    let y = h * 0.5 - dy * s;
+    (x, y)
+}
+
+fn screen_to_lon_lat(x_px: f64, y_px: f64, cam: Camera2DState, w: f64, h: f64) -> (f64, f64) {
+    let s = camera2d_scale_px_per_deg(cam, w, h);
+    let lon = wrap_lon_deg(cam.center_lon_deg + (x_px - w * 0.5) / s);
+    let lat = clamp(cam.center_lat_deg - (y_px - h * 0.5) / s, -89.9, 89.9);
+    (lon, lat)
+}
+
+fn rgba_css(c: [f32; 4]) -> String {
+    let r = (c[0].clamp(0.0, 1.0) * 255.0).round() as u32;
+    let g = (c[1].clamp(0.0, 1.0) * 255.0).round() as u32;
+    let b = (c[2].clamp(0.0, 1.0) * 255.0).round() as u32;
+    let a = c[3].clamp(0.0, 1.0);
+    format!("rgba({r},{g},{b},{a})")
+}
+
+fn ctx_set_fill_style(ctx: &CanvasRenderingContext2d, value: &str) {
+    let _ = js_sys::Reflect::set(
+        ctx.as_ref(),
+        &JsValue::from_str("fillStyle"),
+        &JsValue::from_str(value),
+    );
+}
+
+fn ctx_set_stroke_style(ctx: &CanvasRenderingContext2d, value: &str) {
+    let _ = js_sys::Reflect::set(
+        ctx.as_ref(),
+        &JsValue::from_str("strokeStyle"),
+        &JsValue::from_str(value),
+    );
 }
 
 fn vec3_add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
@@ -325,34 +421,199 @@ fn current_sun_direction_world() -> Option<[f32; 3]> {
 }
 
 fn render_scene() -> Result<(), JsValue> {
+    let mode = STATE.with(|state_ref| state_ref.borrow().view_mode);
+    match mode {
+        ViewMode::ThreeD => {
+            STATE.with(|state_ref| {
+                let state = state_ref.borrow();
+                if let Some(ctx) = &state.wgpu {
+                    let view_proj =
+                        camera_view_proj(state.camera, state.canvas_width, state.canvas_height);
+
+                    let light_dir = if state.sun_follow_real_time {
+                        current_sun_direction_world().unwrap_or([0.4, 0.7, 0.2])
+                    } else {
+                        [0.4, 0.7, 0.2]
+                    };
+
+                    // Layer visibility is baked into the combined overlay buffers; we can always
+                    // attempt to draw and rely on vertex counts to early-out.
+                    let show_cities = true;
+                    let show_corridors = true;
+                    let show_regions = true;
+                    let _ = render_mesh(
+                        ctx,
+                        view_proj,
+                        light_dir,
+                        state.show_graticule,
+                        show_cities,
+                        show_corridors,
+                        show_regions,
+                    );
+                }
+            });
+            Ok(())
+        }
+        ViewMode::TwoD => render_scene_2d(),
+    }
+}
+
+fn render_scene_2d() -> Result<(), JsValue> {
     STATE.with(|state_ref| {
         let state = state_ref.borrow();
-        if let Some(ctx) = &state.wgpu {
-            let view_proj = camera_view_proj(state.camera, state.canvas_width, state.canvas_height);
+        let Some(ctx) = state.ctx_2d.as_ref() else {
+            return Ok(());
+        };
 
-            let light_dir = if state.sun_follow_real_time {
-                current_sun_direction_world().unwrap_or([0.4, 0.7, 0.2])
-            } else {
-                [0.4, 0.7, 0.2]
-            };
+        let w = state.canvas_width.max(1.0);
+        let h = state.canvas_height.max(1.0);
 
-            // Layer visibility is baked into the combined overlay buffers; we can always
-            // attempt to draw and rely on vertex counts to early-out.
-            let show_cities = true;
-            let show_corridors = true;
-            let show_regions = true;
-            let _ = render_mesh(
-                ctx,
-                view_proj,
-                light_dir,
-                state.show_graticule,
-                show_cities,
-                show_corridors,
-                show_regions,
+        // Clear.
+        ctx_set_fill_style(ctx, "#020617");
+        ctx.fill_rect(0.0, 0.0, w, h);
+
+        // Optional graticule (simple, equirectangular).
+        if state.show_graticule {
+            ctx_set_stroke_style(ctx, "rgba(148,163,184,0.25)");
+            ctx.set_line_width(1.0);
+            for lon in (-180..=180).step_by(30) {
+                let (x0, y0) = project_lon_lat_to_screen(lon as f64, -89.0, state.camera_2d, w, h);
+                let (x1, y1) = project_lon_lat_to_screen(lon as f64, 89.0, state.camera_2d, w, h);
+                ctx.begin_path();
+                ctx.move_to(x0, y0);
+                ctx.line_to(x1, y1);
+                ctx.stroke();
+            }
+            for lat in (-60..=60).step_by(30) {
+                let (x0, y0) = project_lon_lat_to_screen(-180.0, lat as f64, state.camera_2d, w, h);
+                let (x1, y1) = project_lon_lat_to_screen(180.0, lat as f64, state.camera_2d, w, h);
+                ctx.begin_path();
+                ctx.move_to(x0, y0);
+                ctx.line_to(x1, y1);
+                ctx.stroke();
+            }
+        }
+
+        let cam = state.camera_2d;
+
+        // Polygons first (fills).
+        let draw_poly_tris = |pos: &[[f32; 3]], color: [f32; 4]| {
+            ctx_set_fill_style(ctx, &rgba_css(color));
+            for tri in pos.chunks_exact(3).take(200_000) {
+                let a = tri[0];
+                let b = tri[1];
+                let c = tri[2];
+                let (lon_a, lat_a) = world_to_lon_lat_deg([a[0] as f64, a[1] as f64, a[2] as f64]);
+                let (lon_b, lat_b) = world_to_lon_lat_deg([b[0] as f64, b[1] as f64, b[2] as f64]);
+                let (lon_c, lat_c) = world_to_lon_lat_deg([c[0] as f64, c[1] as f64, c[2] as f64]);
+
+                let (ax, ay) = project_lon_lat_to_screen(lon_a, lat_a, cam, w, h);
+                let (bx, by) = project_lon_lat_to_screen(lon_b, lat_b, cam, w, h);
+                let (cx, cy) = project_lon_lat_to_screen(lon_c, lat_c, cam, w, h);
+
+                ctx.begin_path();
+                ctx.move_to(ax, ay);
+                ctx.line_to(bx, by);
+                ctx.line_to(cx, cy);
+                ctx.close_path();
+                ctx.fill();
+            }
+        };
+
+        if state.regions_style.visible
+            && let Some(pos) = state.regions_positions.as_deref()
+        {
+            draw_poly_tris(pos, state.regions_style.color);
+        }
+        if state.uploaded_regions_style.visible
+            && let Some(pos) = state.uploaded_regions_positions.as_deref()
+        {
+            draw_poly_tris(pos, state.uploaded_regions_style.color);
+        }
+        if state.selection_style.visible
+            && let Some(pos) = state.selection_poly_positions.as_deref()
+        {
+            draw_poly_tris(pos, state.selection_style.color);
+        }
+
+        // Lines.
+        let draw_lines = |pos: &[[f32; 3]], color: [f32; 4], width_px: f64| {
+            ctx_set_stroke_style(ctx, &rgba_css(color));
+            ctx.set_line_width(width_px.max(1.0));
+            ctx.set_line_cap("round");
+            for seg in pos.chunks_exact(2).take(250_000) {
+                let a = seg[0];
+                let b = seg[1];
+                let (lon_a, lat_a) = world_to_lon_lat_deg([a[0] as f64, a[1] as f64, a[2] as f64]);
+                let (lon_b, lat_b) = world_to_lon_lat_deg([b[0] as f64, b[1] as f64, b[2] as f64]);
+                let (ax, ay) = project_lon_lat_to_screen(lon_a, lat_a, cam, w, h);
+                let (bx, by) = project_lon_lat_to_screen(lon_b, lat_b, cam, w, h);
+                ctx.begin_path();
+                ctx.move_to(ax, ay);
+                ctx.line_to(bx, by);
+                ctx.stroke();
+            }
+        };
+
+        if state.corridors_style.visible
+            && let Some(pos) = state.corridors_positions.as_deref()
+        {
+            draw_lines(pos, state.corridors_style.color, state.line_width_px as f64);
+        }
+        if state.uploaded_corridors_style.visible
+            && let Some(pos) = state.uploaded_corridors_positions.as_deref()
+        {
+            draw_lines(
+                pos,
+                state.uploaded_corridors_style.color,
+                state.line_width_px as f64,
             );
         }
-    });
-    Ok(())
+        if state.selection_style.visible
+            && let Some(pos) = state.selection_line_positions.as_deref()
+        {
+            draw_lines(
+                pos,
+                state.selection_style.color,
+                (state.line_width_px * 1.6) as f64,
+            );
+        }
+
+        // Points.
+        let draw_points = |centers: &[[f32; 3]], color: [f32; 4], radius_px: f64| {
+            ctx_set_fill_style(ctx, &rgba_css(color));
+            for &c in centers.iter().take(200_000) {
+                let (lon, lat) = world_to_lon_lat_deg([c[0] as f64, c[1] as f64, c[2] as f64]);
+                let (x, y) = project_lon_lat_to_screen(lon, lat, cam, w, h);
+                ctx.begin_path();
+                let _ = ctx.arc(x, y, radius_px, 0.0, std::f64::consts::TAU);
+                ctx.fill();
+            }
+        };
+
+        let r = (state.city_marker_size as f64).clamp(1.0, 32.0);
+        if state.cities_style.visible
+            && let Some(centers) = state.cities_centers.as_deref()
+        {
+            draw_points(centers, state.cities_style.color, r);
+        }
+        if state.uploaded_points_style.visible
+            && let Some(centers) = state.uploaded_centers.as_deref()
+        {
+            draw_points(centers, state.uploaded_points_style.color, r);
+        }
+        if state.selection_style.visible
+            && let Some(c) = state.selection_center
+        {
+            draw_points(
+                std::slice::from_ref(&c),
+                state.selection_style.color,
+                r * 1.35,
+            );
+        }
+
+        Ok(())
+    })
 }
 
 fn build_city_vertices(
@@ -362,29 +623,37 @@ fn build_city_vertices(
     lift: f32,
 ) -> Vec<CityVertex> {
     let size_px = size_px.clamp(1.0, 64.0);
+
+    // `lift` is a fraction of Earth radius (legacy UI semantics); convert to meters.
+    let mut lift_m = lift * (WGS84_A as f32);
+    if lift_m <= 0.0 {
+        // Keep points slightly above the surface to avoid z-fighting.
+        lift_m = 50.0;
+    }
+
     let mut out: Vec<CityVertex> = Vec::with_capacity(centers.len() * 6);
     for &c in centers {
         let v0 = CityVertex {
             center: c,
-            lift,
+            lift: lift_m,
             offset_px: [-size_px, -size_px],
             color,
         };
         let v1 = CityVertex {
             center: c,
-            lift,
+            lift: lift_m,
             offset_px: [size_px, -size_px],
             color,
         };
         let v2 = CityVertex {
             center: c,
-            lift,
+            lift: lift_m,
             offset_px: [size_px, size_px],
             color,
         };
         let v3 = CityVertex {
             center: c,
-            lift,
+            lift: lift_m,
             offset_px: [-size_px, size_px],
             color,
         };
@@ -674,6 +943,48 @@ pub fn init_wgpu() {
 }
 
 #[wasm_bindgen]
+pub fn init_canvas_2d() {
+    if let Err(err) = init_canvas_2d_inner() {
+        web_sys::console::log_1(&JsValue::from_str(&format!(
+            "2d canvas init error: {:?}",
+            err
+        )));
+    }
+}
+
+fn init_canvas_2d_inner() -> Result<(), JsValue> {
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("no window"))?;
+    let document = window
+        .document()
+        .ok_or_else(|| JsValue::from_str("no document"))?;
+    let canvas = document
+        .get_element_by_id("atlas-canvas-2d")
+        .ok_or_else(|| JsValue::from_str("missing atlas-canvas-2d"))?
+        .dyn_into::<HtmlCanvasElement>()?;
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("2d context unavailable"))?
+        .dyn_into::<CanvasRenderingContext2d>()?;
+
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.canvas_2d = Some(canvas);
+        s.ctx_2d = Some(ctx);
+    });
+
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_view_mode(mode: &str) -> Result<(), JsValue> {
+    let mode = ViewMode::from_str(mode);
+    STATE.with(|state| {
+        state.borrow_mut().view_mode = mode;
+    });
+    render_scene()
+}
+
+#[wasm_bindgen]
 pub fn set_canvas_sizes(width: f64, height: f64) {
     STATE.with(|state| {
         let mut s = state.borrow_mut();
@@ -688,7 +999,41 @@ pub fn set_canvas_sizes(width: f64, height: f64) {
 #[wasm_bindgen]
 pub fn camera_reset() -> Result<(), JsValue> {
     STATE.with(|state| {
-        state.borrow_mut().camera = CameraState::default();
+        let mut s = state.borrow_mut();
+        match s.view_mode {
+            ViewMode::ThreeD => s.camera = CameraState::default(),
+            ViewMode::TwoD => s.camera_2d = Camera2DState::default(),
+        }
+    });
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn get_camera_yaw_deg() -> f64 {
+    STATE.with(|state| {
+        let s = state.borrow();
+        match s.view_mode {
+            ViewMode::ThreeD => s.camera.yaw_rad.to_degrees().rem_euclid(360.0),
+            ViewMode::TwoD => 0.0,
+        }
+    })
+}
+
+#[wasm_bindgen]
+pub fn set_camera_yaw_deg(yaw_deg: f64) -> Result<(), JsValue> {
+    if !yaw_deg.is_finite() {
+        return Err(JsValue::from_str("yaw_deg must be finite"));
+    }
+
+    let mut yaw_rad = yaw_deg.to_radians();
+    yaw_rad = (yaw_rad + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI)
+        - std::f64::consts::PI;
+
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        if s.view_mode == ViewMode::ThreeD {
+            s.camera.yaw_rad = yaw_rad;
+        }
     });
     render_scene()
 }
@@ -700,9 +1045,24 @@ pub fn camera_reset() -> Result<(), JsValue> {
 pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
     STATE.with(|state| {
         let mut s = state.borrow_mut();
-        let speed = 0.005;
-        s.camera.yaw_rad += delta_x_px * speed;
-        s.camera.pitch_rad = clamp(s.camera.pitch_rad + delta_y_px * speed, -1.55, 1.55);
+        match s.view_mode {
+            ViewMode::ThreeD => {
+                let speed = 0.005;
+                s.camera.yaw_rad += delta_x_px * speed;
+                s.camera.pitch_rad = clamp(s.camera.pitch_rad + delta_y_px * speed, -1.55, 1.55);
+            }
+            ViewMode::TwoD => {
+                // In 2D, treat orbit as pan.
+                let scale = camera2d_scale_px_per_deg(s.camera_2d, s.canvas_width, s.canvas_height);
+                s.camera_2d.center_lon_deg =
+                    wrap_lon_deg(s.camera_2d.center_lon_deg - (delta_x_px / scale));
+                s.camera_2d.center_lat_deg = clamp(
+                    s.camera_2d.center_lat_deg + (delta_y_px / scale),
+                    -89.9,
+                    89.9,
+                );
+            }
+        }
     });
     render_scene()
 }
@@ -714,24 +1074,38 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
 pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
     STATE.with(|state| {
         let mut s = state.borrow_mut();
-        let cam = s.camera;
+        match s.view_mode {
+            ViewMode::ThreeD => {
+                let cam = s.camera;
 
-        let dir = [
-            cam.pitch_rad.cos() * cam.yaw_rad.cos(),
-            cam.pitch_rad.sin(),
-            cam.pitch_rad.cos() * cam.yaw_rad.sin(),
-        ];
-        let forward = vec3_normalize(vec3_mul(dir, -1.0));
-        let up = [0.0, 1.0, 0.0];
-        let right = vec3_normalize(vec3_cross(forward, up));
-        let real_up = vec3_cross(right, forward);
+                let dir = [
+                    cam.pitch_rad.cos() * cam.yaw_rad.cos(),
+                    cam.pitch_rad.sin(),
+                    cam.pitch_rad.cos() * cam.yaw_rad.sin(),
+                ];
+                let forward = vec3_normalize(vec3_mul(dir, -1.0));
+                let up = [0.0, 1.0, 0.0];
+                let right = vec3_normalize(vec3_cross(forward, up));
+                let real_up = vec3_cross(right, forward);
 
-        let pan_scale = cam.distance * 0.002;
-        let delta = vec3_add(
-            vec3_mul(right, -delta_x_px * pan_scale),
-            vec3_mul(real_up, delta_y_px * pan_scale),
-        );
-        s.camera.target = vec3_add(s.camera.target, delta);
+                let pan_scale = cam.distance * 0.002;
+                let delta = vec3_add(
+                    vec3_mul(right, -delta_x_px * pan_scale),
+                    vec3_mul(real_up, delta_y_px * pan_scale),
+                );
+                s.camera.target = vec3_add(s.camera.target, delta);
+            }
+            ViewMode::TwoD => {
+                let scale = camera2d_scale_px_per_deg(s.camera_2d, s.canvas_width, s.canvas_height);
+                s.camera_2d.center_lon_deg =
+                    wrap_lon_deg(s.camera_2d.center_lon_deg - (delta_x_px / scale));
+                s.camera_2d.center_lat_deg = clamp(
+                    s.camera_2d.center_lat_deg + (delta_y_px / scale),
+                    -89.9,
+                    89.9,
+                );
+            }
+        }
     });
     render_scene()
 }
@@ -743,45 +1117,53 @@ pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
 pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
     STATE.with(|state| {
         let mut s = state.borrow_mut();
-        let cam = s.camera;
-        let zoom = (wheel_delta_y * 0.0015).exp();
+        match s.view_mode {
+            ViewMode::ThreeD => {
+                let cam = s.camera;
+                let zoom = (wheel_delta_y * 0.0015).exp();
 
-        // Keep this a soft clamp (mostly for UX), but also ensure the *camera eye*
-        // cannot go inside the globe when orbiting around/near it.
-        let min_dist = 10.0;
-        let max_dist = 200.0 * WGS84_A;
-        let mut dist = clamp(cam.distance * zoom, min_dist, max_dist);
+                // Keep this a soft clamp (mostly for UX), but also ensure the *camera eye*
+                // cannot go inside the globe when orbiting around/near it.
+                let min_dist = 10.0;
+                let max_dist = 200.0 * WGS84_A;
+                let mut dist = clamp(cam.distance * zoom, min_dist, max_dist);
 
-        let dir_cam = [
-            cam.pitch_rad.cos() * cam.yaw_rad.cos(),
-            cam.pitch_rad.sin(),
-            cam.pitch_rad.cos() * cam.yaw_rad.sin(),
-        ];
-        let dir_cam = vec3_normalize(dir_cam);
-        let eye = vec3_add(cam.target, vec3_mul(dir_cam, dist));
+                let dir_cam = [
+                    cam.pitch_rad.cos() * cam.yaw_rad.cos(),
+                    cam.pitch_rad.sin(),
+                    cam.pitch_rad.cos() * cam.yaw_rad.sin(),
+                ];
+                let dir_cam = vec3_normalize(dir_cam);
+                let eye = vec3_add(cam.target, vec3_mul(dir_cam, dist));
 
-        // Conservative: enforce the camera is outside a sphere of radius WGS84_A.
-        // (Good enough to prevent pathological inside-the-globe behavior, even
-        // though the visual globe is an ellipsoid.)
-        let min_eye_r = 1.001 * WGS84_A;
-        let eye_r = vec3_dot(eye, eye).sqrt();
-        if eye_r < min_eye_r {
-            // Solve |target + dir*t| = min_eye_r for t, and move to the exiting root.
-            let b = 2.0 * vec3_dot(cam.target, dir_cam);
-            let c = vec3_dot(cam.target, cam.target) - min_eye_r * min_eye_r;
-            let disc = b * b - 4.0 * c;
-            if disc >= 0.0 {
-                let sdisc = disc.sqrt();
-                let t0 = (-b - sdisc) / 2.0;
-                let t1 = (-b + sdisc) / 2.0;
-                let t = t0.max(t1);
-                if t.is_finite() && t > 0.0 {
-                    dist = clamp(t, min_dist, max_dist);
+                // Conservative: enforce the camera is outside a sphere of radius WGS84_A.
+                // (Good enough to prevent pathological inside-the-globe behavior, even
+                // though the visual globe is an ellipsoid.)
+                let min_eye_r = 1.001 * WGS84_A;
+                let eye_r = vec3_dot(eye, eye).sqrt();
+                if eye_r < min_eye_r {
+                    // Solve |target + dir*t| = min_eye_r for t, and move to the exiting root.
+                    let b = 2.0 * vec3_dot(cam.target, dir_cam);
+                    let c = vec3_dot(cam.target, cam.target) - min_eye_r * min_eye_r;
+                    let disc = b * b - 4.0 * c;
+                    if disc >= 0.0 {
+                        let sdisc = disc.sqrt();
+                        let t0 = (-b - sdisc) / 2.0;
+                        let t1 = (-b + sdisc) / 2.0;
+                        let t = t0.max(t1);
+                        if t.is_finite() && t > 0.0 {
+                            dist = clamp(t, min_dist, max_dist);
+                        }
+                    }
                 }
+
+                s.camera.distance = dist;
+            }
+            ViewMode::TwoD => {
+                let zoom = (wheel_delta_y * 0.0015).exp();
+                s.camera_2d.zoom = clamp(s.camera_2d.zoom * zoom, 0.2, 200.0);
             }
         }
-
-        s.camera.distance = dist;
     });
     render_scene()
 }
@@ -800,7 +1182,7 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 
     if should_load_cities {
         spawn_local(async move {
-            let chunk = match fetch_vector_chunk("assets/chunks/cities.json").await {
+            let chunk = match fetch_vector_chunk("assets/chunks/cities.avc").await {
                 Ok(c) => c,
                 Err(err) => {
                     web_sys::console::log_1(&JsValue::from_str(&format!(
@@ -825,7 +1207,7 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 
     if should_load_corridors {
         spawn_local(async move {
-            let chunk = match fetch_vector_chunk("assets/chunks/air_corridors.json").await {
+            let chunk = match fetch_vector_chunk("assets/chunks/air_corridors.avc").await {
                 Ok(c) => c,
                 Err(err) => {
                     web_sys::console::log_1(&JsValue::from_str(&format!(
@@ -850,7 +1232,7 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 
     if should_load_regions {
         spawn_local(async move {
-            let chunk = match fetch_vector_chunk("assets/chunks/regions.json").await {
+            let chunk = match fetch_vector_chunk("assets/chunks/regions.avc").await {
                 Ok(c) => c,
                 Err(err) => {
                     web_sys::console::log_1(&JsValue::from_str(&format!(
@@ -1137,17 +1519,35 @@ fn mat4_mul_vec4(m: [[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
 #[wasm_bindgen]
 pub fn cursor_move(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     let out = js_sys::Object::new();
-    let hit = STATE.with(|state| {
+    let (mode, cam2d, camera3d, w, h) = STATE.with(|state| {
         let s = state.borrow();
-        ray_hit_globe(s.camera, s.canvas_width, s.canvas_height, x_px, y_px)
+        (
+            s.view_mode,
+            s.camera_2d,
+            s.camera,
+            s.canvas_width,
+            s.canvas_height,
+        )
     });
-    if let Some(p) = hit {
-        let (lon, lat) = world_to_lon_lat_deg(p);
-        js_sys::Reflect::set(&out, &JsValue::from_str("hit"), &JsValue::TRUE)?;
-        js_sys::Reflect::set(&out, &JsValue::from_str("lon"), &JsValue::from_f64(lon))?;
-        js_sys::Reflect::set(&out, &JsValue::from_str("lat"), &JsValue::from_f64(lat))?;
-    } else {
-        js_sys::Reflect::set(&out, &JsValue::from_str("hit"), &JsValue::FALSE)?;
+
+    match mode {
+        ViewMode::ThreeD => {
+            let hit = ray_hit_globe(camera3d, w, h, x_px, y_px);
+            if let Some(p) = hit {
+                let (lon, lat) = world_to_lon_lat_deg(p);
+                js_sys::Reflect::set(&out, &JsValue::from_str("hit"), &JsValue::TRUE)?;
+                js_sys::Reflect::set(&out, &JsValue::from_str("lon"), &JsValue::from_f64(lon))?;
+                js_sys::Reflect::set(&out, &JsValue::from_str("lat"), &JsValue::from_f64(lat))?;
+            } else {
+                js_sys::Reflect::set(&out, &JsValue::from_str("hit"), &JsValue::FALSE)?;
+            }
+        }
+        ViewMode::TwoD => {
+            let (lon, lat) = screen_to_lon_lat(x_px, y_px, cam2d, w.max(1.0), h.max(1.0));
+            js_sys::Reflect::set(&out, &JsValue::from_str("hit"), &JsValue::TRUE)?;
+            js_sys::Reflect::set(&out, &JsValue::from_str("lon"), &JsValue::from_f64(lon))?;
+            js_sys::Reflect::set(&out, &JsValue::from_str("lat"), &JsValue::from_f64(lat))?;
+        }
     }
     Ok(out.into())
 }
@@ -1155,6 +1555,11 @@ pub fn cursor_move(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
 #[wasm_bindgen]
 pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     let out = js_sys::Object::new();
+
+    let mode = STATE.with(|state| state.borrow().view_mode);
+    if mode == ViewMode::TwoD {
+        return cursor_click_2d(x_px, y_px);
+    }
 
     let hit = STATE.with(|state| {
         let s = state.borrow();
@@ -1221,33 +1626,8 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
             consider_points(centers);
         }
         if let Some((c, d2)) = best_point {
-            // Approximate marker radius in pixels by projecting a small tangent offset.
-            let mut radius_px = 12.0f32;
-            if let Some((cx, cy)) = project(c) {
-                // World units are meters; approximate pixel radius by projecting a tangent offset.
-                // Use an ellipsoid normal (viewer radii: x=A, y=B, z=A).
-                let a2 = WGS84_A * WGS84_A;
-                let b2 = WGS84_B * WGS84_B;
-                let n =
-                    vec3_normalize([(c[0] as f64) / a2, (c[1] as f64) / b2, (c[2] as f64) / a2]);
-                let up = if n[1].abs() < 0.99 {
-                    [0.0f64, 1.0, 0.0]
-                } else {
-                    [1.0f64, 0.0, 0.0]
-                };
-                let east = vec3_normalize(vec3_cross(up, n));
-                let half_size_m = s.city_marker_size as f64;
-                let p = [
-                    (c[0] as f64 + east[0] * half_size_m) as f32,
-                    (c[1] as f64 + east[1] * half_size_m) as f32,
-                    (c[2] as f64 + east[2] * half_size_m) as f32,
-                ];
-                if let Some((px2, py2)) = project(p) {
-                    let dx = px2 - cx;
-                    let dy = py2 - cy;
-                    radius_px = (dx * dx + dy * dy).sqrt().clamp(6.0, 64.0);
-                }
-            }
+            // Markers are rendered at a constant screen-space size.
+            let radius_px = (s.city_marker_size).clamp(2.0, 64.0);
             if d2 <= radius_px * radius_px {
                 return Some(("point".to_string(), Some(c), None, None));
             }
@@ -1415,6 +1795,78 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     Ok(out.into())
 }
 
+fn cursor_click_2d(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
+    let out = js_sys::Object::new();
+
+    let picked = STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        let w = s.canvas_width.max(1.0);
+        let h = s.canvas_height.max(1.0);
+        let cam = s.camera_2d;
+
+        let radius_px = (s.city_marker_size as f64).clamp(4.0, 32.0);
+        let r2 = radius_px * radius_px;
+        let (lon_click, lat_click) = screen_to_lon_lat(x_px, y_px, cam, w, h);
+
+        let mut best: Option<([f32; 3], f64)> = None; // (center, d2)
+
+        let mut consider = |centers: &[[f32; 3]]| {
+            for &c in centers.iter().take(250_000) {
+                let (lon, lat) = world_to_lon_lat_deg([c[0] as f64, c[1] as f64, c[2] as f64]);
+                let (sx, sy) = project_lon_lat_to_screen(lon, lat, cam, w, h);
+                let dx = sx - x_px;
+                let dy = sy - y_px;
+                let d2 = dx * dx + dy * dy;
+                if best.map(|(_, bd2)| d2 < bd2).unwrap_or(true) {
+                    best = Some((c, d2));
+                }
+            }
+        };
+
+        if s.cities_style.visible
+            && let Some(centers) = s.cities_centers.as_deref()
+        {
+            consider(centers);
+        }
+        if s.uploaded_points_style.visible
+            && let Some(centers) = s.uploaded_centers.as_deref()
+        {
+            consider(centers);
+        }
+
+        if let Some((c, d2)) = best
+            && d2 <= r2
+        {
+            s.selection_center = Some(c);
+            s.selection_line_positions = None;
+            s.selection_poly_positions = None;
+            Some(("point".to_string(), c, lon_click, lat_click))
+        } else {
+            // Clear selection.
+            s.selection_center = None;
+            s.selection_line_positions = None;
+            s.selection_poly_positions = None;
+            None
+        }
+    });
+
+    rebuild_overlays_and_upload();
+    let _ = render_scene();
+
+    if let Some((kind, center, _lon_click, _lat_click)) = picked {
+        let (lon, lat) =
+            world_to_lon_lat_deg([center[0] as f64, center[1] as f64, center[2] as f64]);
+        js_sys::Reflect::set(&out, &JsValue::from_str("picked"), &JsValue::TRUE)?;
+        js_sys::Reflect::set(&out, &JsValue::from_str("kind"), &JsValue::from_str(&kind))?;
+        js_sys::Reflect::set(&out, &JsValue::from_str("lon"), &JsValue::from_f64(lon))?;
+        js_sys::Reflect::set(&out, &JsValue::from_str("lat"), &JsValue::from_f64(lat))?;
+    } else {
+        js_sys::Reflect::set(&out, &JsValue::from_str("picked"), &JsValue::FALSE)?;
+    }
+
+    Ok(out.into())
+}
+
 #[wasm_bindgen]
 pub fn load_geojson_file(name: String, geojson_text: String) -> Result<JsValue, JsValue> {
     let chunk = formats::VectorChunk::from_geojson_str(&geojson_text)
@@ -1508,19 +1960,104 @@ pub fn load_dataset(url: String) {
             }
         };
 
+        let base_url = base_url_for(&url);
+        let mut chunks: Vec<(formats::VectorChunk, Option<VectorGeometryKind>)> = Vec::new();
+        let mut count_points = 0usize;
+        let mut count_lines = 0usize;
+        let mut count_polys = 0usize;
+
+        for entry in &manifest.chunks {
+            let chunk_url = join_url(&base_url, &entry.path);
+            let expected = match entry.kind.trim().to_ascii_lowercase().as_str() {
+                "points" | "point" => Some(VectorGeometryKind::Point),
+                "lines" | "line" => Some(VectorGeometryKind::Line),
+                "areas" | "area" | "polygons" | "polygon" => Some(VectorGeometryKind::Area),
+                _ => None,
+            };
+
+            let chunk = match fetch_vector_chunk(&chunk_url).await {
+                Ok(c) => c,
+                Err(err) => {
+                    let msg = format!(
+                        "Failed to fetch chunk '{}' ({}) : {:?}",
+                        entry.id, chunk_url, err
+                    );
+                    web_sys::console::log_1(&JsValue::from_str(&msg));
+                    continue;
+                }
+            };
+
+            for f in &chunk.features {
+                match &f.geometry {
+                    formats::VectorGeometry::Point(_) => count_points += 1,
+                    formats::VectorGeometry::MultiPoint(v) => count_points += v.len(),
+                    formats::VectorGeometry::LineString(_) => count_lines += 1,
+                    formats::VectorGeometry::MultiLineString(v) => count_lines += v.len(),
+                    formats::VectorGeometry::Polygon(_) => count_polys += 1,
+                    formats::VectorGeometry::MultiPolygon(v) => count_polys += v.len(),
+                }
+            }
+
+            chunks.push((chunk, expected));
+        }
+
+        let world = world_from_vector_chunks(&chunks);
+
         STATE.with(|state| {
             let mut s = state.borrow_mut();
-            s.dataset = manifest
-                .name
-                .clone()
-                .unwrap_or_else(|| "unknown".to_string());
+            s.uploaded_name = Some(format!(
+                "{} ({})",
+                manifest
+                    .name
+                    .clone()
+                    .unwrap_or_else(|| "unknown".to_string()),
+                manifest.package_id
+            ));
+
+            s.uploaded_world = Some(world);
+            s.uploaded_count_points = count_points;
+            s.uploaded_count_lines = count_lines;
+            s.uploaded_count_polys = count_polys;
+
+            // Use the same path as the built-in uploader: switch to the uploaded dataset.
+            s.dataset = "__uploaded__".to_string();
+            s.uploaded_points_style.visible = count_points > 0;
+            s.uploaded_corridors_style.visible = count_lines > 0;
+            s.uploaded_regions_style.visible = count_polys > 0;
             s.frame_index = 0;
             s.time_s = 0.0;
             s.time_end_s = (manifest.chunks.len().max(1) as f64) * 1.5;
         });
 
+        rebuild_overlays_and_upload();
         let _ = render_scene();
     });
+}
+
+fn world_from_vector_chunks(
+    chunks: &[(formats::VectorChunk, Option<VectorGeometryKind>)],
+) -> scene::World {
+    let mut world = scene::World::new();
+    scene::prefabs::spawn_wgs84_globe(&mut world);
+    for (chunk, expected_kind) in chunks {
+        formats::ingest_vector_chunk(&mut world, chunk, *expected_kind);
+    }
+    world
+}
+
+fn base_url_for(url: &str) -> String {
+    match url.rsplit_once('/') {
+        Some((base, _file)) => format!("{base}/"),
+        None => String::new(),
+    }
+}
+
+fn join_url(base: &str, path: &str) -> String {
+    if path.starts_with("http://") || path.starts_with("https://") {
+        path.to_string()
+    } else {
+        format!("{base}{path}")
+    }
 }
 
 /// Advances the deterministic engine time by one fixed-timestep frame.
@@ -1600,9 +2137,18 @@ async fn fetch_vector_chunk(url: &str) -> Result<formats::VectorChunk, JsValue> 
         .send()
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| JsValue::from_str(&e.to_string()))?;
-    formats::VectorChunk::from_geojson_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))
+
+    if url.to_ascii_lowercase().ends_with(".avc") {
+        let bytes = resp
+            .binary()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        formats::VectorChunk::from_avc_bytes(&bytes).map_err(|e| JsValue::from_str(&e.to_string()))
+    } else {
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| JsValue::from_str(&e.to_string()))?;
+        formats::VectorChunk::from_geojson_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
 }

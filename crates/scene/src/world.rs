@@ -1,10 +1,10 @@
 use crate::components::{
-    ComponentBounds, ComponentTimeSpan, ComponentVectorGeometry, Drawable2D, Drawable3D, Transform,
-    VectorGeometry, VectorGeometryId, Visibility,
+    ComponentBounds, ComponentProperties, ComponentTimeSpan, ComponentVectorGeometry, Drawable2D,
+    Drawable3D, Transform, VectorGeometry, VectorGeometryId, Visibility,
 };
 use crate::entity::EntityId;
 use foundation::handles::Handle;
-use foundation::time::Time;
+use foundation::time::{Time, TimeSpan};
 
 #[derive(Debug, Default)]
 pub struct World {
@@ -13,6 +13,7 @@ pub struct World {
     bounds: Vec<Option<ComponentBounds>>,
     visibility: Vec<Option<Visibility>>,
     time_spans: Vec<Option<ComponentTimeSpan>>,
+    properties: Vec<Option<ComponentProperties>>,
     drawables_2d: Vec<Option<Drawable2D>>,
     drawables_3d: Vec<Option<Drawable3D>>,
     vector_geometry: Vec<Option<ComponentVectorGeometry>>,
@@ -42,6 +43,10 @@ impl World {
         self.bounds[entity.index() as usize] = Some(bounds);
     }
 
+    pub fn bounds(&self, entity: EntityId) -> Option<ComponentBounds> {
+        self.bounds.get(entity.index() as usize).and_then(|b| *b)
+    }
+
     pub fn set_visibility(&mut self, entity: EntityId, visibility: Visibility) {
         self.ensure_capacity(entity.index() as usize);
         self.visibility[entity.index() as usize] = Some(visibility);
@@ -50,6 +55,30 @@ impl World {
     pub fn set_time_span(&mut self, entity: EntityId, span: ComponentTimeSpan) {
         self.ensure_capacity(entity.index() as usize);
         self.time_spans[entity.index() as usize] = Some(span);
+    }
+
+    pub fn time_span(&self, entity: EntityId) -> Option<TimeSpan> {
+        self.time_spans
+            .get(entity.index() as usize)
+            .and_then(|s| *s)
+            .map(|c| c.span)
+    }
+
+    pub fn set_properties(&mut self, entity: EntityId, props: ComponentProperties) {
+        self.ensure_capacity(entity.index() as usize);
+        self.properties[entity.index() as usize] = Some(props);
+    }
+
+    pub fn properties(&self, entity: EntityId) -> Option<&ComponentProperties> {
+        self.properties
+            .get(entity.index() as usize)
+            .and_then(|p| p.as_ref())
+    }
+
+    pub fn transform(&self, entity: EntityId) -> Option<Transform> {
+        self.transforms
+            .get(entity.index() as usize)
+            .and_then(|t| *t)
     }
 
     pub fn set_drawable_2d(&mut self, entity: EntityId, drawable: Drawable2D) {
@@ -185,6 +214,7 @@ impl World {
             self.bounds.resize(new_len, None);
             self.visibility.resize(new_len, None);
             self.time_spans.resize(new_len, None);
+            self.properties.resize(new_len, None);
             self.drawables_2d.resize(new_len, None);
             self.drawables_3d.resize(new_len, None);
             self.vector_geometry.resize(new_len, None);

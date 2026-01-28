@@ -5,7 +5,7 @@ use scene::World;
 use scene::components::VectorGeometryKind;
 
 use crate::scene_package::{ScenePackage, ScenePackageError};
-use crate::vector_chunk::{VectorChunk, VectorChunkError};
+use crate::vector_chunk::VectorChunk;
 
 #[derive(Debug)]
 pub enum SceneWorldLoadError {
@@ -14,9 +14,19 @@ pub enum SceneWorldLoadError {
         path: PathBuf,
         source: std::io::Error,
     },
+    ChunkHashMissing {
+        chunk_id: String,
+        path: PathBuf,
+    },
+    ChunkHashMismatch {
+        chunk_id: String,
+        path: PathBuf,
+        expected: String,
+        found: String,
+    },
     ChunkParse {
         chunk_id: String,
-        source: VectorChunkError,
+        source: String,
     },
 }
 
@@ -27,6 +37,23 @@ impl std::fmt::Display for SceneWorldLoadError {
             SceneWorldLoadError::ChunkIo { path, source } => {
                 write!(f, "failed to read chunk {}: {source}", path.display())
             }
+            SceneWorldLoadError::ChunkHashMissing { chunk_id, path } => {
+                write!(
+                    f,
+                    "missing content_hash for chunk {chunk_id} ({})",
+                    path.display()
+                )
+            }
+            SceneWorldLoadError::ChunkHashMismatch {
+                chunk_id,
+                path,
+                expected,
+                found,
+            } => write!(
+                f,
+                "content hash mismatch for chunk {chunk_id} ({}): expected {expected}, found {found}",
+                path.display()
+            ),
             SceneWorldLoadError::ChunkParse { chunk_id, source } => {
                 write!(f, "failed to parse chunk {chunk_id}: {source}")
             }
@@ -56,21 +83,70 @@ pub fn load_world_from_package(package: &ScenePackage) -> Result<World, SceneWor
         };
 
         let path = package.root().join(&entry.path);
-        let payload = fs::read_to_string(&path).map_err(|e| SceneWorldLoadError::ChunkIo {
-            path: path.clone(),
-            source: e,
-        })?;
-        let chunk = VectorChunk::from_geojson_str(&payload).map_err(|e| {
-            SceneWorldLoadError::ChunkParse {
-                chunk_id: entry.id.clone(),
+        let chunk = if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("avc"))
+            .unwrap_or(false)
+        {
+            let bytes = fs::read(&path).map_err(|e| SceneWorldLoadError::ChunkIo {
+                path: path.clone(),
                 source: e,
+            })?;
+
+            // Hash enforcement for binary chunks: makes caching and streaming deterministic and safe.
+            let expected = entry.content_hash.clone().ok_or_else(|| {
+                SceneWorldLoadError::ChunkHashMissing {
+                    chunk_id: entry.id.clone(),
+                    path: path.clone(),
+                }
+            })?;
+            let found = to_hex(blake3::hash(&bytes).as_bytes());
+            if !eq_hex(&expected, &found) {
+                return Err(SceneWorldLoadError::ChunkHashMismatch {
+                    chunk_id: entry.id.clone(),
+                    path: path.clone(),
+                    expected,
+                    found,
+                });
             }
-        })?;
+
+            VectorChunk::from_avc_bytes(&bytes).map_err(|e| SceneWorldLoadError::ChunkParse {
+                chunk_id: entry.id.clone(),
+                source: e.to_string(),
+            })?
+        } else {
+            let payload = fs::read_to_string(&path).map_err(|e| SceneWorldLoadError::ChunkIo {
+                path: path.clone(),
+                source: e,
+            })?;
+            VectorChunk::from_geojson_str(&payload).map_err(|e| {
+                SceneWorldLoadError::ChunkParse {
+                    chunk_id: entry.id.clone(),
+                    source: e.to_string(),
+                }
+            })?
+        };
 
         ingest_vector_chunk(&mut world, &chunk, expected);
     }
 
     Ok(world)
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0F) as usize] as char);
+    }
+    out
+}
+
+fn eq_hex(a: &str, b: &str) -> bool {
+    // Allow either case in manifests.
+    a.trim().eq_ignore_ascii_case(b.trim())
 }
 
 fn ingest_vector_chunk(
