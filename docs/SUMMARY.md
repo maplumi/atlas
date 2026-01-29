@@ -55,6 +55,7 @@
     - [Terrain Chunk (TCH)](technical/formats/terrain-chunk-tch.md)
     - [Analysis Chunk (ACH)](technical/formats/analysis-chunk-ach.md)
     - [Versioning](technical/formats/versioning.md)
+  - [Hex Grids, LOD, and Smoothing](technical/hex-grids-lod-smoothing.md)
 
 - [Development](development/README.md)
   - [Contributing](development/contributing.md)
