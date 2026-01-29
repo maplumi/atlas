@@ -1,7 +1,9 @@
 [build]
-release = true
+release = false
 
 [serve]
 addresses = ["127.0.0.1"]
 port = 8080
 open = false
+# Disable hot-reload by not injecting the auto-reload script (WASM modules can't be safely hot-patched)
+no_autoreload = true

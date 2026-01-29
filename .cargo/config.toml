@@ -1,0 +1,4 @@
+# Disable debug assertions for wasm32 builds to avoid OnceCell UB checks
+# triggered by hot reload / re-entrant JS glue in debug mode.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "debug-assertions=no"]

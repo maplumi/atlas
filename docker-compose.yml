@@ -1,0 +1,24 @@
+services:
+  viewer_web:
+    image: atlas-viewer:${ATLAS_TAG:-dev}
+    build:
+      context: .
+      dockerfile: crates/apps/viewer_web/Dockerfile
+    ports:
+      - "8080:80"
+    depends_on:
+      - terrain_server
+
+  terrain_server:
+    image: atlas-server:${ATLAS_TAG:-dev}
+    build:
+      context: .
+      dockerfile: crates/apps/terrain_server/Dockerfile
+    ports:
+      - "9100:9100"
+    environment:
+      TERRAIN_ADDR: "0.0.0.0:9100"
+      TERRAIN_ROOT: "/data/terrain"
+      STAC_URL: "https://copernicus-dem-30m-stac.s3.amazonaws.com"
+    volumes:
+      - ./data/terrain:/data/terrain

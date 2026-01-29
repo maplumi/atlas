@@ -1,27 +1,34 @@
-use console_error_panic_hook::set_once;
 use gloo_net::http::Request;
 use std::cell::RefCell;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
+// Guard to prevent double-initialization of global state (relevant during hot reload).
+static INITIALIZED: AtomicBool = AtomicBool::new(false);
+static PANIC_HOOK_SET: OnceLock<()> = OnceLock::new();
+
 use catalog::{CatalogEntry, CatalogStore};
 use formats::SceneManifest;
-use foundation::math::{WGS84_A, WGS84_B, ecef_to_geodetic};
+use foundation::math::{Geodetic, WGS84_A, WGS84_B, ecef_to_geodetic, geodetic_to_ecef};
 use layers::symbology::LayerStyle;
 use layers::vector::VectorLayer;
 use scene::components::VectorGeometryKind;
 mod wgpu;
 use wgpu::{
     CityVertex, CorridorVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh,
-    resize_wgpu, set_cities_points, set_corridors_points, set_regions_points,
+    resize_wgpu, set_base_regions_points, set_cities_points, set_corridors_points,
+    set_regions_points,
 };
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 enum ViewMode {
     TwoD,
+    #[default]
     ThreeD,
 }
 
@@ -90,6 +97,7 @@ struct ViewerState {
     line_width_px: f32,
 
     // Layer styles and visibility.
+    base_regions_style: LayerStyle,
     cities_style: LayerStyle,
     corridors_style: LayerStyle,
     regions_style: LayerStyle,
@@ -99,12 +107,14 @@ struct ViewerState {
     selection_style: LayerStyle,
 
     // Engine worlds (source-of-truth). Renderable geometry must be derived via `layers`.
+    base_world: Option<scene::World>,
     cities_world: Option<scene::World>,
     corridors_world: Option<scene::World>,
     regions_world: Option<scene::World>,
     uploaded_world: Option<scene::World>,
 
     // CPU-side cached geometry in viewer coordinates.
+    base_regions_positions: Option<Vec<[f32; 3]>>,
     cities_centers: Option<Vec<[f32; 3]>>,
     corridors_positions: Option<Vec<[f32; 3]>>,
     regions_positions: Option<Vec<[f32; 3]>>,
@@ -118,6 +128,11 @@ struct ViewerState {
     uploaded_count_lines: usize,
     uploaded_count_polys: usize,
 
+    base_count_polys: usize,
+    cities_count_points: usize,
+    corridors_count_lines: usize,
+    regions_count_polys: usize,
+
     selection_center: Option<[f32; 3]>,
     selection_line_positions: Option<Vec<[f32; 3]>>,
     selection_poly_positions: Option<Vec<[f32; 3]>>,
@@ -125,6 +140,7 @@ struct ViewerState {
     // Combined buffers (all visible layers), uploaded into the shared GPU buffers.
     pending_cities: Option<Vec<CityVertex>>,
     pending_corridors: Option<Vec<CorridorVertex>>,
+    pending_base_regions: Option<Vec<OverlayVertex>>,
     pending_regions: Option<Vec<OverlayVertex>>,
     frame_index: u64,
     dt_s: f64,
@@ -148,6 +164,7 @@ thread_local! {
         city_marker_size: 4.0,
         line_width_px: 2.5,
 
+        base_regions_style: LayerStyle { visible: true, color: [0.12, 0.50, 0.85, 0.22], lift: 0.0002 },
         cities_style: LayerStyle { visible: false, color: [1.0, 0.25, 0.25, 0.95], lift: 0.02 },
         corridors_style: LayerStyle { visible: false, color: [1.0, 0.85, 0.25, 0.90], lift: 0.0 },
         regions_style: LayerStyle { visible: false, color: [0.10, 0.90, 0.75, 0.30], lift: 0.0 },
@@ -156,11 +173,13 @@ thread_local! {
         uploaded_regions_style: LayerStyle { visible: false, color: [0.45, 0.75, 1.00, 0.25], lift: 0.0 },
         selection_style: LayerStyle { visible: true, color: [1.0, 1.0, 1.0, 0.95], lift: 0.02 },
 
+        base_world: None,
         cities_world: None,
         corridors_world: None,
         regions_world: None,
         uploaded_world: None,
 
+        base_regions_positions: None,
         cities_centers: None,
         corridors_positions: None,
         regions_positions: None,
@@ -174,11 +193,17 @@ thread_local! {
         uploaded_count_lines: 0,
         uploaded_count_polys: 0,
 
+        base_count_polys: 0,
+        cities_count_points: 0,
+        corridors_count_lines: 0,
+        regions_count_polys: 0,
+
         selection_center: None,
         selection_line_positions: None,
         selection_poly_positions: None,
         pending_cities: None,
         pending_corridors: None,
+        pending_base_regions: None,
         pending_regions: None,
         frame_index: 0,
         dt_s: 1.0 / 60.0,
@@ -186,6 +211,25 @@ thread_local! {
         time_end_s: 10.0,
         camera: CameraState::default(),
         camera_2d: Camera2DState::default(),
+    });
+}
+
+/// Safe TLS access helper that returns a default on teardown instead of panicking.
+/// Use this for all STATE/CATALOG accesses to prevent hot-reload crashes.
+fn with_state<F, R>(f: F) -> R
+where
+    F: FnOnce(&RefCell<ViewerState>) -> R,
+    R: Default,
+{
+    STATE.try_with(f).unwrap_or_default()
+}
+
+fn init_panic_hook() {
+    PANIC_HOOK_SET.get_or_init(|| {
+        std::panic::set_hook(Box::new(|info| {
+            let msg = info.to_string();
+            web_sys::console::error_1(&JsValue::from_str(&msg));
+        }));
     });
 }
 
@@ -606,10 +650,15 @@ fn current_sun_direction_world() -> Option<[f32; 3]> {
 }
 
 fn render_scene() -> Result<(), JsValue> {
-    let mode = STATE.with(|state_ref| state_ref.borrow().view_mode);
+    let mode = match STATE.try_with(|state_ref| state_ref.borrow().view_mode) {
+        Ok(mode) => mode,
+        // During hot-reload / teardown, JS callbacks can still fire briefly.
+        // Avoid panicking on TLS access in that window.
+        Err(_) => return Ok(()),
+    };
     match mode {
         ViewMode::ThreeD => {
-            STATE.with(|state_ref| {
+            let _ = STATE.try_with(|state_ref| {
                 let state = state_ref.borrow();
                 if let Some(ctx) = &state.wgpu {
                     let view_proj =
@@ -623,6 +672,7 @@ fn render_scene() -> Result<(), JsValue> {
 
                     // Layer visibility is baked into the combined overlay buffers; we can always
                     // attempt to draw and rely on vertex counts to early-out.
+                    let show_base_regions = state.base_regions_style.visible;
                     let show_cities = true;
                     let show_corridors = true;
                     let show_regions = true;
@@ -631,6 +681,7 @@ fn render_scene() -> Result<(), JsValue> {
                         view_proj,
                         light_dir,
                         state.show_graticule,
+                        show_base_regions,
                         show_cities,
                         show_corridors,
                         show_regions,
@@ -644,7 +695,7 @@ fn render_scene() -> Result<(), JsValue> {
 }
 
 fn render_scene_2d() -> Result<(), JsValue> {
-    STATE.with(|state_ref| {
+    match STATE.try_with(|state_ref| {
         let state = state_ref.borrow();
         let Some(ctx) = state.ctx_2d.as_ref() else {
             return Ok(());
@@ -659,8 +710,29 @@ fn render_scene_2d() -> Result<(), JsValue> {
 
         // Optional graticule (simple, equirectangular).
         if state.show_graticule {
-            ctx_set_stroke_style(ctx, "rgba(148,163,184,0.25)");
-            ctx.set_line_width(1.0);
+            // Minor lines.
+            ctx_set_stroke_style(ctx, "rgba(148,163,184,0.20)");
+            ctx.set_line_width(0.75);
+            for lon in (-180..=180).step_by(10) {
+                let (x0, y0) = project_lon_lat_to_screen(lon as f64, -89.0, state.camera_2d, w, h);
+                let (x1, y1) = project_lon_lat_to_screen(lon as f64, 89.0, state.camera_2d, w, h);
+                ctx.begin_path();
+                ctx.move_to(x0, y0);
+                ctx.line_to(x1, y1);
+                ctx.stroke();
+            }
+            for lat in (-80..=80).step_by(10) {
+                let (x0, y0) = project_lon_lat_to_screen(-180.0, lat as f64, state.camera_2d, w, h);
+                let (x1, y1) = project_lon_lat_to_screen(180.0, lat as f64, state.camera_2d, w, h);
+                ctx.begin_path();
+                ctx.move_to(x0, y0);
+                ctx.line_to(x1, y1);
+                ctx.stroke();
+            }
+
+            // Major lines.
+            ctx_set_stroke_style(ctx, "rgba(148,163,184,0.55)");
+            ctx.set_line_width(1.25);
             for lon in (-180..=180).step_by(30) {
                 let (x0, y0) = project_lon_lat_to_screen(lon as f64, -89.0, state.camera_2d, w, h);
                 let (x1, y1) = project_lon_lat_to_screen(lon as f64, 89.0, state.camera_2d, w, h);
@@ -705,6 +777,11 @@ fn render_scene_2d() -> Result<(), JsValue> {
             }
         };
 
+        if state.base_regions_style.visible
+            && let Some(pos) = state.base_regions_positions.as_deref()
+        {
+            draw_poly_tris(pos, state.base_regions_style.color);
+        }
         if state.regions_style.visible
             && let Some(pos) = state.regions_positions.as_deref()
         {
@@ -798,7 +875,10 @@ fn render_scene_2d() -> Result<(), JsValue> {
         }
 
         Ok(())
-    })
+    }) {
+        Ok(res) => res,
+        Err(_) => Ok(()),
+    }
 }
 
 fn build_city_vertices(
@@ -854,6 +934,46 @@ fn ecef_vec3_to_viewer_f32(p: foundation::math::Vec3) -> [f32; 3] {
     [p.x as f32, p.z as f32, (-p.y) as f32]
 }
 
+fn lon_lat_deg_to_world(lon_deg: f64, lat_deg: f64) -> [f32; 3] {
+    let geo = Geodetic::new(lat_deg.to_radians(), lon_deg.to_radians(), 0.0);
+    let ecef = geodetic_to_ecef(geo);
+    [ecef.x as f32, ecef.z as f32, (-ecef.y) as f32]
+}
+
+fn unit_from_lon_lat_deg(lon_deg: f64, lat_deg: f64) -> [f64; 3] {
+    let lon = lon_deg.to_radians();
+    let lat = lat_deg.to_radians();
+    let cos_lat = lat.cos();
+    [cos_lat * lon.cos(), lat.sin(), cos_lat * lon.sin()]
+}
+
+fn slerp_unit(a: [f64; 3], b: [f64; 3], t: f64) -> [f64; 3] {
+    let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]).clamp(-1.0, 1.0);
+    let omega = dot.acos();
+    let sin_omega = omega.sin();
+    if sin_omega.abs() < 1e-6 {
+        let x = a[0] + (b[0] - a[0]) * t;
+        let y = a[1] + (b[1] - a[1]) * t;
+        let z = a[2] + (b[2] - a[2]) * t;
+        let len = (x * x + y * y + z * z).sqrt().max(1e-9);
+        [x / len, y / len, z / len]
+    } else {
+        let a_scale = ((1.0 - t) * omega).sin() / sin_omega;
+        let b_scale = (t * omega).sin() / sin_omega;
+        [
+            a_scale * a[0] + b_scale * b[0],
+            a_scale * a[1] + b_scale * b[1],
+            a_scale * a[2] + b_scale * b[2],
+        ]
+    }
+}
+
+fn lon_lat_deg_from_unit(u: [f64; 3]) -> (f64, f64) {
+    let lon = u[2].atan2(u[0]).to_degrees();
+    let lat = u[1].clamp(-1.0, 1.0).asin().to_degrees();
+    (lon, lat)
+}
+
 fn world_from_vector_chunk(
     chunk: &formats::VectorChunk,
     expected_kind: Option<VectorGeometryKind>,
@@ -880,18 +1000,7 @@ fn build_corridor_vertices(
     let seg_count = positions_line_list.len() / 2;
     let mut out: Vec<CorridorVertex> = Vec::with_capacity(seg_count.saturating_mul(6));
 
-    for seg in positions_line_list.chunks_exact(2).take(250_000) {
-        let a = seg[0];
-        let b = seg[1];
-
-        // Skip degenerate segments.
-        let dx = a[0] - b[0];
-        let dy = a[1] - b[1];
-        let dz = a[2] - b[2];
-        if dx * dx + dy * dy + dz * dz < 1e-12 {
-            continue;
-        }
-
+    let push_segment = |out: &mut Vec<CorridorVertex>, a: [f32; 3], b: [f32; 3]| {
         let v00 = CorridorVertex {
             a,
             b,
@@ -915,6 +1024,58 @@ fn build_corridor_vertices(
 
         // Two triangles for the segment quad.
         out.extend([v00, v01, v11, v00, v11, v10]);
+    };
+
+    const MAX_SEGMENTS: usize = 250_000;
+    let mut emitted_segments = 0usize;
+
+    for seg in positions_line_list.chunks_exact(2).take(250_000) {
+        let a = seg[0];
+        let b = seg[1];
+
+        // Skip degenerate segments.
+        let dx = a[0] - b[0];
+        let dy = a[1] - b[1];
+        let dz = a[2] - b[2];
+        if dx * dx + dy * dy + dz * dz < 1e-12 {
+            continue;
+        }
+
+        let (lon_a, lat_a) = world_to_lon_lat_deg([a[0] as f64, a[1] as f64, a[2] as f64]);
+        let (lon_b, lat_b) = world_to_lon_lat_deg([b[0] as f64, b[1] as f64, b[2] as f64]);
+        let ua = unit_from_lon_lat_deg(lon_a, lat_a);
+        let ub = unit_from_lon_lat_deg(lon_b, lat_b);
+        let dot = (ua[0] * ub[0] + ua[1] * ub[1] + ua[2] * ub[2]).clamp(-1.0, 1.0);
+        let angle = dot.acos();
+        let max_step = 5.0_f64.to_radians();
+        let steps = ((angle / max_step).ceil() as usize).clamp(1, 128);
+
+        if steps <= 1 {
+            push_segment(&mut out, a, b);
+            emitted_segments += 1;
+        } else {
+            let mut prev = a;
+            for i in 1..=steps {
+                if emitted_segments >= MAX_SEGMENTS {
+                    break;
+                }
+                let t = i as f64 / steps as f64;
+                let p = if i == steps {
+                    b
+                } else {
+                    let u = slerp_unit(ua, ub, t);
+                    let (lon, lat) = lon_lat_deg_from_unit(u);
+                    lon_lat_deg_to_world(lon, lat)
+                };
+                push_segment(&mut out, prev, p);
+                prev = p;
+                emitted_segments += 1;
+            }
+        }
+
+        if emitted_segments >= MAX_SEGMENTS {
+            break;
+        }
     }
 
     out
@@ -927,7 +1088,7 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
     const MAX_UPLOADED_LINE_SEGMENTS: usize = 150_000;
     const MAX_UPLOADED_POLY_VERTS: usize = 600_000;
 
-    STATE.with(|state| {
+    match STATE.try_with(|state| {
         let mut s = state.borrow_mut();
 
         // Refresh cached viewer-space geometry from the engine worlds.
@@ -935,6 +1096,13 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
         let layer = VectorLayer::new(1);
 
         // Built-ins
+        s.base_regions_positions = s.base_world.as_ref().map(|w| {
+            let snap = layer.extract(w);
+            snap.area_triangles
+                .into_iter()
+                .map(ecef_vec3_to_viewer_f32)
+                .collect::<Vec<_>>()
+        });
         s.cities_centers = s.cities_world.as_ref().map(|w| {
             let snap = layer.extract(w);
             snap.points
@@ -1021,6 +1189,7 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
 
         let mut points: Vec<CityVertex> = Vec::new();
         let mut lines: Vec<CorridorVertex> = Vec::new();
+        let mut base_polys: Vec<OverlayVertex> = Vec::new();
         let mut polys: Vec<OverlayVertex> = Vec::new();
 
         // Points
@@ -1088,6 +1257,22 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
             ));
         }
 
+        // Base polygons (triangles)
+        if s.base_regions_style.visible
+            && let Some(pos) = s.base_regions_positions.as_deref()
+        {
+            let mut lift_m = s.base_regions_style.lift * (WGS84_A as f32);
+            if lift_m <= 0.0 {
+                // Keep base fills above the surface to avoid z-fighting.
+                lift_m = 500.0;
+            }
+            base_polys.extend(pos.iter().map(|&p| OverlayVertex {
+                position: p,
+                lift: lift_m,
+                color: s.base_regions_style.color,
+            }));
+        }
+
         // Polygons (triangles)
         if s.regions_style.visible
             && let Some(pos) = s.regions_positions.as_deref()
@@ -1131,23 +1316,33 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
         if let Some(ctx) = &mut s.wgpu {
             set_cities_points(ctx, &points);
             set_corridors_points(ctx, &lines);
+            set_base_regions_points(ctx, &base_polys);
             set_regions_points(ctx, &polys);
             s.pending_cities = None;
             s.pending_corridors = None;
+            s.pending_base_regions = None;
             s.pending_regions = None;
         } else {
             s.pending_cities = Some(points);
             s.pending_corridors = Some(lines);
+            s.pending_base_regions = Some(base_polys);
             s.pending_regions = Some(polys);
         }
 
         Ok(())
-    })
+    }) {
+        Ok(res) => res,
+        Err(_) => Ok(()),
+    }
 }
 
 #[wasm_bindgen(start)]
 pub fn start() -> Result<(), JsValue> {
-    set_once();
+    // Avoid double-initialization (can happen during hot-reload edge cases).
+    if INITIALIZED.swap(true, Ordering::SeqCst) {
+        return Ok(());
+    }
+    init_panic_hook();
     Ok(())
 }
 
@@ -1184,7 +1379,7 @@ fn init_canvas_2d_inner() -> Result<(), JsValue> {
         .ok_or_else(|| JsValue::from_str("2d context unavailable"))?
         .dyn_into::<CanvasRenderingContext2d>()?;
 
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         s.canvas_2d = Some(canvas);
         s.ctx_2d = Some(ctx);
@@ -1196,7 +1391,7 @@ fn init_canvas_2d_inner() -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn set_view_mode(mode: &str) -> Result<(), JsValue> {
     let mode = ViewMode::from_str(mode);
-    STATE.with(|state| {
+    with_state(|state| {
         state.borrow_mut().view_mode = mode;
     });
     render_scene()
@@ -1204,7 +1399,7 @@ pub fn set_view_mode(mode: &str) -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn set_canvas_sizes(width: f64, height: f64) {
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         s.canvas_width = width;
         s.canvas_height = height;
@@ -1216,7 +1411,7 @@ pub fn set_canvas_sizes(width: f64, height: f64) {
 
 #[wasm_bindgen]
 pub fn camera_reset() -> Result<(), JsValue> {
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         match s.view_mode {
             ViewMode::ThreeD => s.camera = CameraState::default(),
@@ -1228,7 +1423,7 @@ pub fn camera_reset() -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn get_camera_yaw_deg() -> f64 {
-    STATE.with(|state| {
+    with_state(|state| {
         let s = state.borrow();
         match s.view_mode {
             ViewMode::ThreeD => s.camera.yaw_rad.to_degrees().rem_euclid(360.0),
@@ -1247,7 +1442,7 @@ pub fn set_camera_yaw_deg(yaw_deg: f64) -> Result<(), JsValue> {
     yaw_rad = (yaw_rad + std::f64::consts::PI).rem_euclid(2.0 * std::f64::consts::PI)
         - std::f64::consts::PI;
 
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         if s.view_mode == ViewMode::ThreeD {
             s.camera.yaw_rad = yaw_rad;
@@ -1261,7 +1456,7 @@ pub fn set_camera_yaw_deg(yaw_deg: f64) -> Result<(), JsValue> {
 /// Intended usage: call with pointer delta in pixels.
 #[wasm_bindgen]
 pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         match s.view_mode {
             ViewMode::ThreeD => {
@@ -1290,7 +1485,7 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
 /// Intended usage: call with pointer delta in pixels.
 #[wasm_bindgen]
 pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         match s.view_mode {
             ViewMode::ThreeD => {
@@ -1333,7 +1528,7 @@ pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
 /// Intended usage: call with wheel deltaY.
 #[wasm_bindgen]
 pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         match s.view_mode {
             ViewMode::ThreeD => {
@@ -1394,87 +1589,39 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
     let should_load_regions = dataset == "regions";
     let should_load_uploaded = dataset == "__uploaded__";
 
-    STATE.with(|state| {
+    with_state(|state| {
         state.borrow_mut().dataset = dataset;
     });
 
     if should_load_cities {
-        spawn_local(async move {
-            let chunk = match fetch_vector_chunk("assets/chunks/cities.avc").await {
-                Ok(c) => c,
-                Err(err) => {
-                    web_sys::console::log_1(&JsValue::from_str(&format!(
-                        "Failed to fetch cities: {:?}",
-                        err
-                    )));
-                    return;
-                }
-            };
-
-            let world = world_from_vector_chunk(&chunk, Some(VectorGeometryKind::Point));
-
-            STATE.with(|state| {
-                let mut s = state.borrow_mut();
-                s.cities_world = Some(world);
-                s.cities_style.visible = true;
-            });
-            let _ = rebuild_overlays_and_upload();
-            let _ = render_scene();
+        with_state(|state| {
+            if let Some(st) = layer_style_mut(&mut state.borrow_mut(), "cities") {
+                st.visible = true;
+            }
         });
+        ensure_builtin_layer_loaded("cities");
     }
 
     if should_load_corridors {
-        spawn_local(async move {
-            let chunk = match fetch_vector_chunk("assets/chunks/air_corridors.avc").await {
-                Ok(c) => c,
-                Err(err) => {
-                    web_sys::console::log_1(&JsValue::from_str(&format!(
-                        "Failed to fetch air corridors: {:?}",
-                        err
-                    )));
-                    return;
-                }
-            };
-
-            let world = world_from_vector_chunk(&chunk, Some(VectorGeometryKind::Line));
-
-            STATE.with(|state| {
-                let mut s = state.borrow_mut();
-                s.corridors_world = Some(world);
-                s.corridors_style.visible = true;
-            });
-            let _ = rebuild_overlays_and_upload();
-            let _ = render_scene();
+        with_state(|state| {
+            if let Some(st) = layer_style_mut(&mut state.borrow_mut(), "air_corridors") {
+                st.visible = true;
+            }
         });
+        ensure_builtin_layer_loaded("air_corridors");
     }
 
     if should_load_regions {
-        spawn_local(async move {
-            let chunk = match fetch_vector_chunk("assets/chunks/regions.avc").await {
-                Ok(c) => c,
-                Err(err) => {
-                    web_sys::console::log_1(&JsValue::from_str(&format!(
-                        "Failed to fetch regions: {:?}",
-                        err
-                    )));
-                    return;
-                }
-            };
-
-            let world = world_from_vector_chunk(&chunk, Some(VectorGeometryKind::Area));
-
-            STATE.with(|state| {
-                let mut s = state.borrow_mut();
-                s.regions_world = Some(world);
-                s.regions_style.visible = true;
-            });
-            let _ = rebuild_overlays_and_upload();
-            let _ = render_scene();
+        with_state(|state| {
+            if let Some(st) = layer_style_mut(&mut state.borrow_mut(), "regions") {
+                st.visible = true;
+            }
         });
+        ensure_builtin_layer_loaded("regions");
     }
 
     if should_load_uploaded {
-        STATE.with(|state| {
+        with_state(|state| {
             let mut s = state.borrow_mut();
             s.uploaded_points_style.visible = s.uploaded_count_points > 0;
             s.uploaded_corridors_style.visible = s.uploaded_count_lines > 0;
@@ -1489,11 +1636,16 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 }
 
 #[wasm_bindgen]
+pub fn load_base_world() {
+    ensure_base_world_loaded();
+}
+
+#[wasm_bindgen]
 pub fn set_city_marker_size(size: f64) -> Result<(), JsValue> {
     // Size is in screen pixels.
     let size = (size as f32).clamp(1.0, 64.0);
 
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         s.city_marker_size = size;
     });
@@ -1505,7 +1657,7 @@ pub fn set_city_marker_size(size: f64) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn set_line_width_px(width_px: f64) -> Result<(), JsValue> {
     let width_px = (width_px as f32).clamp(1.0, 24.0);
-    STATE.with(|state| {
+    with_state(|state| {
         state.borrow_mut().line_width_px = width_px;
     });
     let _ = rebuild_overlays_and_upload();
@@ -1514,7 +1666,7 @@ pub fn set_line_width_px(width_px: f64) -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn set_graticule_enabled(enabled: bool) -> Result<(), JsValue> {
-    STATE.with(|state| {
+    with_state(|state| {
         state.borrow_mut().show_graticule = enabled;
     });
     // Render immediately so the toggle feels responsive.
@@ -1523,7 +1675,7 @@ pub fn set_graticule_enabled(enabled: bool) -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn set_real_time_sun_enabled(enabled: bool) -> Result<(), JsValue> {
-    STATE.with(|state| {
+    with_state(|state| {
         state.borrow_mut().sun_follow_real_time = enabled;
     });
     render_scene()
@@ -1531,6 +1683,7 @@ pub fn set_real_time_sun_enabled(enabled: bool) -> Result<(), JsValue> {
 
 fn layer_style_mut<'a>(s: &'a mut ViewerState, id: &str) -> Option<&'a mut LayerStyle> {
     match id {
+        "world_base" => Some(&mut s.base_regions_style),
         "cities" => Some(&mut s.cities_style),
         "air_corridors" => Some(&mut s.corridors_style),
         "regions" => Some(&mut s.regions_style),
@@ -1542,14 +1695,31 @@ fn layer_style_mut<'a>(s: &'a mut ViewerState, id: &str) -> Option<&'a mut Layer
     }
 }
 
+fn layer_style_ref<'a>(s: &'a ViewerState, id: &str) -> Option<&'a LayerStyle> {
+    match id {
+        "world_base" => Some(&s.base_regions_style),
+        "cities" => Some(&s.cities_style),
+        "air_corridors" => Some(&s.corridors_style),
+        "regions" => Some(&s.regions_style),
+        "uploaded_points" => Some(&s.uploaded_points_style),
+        "uploaded_corridors" => Some(&s.uploaded_corridors_style),
+        "uploaded_regions" => Some(&s.uploaded_regions_style),
+        "selection" => Some(&s.selection_style),
+        _ => None,
+    }
+}
+
 #[wasm_bindgen]
 pub fn set_layer_visible(id: &str, visible: bool) -> Result<(), JsValue> {
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         if let Some(st) = layer_style_mut(&mut s, id) {
             st.visible = visible;
         }
     });
+    if visible {
+        ensure_builtin_layer_loaded(id);
+    }
     let _ = rebuild_overlays_and_upload();
     render_scene()
 }
@@ -1566,10 +1736,340 @@ fn parse_hex_color(s: &str) -> Option<[f32; 3]> {
     Some([r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0])
 }
 
+fn color_to_hex(rgb: [f32; 3]) -> String {
+    let r = (rgb[0].clamp(0.0, 1.0) * 255.0).round() as u8;
+    let g = (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8;
+    let b = (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!("#{:02x}{:02x}{:02x}", r, g, b)
+}
+
+fn update_bounds(
+    min_lon: &mut f64,
+    max_lon: &mut f64,
+    min_lat: &mut f64,
+    max_lat: &mut f64,
+    lon: f64,
+    lat: f64,
+) {
+    if lon.is_finite() && lat.is_finite() {
+        *min_lon = min_lon.min(lon);
+        *max_lon = max_lon.max(lon);
+        *min_lat = min_lat.min(lat);
+        *max_lat = max_lat.max(lat);
+    }
+}
+
+fn update_bounds_for_geometry(
+    geom: &formats::VectorGeometry,
+    min_lon: &mut f64,
+    max_lon: &mut f64,
+    min_lat: &mut f64,
+    max_lat: &mut f64,
+) {
+    use formats::VectorGeometry::*;
+    match geom {
+        Point(p) => update_bounds(min_lon, max_lon, min_lat, max_lat, p.lon_deg, p.lat_deg),
+        MultiPoint(ps) | LineString(ps) => {
+            for p in ps {
+                update_bounds(min_lon, max_lon, min_lat, max_lat, p.lon_deg, p.lat_deg);
+            }
+        }
+        MultiLineString(lines) | Polygon(lines) => {
+            for line in lines {
+                for p in line {
+                    update_bounds(min_lon, max_lon, min_lat, max_lat, p.lon_deg, p.lat_deg);
+                }
+            }
+        }
+        MultiPolygon(polys) => {
+            for poly in polys {
+                for ring in poly {
+                    for p in ring {
+                        update_bounds(min_lon, max_lon, min_lat, max_lat, p.lon_deg, p.lat_deg);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn fit_camera_2d_to_bounds(
+    cam: &mut Camera2DState,
+    w: f64,
+    h: f64,
+    min_lon: f64,
+    max_lon: f64,
+    min_lat: f64,
+    max_lat: f64,
+) {
+    let span_lon = (max_lon - min_lon).abs().max(1e-6);
+    let span_lat = (max_lat - min_lat).abs().max(1e-6);
+
+    let center_lon = wrap_lon_deg((min_lon + max_lon) * 0.5);
+    let center_lat = clamp((min_lat + max_lat) * 0.5, -89.9, 89.9);
+
+    let base = (w / 360.0).min(h / 180.0).max(1e-6);
+    let scale = (w / span_lon).min(h / span_lat) * 0.9;
+    let zoom = clamp(scale / base, 0.2, 200.0);
+
+    cam.center_lon_deg = center_lon;
+    cam.center_lat_deg = center_lat;
+    cam.zoom = zoom;
+}
+
+fn count_chunk_features(chunk: &formats::VectorChunk) -> (usize, usize, usize) {
+    let mut points = 0usize;
+    let mut lines = 0usize;
+    let mut polys = 0usize;
+    for f in &chunk.features {
+        match &f.geometry {
+            formats::VectorGeometry::Point(_) => points += 1,
+            formats::VectorGeometry::MultiPoint(v) => points += v.len(),
+            formats::VectorGeometry::LineString(_) => lines += 1,
+            formats::VectorGeometry::MultiLineString(v) => lines += v.len(),
+            formats::VectorGeometry::Polygon(_) => polys += 1,
+            formats::VectorGeometry::MultiPolygon(v) => polys += v.len(),
+        }
+    }
+    (points, lines, polys)
+}
+
+async fn fetch_geojson_chunk(url: &str) -> Result<formats::VectorChunk, JsValue> {
+    let resp = Request::get(url)
+        .send()
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    formats::VectorChunk::from_geojson_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+fn ensure_base_world_loaded() {
+    let needs_load = with_state(|state| state.borrow().base_world.is_none());
+    if !needs_load {
+        return;
+    }
+
+    spawn_local(async move {
+        let chunk = match fetch_geojson_chunk("assets/world.json").await {
+            Ok(c) => c,
+            Err(err) => {
+                web_sys::console::log_1(&JsValue::from_str(&format!(
+                    "Failed to fetch base world: {:?}",
+                    err
+                )));
+                return;
+            }
+        };
+
+        let (_points, _lines, polys) = count_chunk_features(&chunk);
+        let world = world_from_vector_chunk(&chunk, Some(VectorGeometryKind::Area));
+        // TODO: when a DEM/surface model is available, sample heights for layer-0 terrain.
+
+        with_state(|state| {
+            let mut s = state.borrow_mut();
+            s.base_world = Some(world);
+            s.base_count_polys = polys;
+        });
+
+        let _ = rebuild_overlays_and_upload();
+        let _ = render_scene();
+    });
+}
+
+fn ensure_builtin_layer_loaded(id: &str) {
+    match id {
+        "world_base" => {
+            ensure_base_world_loaded();
+        }
+        "cities" => {
+            let needs_load = with_state(|state| state.borrow().cities_world.is_none());
+            if !needs_load {
+                return;
+            }
+            spawn_local(async move {
+                let chunk = match fetch_vector_chunk("assets/chunks/cities.avc").await {
+                    Ok(c) => c,
+                    Err(err) => {
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "Failed to fetch cities: {:?}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+
+                let (points, _lines, _polys) = count_chunk_features(&chunk);
+                let world = world_from_vector_chunk(&chunk, Some(VectorGeometryKind::Point));
+
+                with_state(|state| {
+                    let mut s = state.borrow_mut();
+                    s.cities_world = Some(world);
+                    s.cities_count_points = points;
+                });
+                let _ = rebuild_overlays_and_upload();
+                let _ = render_scene();
+            });
+        }
+        "air_corridors" => {
+            let needs_load = with_state(|state| state.borrow().corridors_world.is_none());
+            if !needs_load {
+                return;
+            }
+            spawn_local(async move {
+                let chunk = match fetch_vector_chunk("assets/chunks/air_corridors.avc").await {
+                    Ok(c) => c,
+                    Err(err) => {
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "Failed to fetch air corridors: {:?}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+
+                let (_points, lines, _polys) = count_chunk_features(&chunk);
+                let world = world_from_vector_chunk(&chunk, Some(VectorGeometryKind::Line));
+
+                with_state(|state| {
+                    let mut s = state.borrow_mut();
+                    s.corridors_world = Some(world);
+                    s.corridors_count_lines = lines;
+                });
+                let _ = rebuild_overlays_and_upload();
+                let _ = render_scene();
+            });
+        }
+        "regions" => {
+            let needs_load = with_state(|state| state.borrow().regions_world.is_none());
+            if !needs_load {
+                return;
+            }
+            spawn_local(async move {
+                let chunk = match fetch_vector_chunk("assets/chunks/regions.avc").await {
+                    Ok(c) => c,
+                    Err(err) => {
+                        web_sys::console::log_1(&JsValue::from_str(&format!(
+                            "Failed to fetch regions: {:?}",
+                            err
+                        )));
+                        return;
+                    }
+                };
+
+                let (_points, _lines, polys) = count_chunk_features(&chunk);
+                let world = world_from_vector_chunk(&chunk, Some(VectorGeometryKind::Area));
+
+                with_state(|state| {
+                    let mut s = state.borrow_mut();
+                    s.regions_world = Some(world);
+                    s.regions_count_polys = polys;
+                });
+                let _ = rebuild_overlays_and_upload();
+                let _ = render_scene();
+            });
+        }
+        _ => {}
+    }
+}
+
+#[wasm_bindgen]
+pub fn get_layer_style(id: &str) -> Result<JsValue, JsValue> {
+    let style = with_state(|state| {
+        let s = state.borrow();
+        layer_style_ref(&s, id).copied()
+    });
+
+    let Some(style) = style else {
+        return Err(JsValue::from_str("Unknown layer id"));
+    };
+
+    let o = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("visible"),
+        &JsValue::from_bool(style.visible),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("color_hex"),
+        &JsValue::from_str(&color_to_hex([
+            style.color[0],
+            style.color[1],
+            style.color[2],
+        ])),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("opacity"),
+        &JsValue::from_f64(style.color[3] as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("lift"),
+        &JsValue::from_f64(style.lift as f64),
+    );
+    Ok(o.into())
+}
+
+#[wasm_bindgen]
+pub fn get_builtin_layers() -> Result<JsValue, JsValue> {
+    let arr = js_sys::Array::new();
+    with_state(|state| {
+        let s = state.borrow();
+        let push = |id: &str, name: &str, points: usize, lines: usize, polys: usize| {
+            let o = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&o, &JsValue::from_str("id"), &JsValue::from_str(id));
+            let _ = js_sys::Reflect::set(&o, &JsValue::from_str("name"), &JsValue::from_str(name));
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("points"),
+                &JsValue::from_f64(points as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("lines"),
+                &JsValue::from_f64(lines as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("polygons"),
+                &JsValue::from_f64(polys as f64),
+            );
+            let _ = js_sys::Reflect::set(&o, &JsValue::from_str("builtin"), &JsValue::TRUE);
+            arr.push(&o);
+        };
+
+        push("world_base", "World base", 0, 0, s.base_count_polys);
+        push("cities", "Cities", s.cities_count_points, 0, 0);
+        push(
+            "air_corridors",
+            "Air corridors",
+            0,
+            s.corridors_count_lines,
+            0,
+        );
+        push("regions", "Regions", 0, 0, s.regions_count_polys);
+    });
+    Ok(arr.into())
+}
+
+#[wasm_bindgen]
+pub fn get_city_marker_size() -> f64 {
+    with_state(|state| state.borrow().city_marker_size as f64)
+}
+
+#[wasm_bindgen]
+pub fn get_line_width_px() -> f64 {
+    with_state(|state| state.borrow().line_width_px as f64)
+}
+
 #[wasm_bindgen]
 pub fn set_layer_color_hex(id: &str, hex: &str) -> Result<(), JsValue> {
     let rgb = parse_hex_color(hex).ok_or_else(|| JsValue::from_str("Invalid color"))?;
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         if let Some(st) = layer_style_mut(&mut s, id) {
             st.color[0] = rgb[0];
@@ -1584,7 +2084,7 @@ pub fn set_layer_color_hex(id: &str, hex: &str) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn set_layer_opacity(id: &str, opacity: f64) -> Result<(), JsValue> {
     let a = (opacity as f32).clamp(0.0, 1.0);
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         if let Some(st) = layer_style_mut(&mut s, id) {
             st.color[3] = a;
@@ -1597,7 +2097,7 @@ pub fn set_layer_opacity(id: &str, opacity: f64) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn set_layer_lift(id: &str, lift: f64) -> Result<(), JsValue> {
     let lift = (lift as f32).clamp(-0.1, 0.2);
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         if let Some(st) = layer_style_mut(&mut s, id) {
             st.lift = lift;
@@ -1610,7 +2110,7 @@ pub fn set_layer_lift(id: &str, lift: f64) -> Result<(), JsValue> {
 #[wasm_bindgen]
 pub fn get_uploaded_summary() -> Result<JsValue, JsValue> {
     let summary = js_sys::Object::new();
-    STATE.with(|state| {
+    with_state(|state| {
         let s = state.borrow();
         let name = s.uploaded_name.clone().unwrap_or_else(|| "".to_string());
         let catalog_id = s
@@ -1648,7 +2148,7 @@ pub fn get_uploaded_summary() -> Result<JsValue, JsValue> {
 
 #[wasm_bindgen]
 pub fn clear_uploaded() -> Result<(), JsValue> {
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         s.uploaded_name = None;
         s.uploaded_catalog_id = None;
@@ -1732,11 +2232,22 @@ pub async fn catalog_load(id: String) -> Result<JsValue, JsValue> {
     let chunk = formats::VectorChunk::from_avc_bytes(&bytes)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
 
-    // Count primitives for UI.
+    // Count primitives for UI + bounds for camera fit.
     let mut count_points = 0usize;
     let mut count_lines = 0usize;
     let mut count_polys = 0usize;
+    let mut min_lon = f64::INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    let mut min_lat = f64::INFINITY;
+    let mut max_lat = f64::NEG_INFINITY;
     for f in &chunk.features {
+        update_bounds_for_geometry(
+            &f.geometry,
+            &mut min_lon,
+            &mut max_lon,
+            &mut min_lat,
+            &mut max_lat,
+        );
         match &f.geometry {
             formats::VectorGeometry::Point(_) => count_points += 1,
             formats::VectorGeometry::MultiPoint(v) => count_points += v.len(),
@@ -1749,7 +2260,7 @@ pub async fn catalog_load(id: String) -> Result<JsValue, JsValue> {
 
     let world = world_from_vector_chunk(&chunk, None);
 
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         s.uploaded_name = Some(entry.name.clone());
         s.uploaded_catalog_id = Some(entry.id.clone());
@@ -1762,6 +2273,13 @@ pub async fn catalog_load(id: String) -> Result<JsValue, JsValue> {
         s.uploaded_points_style.visible = count_points > 0;
         s.uploaded_corridors_style.visible = count_lines > 0;
         s.uploaded_regions_style.visible = count_polys > 0;
+
+        if min_lon.is_finite() && max_lon.is_finite() && min_lat.is_finite() && max_lat.is_finite()
+        {
+            let w = s.canvas_width.max(1.0);
+            let h = s.canvas_height.max(1.0);
+            fit_camera_2d_to_bounds(&mut s.camera_2d, w, h, min_lon, max_lon, min_lat, max_lat);
+        }
     });
 
     rebuild_overlays_and_upload()?;
@@ -1869,7 +2387,7 @@ fn mat4_mul_vec4(m: [[f32; 4]; 4], v: [f32; 4]) -> [f32; 4] {
 #[wasm_bindgen]
 pub fn cursor_move(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     let out = js_sys::Object::new();
-    let (mode, cam2d, camera3d, w, h) = STATE.with(|state| {
+    let (mode, cam2d, camera3d, w, h) = with_state(|state| {
         let s = state.borrow();
         (
             s.view_mode,
@@ -1906,18 +2424,18 @@ pub fn cursor_move(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
 pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     let out = js_sys::Object::new();
 
-    let mode = STATE.with(|state| state.borrow().view_mode);
+    let mode = with_state(|state| state.borrow().view_mode);
     if mode == ViewMode::TwoD {
         return cursor_click_2d(x_px, y_px);
     }
 
-    let hit = STATE.with(|state| {
+    let hit = with_state(|state| {
         let s = state.borrow();
         ray_hit_globe(s.camera, s.canvas_width, s.canvas_height, x_px, y_px)
     });
     if hit.is_none() {
         // Clear selection if nothing hit on globe.
-        STATE.with(|state| {
+        with_state(|state| {
             let mut s = state.borrow_mut();
             s.selection_center = None;
             s.selection_line_positions = None;
@@ -1930,7 +2448,7 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     }
 
     // Prefer: point (near) -> line (near) -> polygon (inside).
-    let picked = STATE.with(|state| {
+    let picked = with_state(|state| {
         let s = state.borrow();
         let view_proj = camera_view_proj(s.camera, s.canvas_width, s.canvas_height);
         let w = s.canvas_width.max(1.0) as f32;
@@ -2107,7 +2625,7 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     });
 
     if let Some((kind, point, line, poly)) = picked {
-        STATE.with(|state| {
+        with_state(|state| {
             let mut s = state.borrow_mut();
             s.selection_center = point;
             s.selection_line_positions = line;
@@ -2133,7 +2651,7 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     }
 
     // Clear selection if nothing picked.
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         s.selection_center = None;
         s.selection_line_positions = None;
@@ -2148,7 +2666,7 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
 fn cursor_click_2d(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     let out = js_sys::Object::new();
 
-    let picked = STATE.with(|state| {
+    let picked = with_state(|state| {
         let mut s = state.borrow_mut();
         let w = s.canvas_width.max(1.0);
         let h = s.canvas_height.max(1.0);
@@ -2237,11 +2755,22 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
 
     web_sys::console::error_1(&JsValue::from_str("upload: parsed GeoJSON"));
 
-    // Count primitives for UI.
+    // Count primitives for UI + bounds for camera fit.
     let mut count_points = 0usize;
     let mut count_lines = 0usize;
     let mut count_polys = 0usize;
+    let mut min_lon = f64::INFINITY;
+    let mut max_lon = f64::NEG_INFINITY;
+    let mut min_lat = f64::INFINITY;
+    let mut max_lat = f64::NEG_INFINITY;
     for f in &chunk.features {
+        update_bounds_for_geometry(
+            &f.geometry,
+            &mut min_lon,
+            &mut max_lon,
+            &mut min_lat,
+            &mut max_lat,
+        );
         match &f.geometry {
             formats::VectorGeometry::Point(_) => count_points += 1,
             formats::VectorGeometry::MultiPoint(v) => count_points += v.len(),
@@ -2260,9 +2789,19 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
         .to_avc_bytes()
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     web_sys::console::error_1(&JsValue::from_str("upload: encoded AVC"));
+
+    web_sys::console::error_1(&JsValue::from_str("upload: computing now_ms"));
     let now_ms = js_sys::Date::now().max(0.0) as u64;
 
+    web_sys::console::error_1(&JsValue::from_str("upload: computing catalog_id"));
+    web_sys::console::error_1(&JsValue::from_str(&format!(
+        "upload: avc_bytes_len={}",
+        avc_bytes.len()
+    )));
+
     let catalog_id = catalog::id_for_avc_bytes(&avc_bytes);
+
+    web_sys::console::error_1(&JsValue::from_str("upload: computed catalog_id"));
     web_sys::console::error_1(&JsValue::from_str("upload: persisting to catalog"));
 
     let mut catalog_error: Option<String> = None;
@@ -2272,7 +2811,7 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
     // 1) Try IndexedDB for bytes + LocalStorage for metadata.
     match idb_put_avc_bytes(&catalog_id, &avc_bytes).await {
         Ok(()) => {
-            let meta_res = CATALOG.with(|cat| {
+            let meta_res = match CATALOG.try_with(|cat| {
                 let mut cat = cat.borrow_mut();
                 let existing = cat.get(&catalog_id)?;
                 created_at_ms = existing.as_ref().map(|e| e.created_at_ms).unwrap_or(now_ms);
@@ -2286,7 +2825,14 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
                     created_at_ms,
                 })?;
                 Ok::<(), catalog::CatalogError>(())
-            });
+            }) {
+                Ok(res) => res,
+                Err(_) => {
+                    return Err(JsValue::from_str(
+                        "Viewer state is shutting down (hot reload). Please retry the upload.",
+                    ));
+                }
+            };
             match meta_res {
                 Ok(()) => {
                     catalog_persisted = true;
@@ -2307,7 +2853,7 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
 
     // 2) Fallback: chunked LocalStorage (catalog crate) if IDB path failed.
     if !catalog_persisted {
-        let persisted = CATALOG.with(|cat| {
+        let persisted = match CATALOG.try_with(|cat| {
             let mut cat = cat.borrow_mut();
             let existing = cat.get(&catalog_id)?;
             created_at_ms = existing.as_ref().map(|e| e.created_at_ms).unwrap_or(now_ms);
@@ -2324,7 +2870,14 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
                 &avc_bytes,
             )?;
             Ok::<(), catalog::CatalogError>(())
-        });
+        }) {
+            Ok(res) => res,
+            Err(_) => {
+                return Err(JsValue::from_str(
+                    "Viewer state is shutting down (hot reload). Please retry the upload.",
+                ));
+            }
+        };
         match persisted {
             Ok(()) => {
                 catalog_persisted = true;
@@ -2351,7 +2904,7 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
 
     web_sys::console::error_1(&JsValue::from_str("upload: ingested world"));
 
-    STATE.with(|state| {
+    match STATE.try_with(|state| {
         let mut s = state.borrow_mut();
         s.uploaded_name = Some(name.clone());
         s.uploaded_catalog_id = if catalog_persisted {
@@ -2369,7 +2922,21 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
         s.uploaded_points_style.visible = s.uploaded_count_points > 0;
         s.uploaded_corridors_style.visible = s.uploaded_count_lines > 0;
         s.uploaded_regions_style.visible = s.uploaded_count_polys > 0;
-    });
+
+        if min_lon.is_finite() && max_lon.is_finite() && min_lat.is_finite() && max_lat.is_finite()
+        {
+            let w = s.canvas_width.max(1.0);
+            let h = s.canvas_height.max(1.0);
+            fit_camera_2d_to_bounds(&mut s.camera_2d, w, h, min_lon, max_lon, min_lat, max_lat);
+        }
+    }) {
+        Ok(()) => {}
+        Err(_) => {
+            return Err(JsValue::from_str(
+                "Viewer state is shutting down (hot reload). Please retry the upload.",
+            ));
+        }
+    }
 
     web_sys::console::error_1(&JsValue::from_str("upload: rebuilding overlays"));
     rebuild_overlays_and_upload()?;
@@ -2492,7 +3059,7 @@ pub fn load_dataset(url: String) {
 
         let world = world_from_vector_chunks(&chunks);
 
-        STATE.with(|state| {
+        with_state(|state| {
             let mut s = state.borrow_mut();
             s.uploaded_name = Some(format!(
                 "{} ({})",
@@ -2556,7 +3123,7 @@ fn join_url(base: &str, path: &str) -> String {
 /// This is intentionally not wall-clock driven so it can be replayed.
 #[wasm_bindgen]
 pub fn advance_frame() -> Result<f64, JsValue> {
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         s.frame_index = s.frame_index.wrapping_add(1);
         s.time_s += s.dt_s;
@@ -2567,12 +3134,12 @@ pub fn advance_frame() -> Result<f64, JsValue> {
     });
 
     render_scene()?;
-    Ok(STATE.with(|state| state.borrow().time_s))
+    Ok(with_state(|state| state.borrow().time_s))
 }
 
 #[wasm_bindgen]
 pub fn set_time(time_s: f64) -> Result<(), JsValue> {
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         s.time_s = time_s.max(0.0);
     });
@@ -2582,10 +3149,11 @@ pub fn set_time(time_s: f64) -> Result<(), JsValue> {
 async fn init_wgpu_inner() -> Result<(), JsValue> {
     let ctx = init_wgpu_from_canvas_id("atlas-canvas-3d").await?;
 
-    STATE.with(|state| {
+    with_state(|state| {
         let mut s = state.borrow_mut();
         let pending = s.pending_cities.take();
         let pending_corridors = s.pending_corridors.take();
+        let pending_base_regions = s.pending_base_regions.take();
         let pending_regions = s.pending_regions.take();
         s.wgpu = Some(ctx);
 
@@ -2599,6 +3167,12 @@ async fn init_wgpu_inner() -> Result<(), JsValue> {
             && let Some(ctx) = &mut s.wgpu
         {
             set_corridors_points(ctx, &points);
+        }
+
+        if let Some(points) = pending_base_regions
+            && let Some(ctx) = &mut s.wgpu
+        {
+            set_base_regions_points(ctx, &points);
         }
 
         if let Some(points) = pending_regions

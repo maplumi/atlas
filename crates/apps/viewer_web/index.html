@@ -266,16 +266,8 @@
               <button id="mode-3d" class="tab-btn active" type="button">3D</button>
             </div>
             <div style="font-size:12px; color:#94a3b8; line-height:1.35; margin-top:8px;">
-              Switches the active surface. Layers and dataset stay the same.
+              Switches the active surface. Layers stay the same.
             </div>
-          </div>
-
-          <div class="section">
-            <h3>Datasets</h3>
-            <label for="dataset">Choose dataset</label>
-            <select id="dataset">
-              <option value="" selected>Loading…</option>
-            </select>
           </div>
 
           <div class="section">
@@ -328,6 +320,22 @@
 
           <div class="section">
             <h3>Layers</h3>
+
+            <div class="layer-row">
+              <label class="checkbox">
+                <input id="layer-world-base" type="checkbox" checked />
+                <span>World base (built-in)</span>
+              </label>
+              <input id="layer-world-base-color" type="color" value="#1e7fd9" />
+              <div>
+                <div class="mini">Opacity</div>
+                <input id="layer-world-base-opacity" type="range" min="0" max="1" step="0.01" value="0.22" />
+              </div>
+              <div>
+                <div class="mini">Lift</div>
+                <input id="layer-world-base-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
+              </div>
+            </div>
 
             <div class="layer-row">
               <label class="checkbox">
@@ -435,7 +443,7 @@
           <div class="section">
             <h3>Catalog</h3>
             <div style="font-size:12px; color:#94a3b8; line-height:1.35; margin-bottom:10px;">
-              Uploaded datasets are stored locally (in AVC format) and listed here.
+              Uploaded layers are stored locally (in AVC format) and listed here. Built-ins are listed as read-only.
             </div>
             <div id="catalog-list" style="display:flex; flex-direction:column; gap:10px;"></div>
             <div id="catalog-empty" style="font-size:12px; color:#94a3b8; line-height:1.35;">
@@ -491,60 +499,36 @@
         window.addEventListener("resize", () => resizeCanvas(wasm));
         wasm.init_canvas_2d();
         wasm.init_wgpu();
-        // preload built-in dataset
-        const manifestUrl = new URL("./assets/scene.manifest.json", import.meta.url).toString();
-        wasm.load_dataset(manifestUrl);
-        populateDatasets(manifestUrl, wasm);
+        // preload base world layer
+        try { wasm.load_base_world?.(); } catch (err) { console.error("load_base_world failed", err); }
+        detectBackendAvailability();
         startAnimation(wasm);
       }
 
-      async function populateDatasets(manifestUrl, wasm) {
-        const select = document.getElementById("dataset");
-        try {
-          const resp = await fetch(manifestUrl);
-          if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-          const manifest = await resp.json();
+      async function detectBackendAvailability() {
+        const override = window.ATLAS_BACKEND_URL || "";
+        const host = window.location.hostname || "localhost";
+        const scheme = window.location.protocol === "https:" ? "https" : "http";
+        const fallback = `${scheme}://${host}:9100`;
+        const candidates = [String(override || "").trim(), fallback].filter(Boolean);
 
-          const chunks = Array.isArray(manifest.chunks) ? manifest.chunks : [];
-          // Clear existing options.
-          select.innerHTML = "";
-
-          // Populate from manifest chunks.
-          if (chunks.length === 0) {
-            const opt = document.createElement("option");
-            opt.value = "";
-            opt.textContent = "(no datasets found)";
-            select.appendChild(opt);
-            return;
-          }
-
-          for (const c of chunks) {
-            const id = String(c.id ?? "");
-            if (!id) continue;
-            const kind = c.kind ? String(c.kind) : "";
-            const opt = document.createElement("option");
-            opt.value = id;
-            opt.textContent = kind ? `${id} (${kind})` : id;
-            select.appendChild(opt);
-          }
-
-          // Default selection: first dataset.
-          select.value = select.options[0]?.value ?? "";
-          if (select.value) {
-            try {
-              wasm.set_dataset(select.value);
-            } catch (err) {
-              console.error("set_dataset failed", err);
+        for (const base of candidates) {
+          try {
+            const resp = await fetch(`${base}/healthz`, { method: "GET" });
+            if (resp.ok) {
+              window.__atlasBackendUrl = base;
+              window.__atlasStacUrl = `${base}/stac`;
+              setStatus(`Backend: connected (${base})`);
+              return;
             }
+          } catch (err) {
+            // ignore and try next
           }
-        } catch (err) {
-          console.error("Failed to populate datasets", err);
-          select.innerHTML = "";
-          const opt = document.createElement("option");
-          opt.value = "";
-          opt.textContent = "Failed to load datasets";
-          select.appendChild(opt);
         }
+
+        window.__atlasBackendUrl = "";
+        window.__atlasStacUrl = "https://copernicus-dem-30m-stac.s3.amazonaws.com";
+        setStatus("Backend: offline (using defaults)");
       }
 
       function startAnimation(wasm) {
@@ -591,7 +575,6 @@
         const catalogList = document.getElementById("catalog-list");
         const catalogEmpty = document.getElementById("catalog-empty");
 
-        const dataset = document.getElementById("dataset");
         const fileGeoJson = document.getElementById("file-geojson");
         const uploadedInfo = document.getElementById("uploaded-info");
         const toggleGraticule = document.getElementById("toggle-graticule");
@@ -620,6 +603,11 @@
 
         const cursorText = document.getElementById("cursor-text");
         const pickText = document.getElementById("pick-text");
+
+        const layerWorldBase = document.getElementById("layer-world-base");
+        const layerWorldBaseColor = document.getElementById("layer-world-base-color");
+        const layerWorldBaseOpacity = document.getElementById("layer-world-base-opacity");
+        const layerWorldBaseLift = document.getElementById("layer-world-base-lift");
 
         const layerCities = document.getElementById("layer-cities");
         const layerCitiesColor = document.getElementById("layer-cities-color");
@@ -654,6 +642,18 @@
         const layerUploadedRegionsOpacity = document.getElementById("layer-uploaded-regions-opacity");
         const layerUploadedRegionsLift = document.getElementById("layer-uploaded-regions-lift");
 
+        function formatGeometrySummary(points, lines, polygons) {
+          const p = Number(points ?? 0);
+          const l = Number(lines ?? 0);
+          const g = Number(polygons ?? 0);
+          const parts = [];
+          if (p > 0) parts.push(`Points: ${p}`);
+          if (l > 0) parts.push(`Lines: ${l}`);
+          if (g > 0) parts.push(`Polygons: ${g}`);
+          if (parts.length === 0) return "Empty";
+          return parts.join(" • ");
+        }
+
         function setUploadedInfo({ name, points, lines, polygons, catalog_persisted, catalog_error, skipped_coords, fixed_swapped, fixed_web_mercator, error }) {
           if (error) {
             uploadedInfo.innerHTML = `<div style="color:#fca5a5;">Upload error: ${String(error)}</div>`;
@@ -671,9 +671,10 @@
           const persisted = catalog_persisted === undefined ? null : !!catalog_persisted;
           const catErr = String(catalog_error ?? "").trim();
 
+          const geomSummary = formatGeometrySummary(points, lines, polygons);
           uploadedInfo.innerHTML = `
             <div><span style="color:#93c5fd;">Uploaded:</span> ${name}</div>
-            <div style="color:#94a3b8;">Points: ${points ?? 0} • Lines: ${lines ?? 0} • Polygons: ${polygons ?? 0}</div>
+            <div style="color:#94a3b8;">${geomSummary}</div>
             ${persisted === null ? "" : (persisted ? `<div style="color:#86efac; font-size:12px;">Saved to Catalog.</div>` : `<div style="color:#fbbf24; font-size:12px;">Not saved to Catalog.</div>${catErr ? `<div style=\"color:#94a3b8; font-size:12px;\">${catErr}</div>` : ``}`) }
             ${hasDiag ? `<div style="color:#94a3b8;">Coords: fixed swap ${swapped} • fixed mercator ${merc} • skipped ${skipped}</div>` : ""}
           `;
@@ -694,6 +695,7 @@
               try { wasm.set_layer_lift(id, Number(e.target.value)); } catch (err) { console.error(err); }
             });
           }
+          bind("world_base", layerWorldBase, layerWorldBaseColor, layerWorldBaseOpacity, layerWorldBaseLift);
           bind("cities", layerCities, layerCitiesColor, layerCitiesOpacity, layerCitiesLift);
           bind("air_corridors", layerCorridors, layerCorridorsColor, layerCorridorsOpacity, layerCorridorsLift);
           bind("regions", layerRegions, layerRegionsColor, layerRegionsOpacity, layerRegionsLift);
@@ -703,6 +705,46 @@
         }
 
         wireLayerControls();
+        syncSymbologyControls();
+
+        function syncSymbologyControls() {
+          function syncLayer(id, checkbox, color, opacity, lift) {
+            if (!wasm.get_layer_style) return;
+            try {
+              const style = wasm.get_layer_style(id);
+              if (!style) return;
+              checkbox.checked = !!style.visible;
+              if (color && style.color_hex) color.value = style.color_hex;
+              if (opacity && style.opacity !== undefined) opacity.value = String(style.opacity);
+              if (lift && style.lift !== undefined) lift.value = String(style.lift);
+            } catch (err) {
+              console.error("get_layer_style failed", err);
+            }
+          }
+
+          syncLayer("world_base", layerWorldBase, layerWorldBaseColor, layerWorldBaseOpacity, layerWorldBaseLift);
+          syncLayer("cities", layerCities, layerCitiesColor, layerCitiesOpacity, layerCitiesLift);
+          syncLayer("air_corridors", layerCorridors, layerCorridorsColor, layerCorridorsOpacity, layerCorridorsLift);
+          syncLayer("regions", layerRegions, layerRegionsColor, layerRegionsOpacity, layerRegionsLift);
+          syncLayer("uploaded_points", layerUploadedPoints, layerUploadedPointsColor, layerUploadedPointsOpacity, layerUploadedPointsLift);
+          syncLayer("uploaded_corridors", layerUploadedCorridors, layerUploadedCorridorsColor, layerUploadedCorridorsOpacity, layerUploadedCorridorsLift);
+          syncLayer("uploaded_regions", layerUploadedRegions, layerUploadedRegionsColor, layerUploadedRegionsOpacity, layerUploadedRegionsLift);
+
+          if (wasm.get_city_marker_size) {
+            try {
+              const size = wasm.get_city_marker_size();
+              citySize.value = String(size);
+              citySizeValue.textContent = String(size);
+            } catch (err) { console.error("get_city_marker_size failed", err); }
+          }
+          if (wasm.get_line_width_px) {
+            try {
+              const width = wasm.get_line_width_px();
+              lineWidth.value = String(width);
+              lineWidthValue.textContent = String(width);
+            } catch (err) { console.error("get_line_width_px failed", err); }
+          }
+        }
 
         function setTab(which) {
           const isGeneral = which === "general";
@@ -731,18 +773,7 @@
         tabSettingsBtn.addEventListener("click", () => setTab("settings"));
 
         function applyUploadedSummary(summary, labelName) {
-          const uploadedId = "__uploaded__";
           const displayName = labelName || summary?.name || "uploaded";
-
-          // Add/update an Uploaded option in the dataset dropdown.
-          let opt = Array.from(dataset.options).find((o) => o.value === uploadedId);
-          if (!opt) {
-            opt = document.createElement("option");
-            opt.value = uploadedId;
-            dataset.appendChild(opt);
-          }
-          opt.textContent = `uploaded (${displayName})`;
-          dataset.value = uploadedId;
 
           setUploadedInfo({
             name: displayName,
@@ -754,11 +785,17 @@
           layerUploadedPointsLabel.textContent = `Uploaded points (${displayName})`;
           layerUploadedCorridorsLabel.textContent = `Uploaded lines (${displayName})`;
           layerUploadedRegionsLabel.textContent = `Uploaded polygons (${displayName})`;
-          layerUploadedPoints.checked = (summary?.points ?? 0) > 0;
-          layerUploadedCorridors.checked = (summary?.lines ?? 0) > 0;
-          layerUploadedRegions.checked = (summary?.polygons ?? 0) > 0;
+          const hasPoints = (summary?.points ?? 0) > 0;
+          const hasLines = (summary?.lines ?? 0) > 0;
+          const hasPolys = (summary?.polygons ?? 0) > 0;
 
-          try { wasm.set_dataset(uploadedId); } catch (err) { /* ignore */ }
+          layerUploadedPoints.checked = hasPoints;
+          layerUploadedCorridors.checked = hasLines;
+          layerUploadedRegions.checked = hasPolys;
+
+          try { wasm.set_layer_visible("uploaded_points", hasPoints); } catch (err) { /* ignore */ }
+          try { wasm.set_layer_visible("uploaded_corridors", hasLines); } catch (err) { /* ignore */ }
+          try { wasm.set_layer_visible("uploaded_regions", hasPolys); } catch (err) { /* ignore */ }
         }
 
         function clearUploadedUi() {
@@ -769,19 +806,27 @@
           layerUploadedPoints.checked = false;
           layerUploadedCorridors.checked = false;
           layerUploadedRegions.checked = false;
+          try { wasm.set_layer_visible("uploaded_points", false); } catch (err) { /* ignore */ }
+          try { wasm.set_layer_visible("uploaded_corridors", false); } catch (err) { /* ignore */ }
+          try { wasm.set_layer_visible("uploaded_regions", false); } catch (err) { /* ignore */ }
         }
 
         async function renderCatalog() {
           if (!catalogList || !catalogEmpty) return;
 
           let entries = [];
+          let builtins = [];
           try {
             entries = wasm.catalog_list?.() ?? [];
           } catch (err) {
             console.error("catalog_list failed", err);
-            catalogList.innerHTML = "<div style=\"color:#fca5a5; font-size:12px;\">Catalog unavailable.</div>";
-            catalogEmpty.style.display = "none";
-            return;
+            entries = [];
+          }
+
+          try {
+            builtins = wasm.get_builtin_layers?.() ?? [];
+          } catch (err) {
+            builtins = [];
           }
 
           let currentCatalogId = "";
@@ -793,17 +838,32 @@
           }
 
           catalogList.innerHTML = "";
-          const hasAny = Array.isArray(entries) && entries.length > 0;
+          if (!Array.isArray(entries)) entries = [];
+          if (!Array.isArray(builtins)) builtins = [];
+          const allEntries = [...builtins, ...entries];
+          const hasAny = allEntries.length > 0;
           catalogEmpty.style.display = hasAny ? "none" : "block";
           if (!hasAny) return;
 
-          for (const e of entries) {
+          for (const e of allEntries) {
             const id = String(e?.id ?? "");
             const name = String(e?.name ?? id);
             const pts = Number(e?.points ?? 0);
             const lines = Number(e?.lines ?? 0);
             const polys = Number(e?.polygons ?? 0);
-            const loaded = id && currentCatalogId && id === currentCatalogId;
+            const isBuiltin = !!e?.builtin;
+            let loaded = false;
+            if (isBuiltin) {
+              try {
+                const style = wasm.get_layer_style?.(id);
+                loaded = !!style?.visible;
+              } catch (err) {
+                loaded = false;
+              }
+            } else {
+              loaded = id && currentCatalogId && id === currentCatalogId;
+            }
+            const geomSummary = formatGeometrySummary(pts, lines, polys);
 
             const row = document.createElement("div");
             row.className = "section";
@@ -813,10 +873,10 @@
                 <div style="font-weight:700;">${name}</div>
                 ${loaded ? '<div style="font-size:11px; color:#86efac; font-weight:700;">Loaded</div>' : ''}
               </div>
-              <div style="font-size:12px; color:#94a3b8; margin-top:6px;">Points: ${pts} • Lines: ${lines} • Polygons: ${polys}</div>
+              <div style="font-size:12px; color:#94a3b8; margin-top:6px;">${geomSummary}</div>
               <div style="display:flex; gap:8px; margin-top:10px;">
                 <button type="button" data-action="toggle">${loaded ? "Remove from scene" : "Add to scene"}</button>
-                <button type="button" data-action="delete" style="border-color:#7f1d1d;">Delete</button>
+                ${isBuiltin ? '' : '<button type="button" data-action="delete" style="border-color:#7f1d1d;">Delete</button>'}
               </div>
             `;
 
@@ -825,14 +885,21 @@
 
             btnToggle?.addEventListener("click", async () => {
               try {
-                if (loaded) {
-                  wasm.clear_uploaded?.();
-                  clearUploadedUi();
+                if (isBuiltin) {
+                  const nextVisible = !loaded;
+                  wasm.set_layer_visible?.(id, nextVisible);
+                  syncSymbologyControls();
+                  renderCatalog();
                 } else {
-                  const summary = await wasm.catalog_load(id);
-                  applyUploadedSummary(summary, name);
+                  if (loaded) {
+                    wasm.clear_uploaded?.();
+                    clearUploadedUi();
+                  } else {
+                    const summary = await wasm.catalog_load(id);
+                    applyUploadedSummary(summary, name);
+                  }
+                  renderCatalog();
                 }
-                renderCatalog();
               } catch (err) {
                 console.error("catalog toggle failed", err);
                 setStatus("Catalog load failed (see console)");
@@ -921,6 +988,9 @@
         let downX = 0;
         let downY = 0;
         let downButton = 0;
+        let pendingDx = 0;
+        let pendingDy = 0;
+        let dragRaf = 0;
 
         function onPointerDown(e) {
           const canvas = activeCanvas();
@@ -963,15 +1033,27 @@
           lastX = e.clientX;
           lastY = e.clientY;
 
-          try {
-            if (dragMode === "pan") {
-              wasm.camera_pan(dx, dy);
-            } else {
-              wasm.camera_orbit(dx, dy);
-            }
-            updateCompass();
-          } catch (err) {
-            console.error("camera input failed", err);
+          pendingDx += dx;
+          pendingDy += dy;
+
+          if (!dragRaf) {
+            dragRaf = window.requestAnimationFrame(() => {
+              dragRaf = 0;
+              const px = pendingDx;
+              const py = pendingDy;
+              pendingDx = 0;
+              pendingDy = 0;
+              try {
+                if (dragMode === "pan") {
+                  wasm.camera_pan(px, py);
+                } else {
+                  wasm.camera_orbit(px, py);
+                }
+                updateCompass();
+              } catch (err) {
+                console.error("camera input failed", err);
+              }
+            });
           }
         }
 
@@ -1002,7 +1084,7 @@
         function onWheel(e) {
           e.preventDefault();
           try {
-            wasm.camera_zoom(e.deltaY);
+            wasm.camera_zoom(-e.deltaY);
             updateCompass();
           } catch (err) {
             console.error("camera_zoom failed", err);
@@ -1062,18 +1144,6 @@
         });
         mapHelp?.addEventListener("click", () => {
           mapHelpText?.classList.toggle("hidden");
-        });
-
-        dataset.addEventListener("change", (e) => {
-          const value = e.target.value;
-          if (!value) return;
-          wasm.set_dataset(value);
-          setStatus(`Dataset: ${value}`);
-
-          // If this is a known built-in dataset, enable its layer checkbox.
-          if (value === "cities") layerCities.checked = true;
-          if (value === "air_corridors") layerCorridors.checked = true;
-          if (value === "regions") layerRegions.checked = true;
         });
 
         fileGeoJson.addEventListener("change", async () => {
@@ -1160,17 +1230,6 @@
 
             // Refresh catalog (upload is persisted in AVC form when it fits local storage).
             renderCatalog();
-
-            // Add/update an Uploaded option in the dataset dropdown.
-            const uploadedId = "__uploaded__";
-            let opt = Array.from(dataset.options).find((o) => o.value === uploadedId);
-            if (!opt) {
-              opt = document.createElement("option");
-              opt.value = uploadedId;
-              dataset.appendChild(opt);
-            }
-            opt.textContent = `uploaded (${file.name})`;
-            dataset.value = uploadedId;
 
             setUploadedInfo({
               name: summary?.name ?? file.name,

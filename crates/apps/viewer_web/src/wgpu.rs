@@ -34,6 +34,8 @@ mod imp {
         pub cities_vertex_count: u32,
         pub corridors_vertex_buffer: ::wgpu::Buffer,
         pub corridors_vertex_count: u32,
+        pub base_regions_vertex_buffer: ::wgpu::Buffer,
+        pub base_regions_vertex_count: u32,
         pub regions_vertex_buffer: ::wgpu::Buffer,
         pub regions_vertex_count: u32,
     }
@@ -1117,6 +1119,17 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
             });
 
+        let base_regions_vertex_buffer =
+            device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
+                label: Some("atlas-base-regions-vertices"),
+                contents: bytemuck::bytes_of(&OverlayVertex {
+                    position: [0.0, 0.0, 0.0],
+                    lift: 0.0,
+                    color: [1.0, 1.0, 1.0, 1.0],
+                }),
+                usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            });
+
         // Initialize uniforms so the first render doesn't read uninitialized memory.
         let globals = Globals {
             view_proj: [[0.0; 4]; 4],
@@ -1153,6 +1166,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             cities_vertex_count: 0,
             corridors_vertex_buffer,
             corridors_vertex_count: 0,
+            base_regions_vertex_buffer,
+            base_regions_vertex_count: 0,
             regions_vertex_buffer,
             regions_vertex_count: 0,
         })
@@ -1206,6 +1221,22 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         ctx.regions_vertex_count = points.len() as u32;
     }
 
+    pub fn set_base_regions_points(ctx: &mut WgpuContext, points: &[OverlayVertex]) {
+        if points.is_empty() {
+            ctx.base_regions_vertex_count = 0;
+            return;
+        }
+
+        ctx.base_regions_vertex_buffer =
+            ctx.device
+                .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
+                    label: Some("atlas-base-regions-vertices"),
+                    contents: bytemuck::cast_slice(points),
+                    usage: ::wgpu::BufferUsages::VERTEX,
+                });
+        ctx.base_regions_vertex_count = points.len() as u32;
+    }
+
     pub fn resize_wgpu(ctx: &mut WgpuContext, width: u32, height: u32) {
         ctx.config.width = width.max(1);
         ctx.config.height = height.max(1);
@@ -1213,11 +1244,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         ctx.depth_view = create_depth_view(&ctx.device, &ctx.config);
     }
 
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn render_mesh(
         ctx: &WgpuContext,
         view_proj: [[f32; 4]; 4],
         light_dir: [f32; 3],
         show_graticule: bool,
+        show_base_regions: bool,
         show_cities: bool,
         show_corridors: bool,
         show_regions: bool,
@@ -1349,7 +1385,43 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             rpass.draw(0..ctx.graticule_vertex_count, 0..1);
         }
 
-        // Pass 4 (optional): region polygons (depth-tested, alpha blended).
+        // Pass 4 (optional): base world polygons (depth-tested, alpha blended).
+        if show_base_regions && ctx.base_regions_vertex_count > 0 {
+            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
+                label: Some("atlas-base-regions-pass"),
+                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: ::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(::wgpu::RenderPassDepthStencilAttachment {
+                    view: &ctx.depth_view,
+                    depth_ops: Some(::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: Some(::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    }),
+                }),
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            rpass.set_pipeline(&ctx.regions_pipeline);
+            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            rpass.set_stencil_reference(1);
+            rpass.set_vertex_buffer(0, ctx.base_regions_vertex_buffer.slice(..));
+            rpass.draw(0..ctx.base_regions_vertex_count, 0..1);
+        }
+
+        // Pass 5 (optional): region polygons (depth-tested, alpha blended).
         if show_regions && ctx.regions_vertex_count > 0 {
             let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
                 label: Some("atlas-regions-pass"),
@@ -1385,7 +1457,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             rpass.draw(0..ctx.regions_vertex_count, 0..1);
         }
 
-        // Pass 5 (optional): air corridors (depth-tested, alpha blended).
+        // Pass 6 (optional): air corridors (depth-tested, alpha blended).
         if show_corridors && ctx.corridors_vertex_count > 0 {
             let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
                 label: Some("atlas-corridors-pass"),
@@ -1421,7 +1493,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             rpass.draw(0..ctx.corridors_vertex_count, 0..1);
         }
 
-        // Pass 6 (optional): city markers (depth-tested triangles).
+        // Pass 7 (optional): city markers (depth-tested triangles).
         if show_cities && ctx.cities_vertex_count > 0 {
             let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
                 label: Some("atlas-cities-pass"),
@@ -1513,11 +1585,15 @@ mod imp {
 
     pub fn set_regions_points(_ctx: &mut WgpuContext, _points: &[OverlayVertex]) {}
 
+    pub fn set_base_regions_points(_ctx: &mut WgpuContext, _points: &[OverlayVertex]) {}
+
+    #[allow(clippy::too_many_arguments)]
     pub fn render_mesh(
         _ctx: &WgpuContext,
         _view_proj: [[f32; 4]; 4],
         _light_dir: [f32; 3],
         _show_graticule: bool,
+        _show_base_regions: bool,
         _show_cities: bool,
         _show_corridors: bool,
         _show_regions: bool,
@@ -1530,5 +1606,6 @@ mod imp {
 
 pub use imp::{
     CityVertex, CorridorVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh,
-    resize_wgpu, set_cities_points, set_corridors_points, set_regions_points,
+    resize_wgpu, set_base_regions_points, set_cities_points, set_corridors_points,
+    set_regions_points,
 };

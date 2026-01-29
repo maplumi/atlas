@@ -1,0 +1,7 @@
+target/
+.git/
+**/target/
+**/dist/
+node_modules/
+.data/
+logs/

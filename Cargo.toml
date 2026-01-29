@@ -12,8 +12,21 @@ members = [
     "crates/compute",
     "crates/apps/viewer_web",
     "crates/apps/viewer_native",
+    "crates/apps/terrain_server",
     "crates/tools"
 ]
 
 [profile.release]
 debug = true
+
+# Pin once_cell to a version compatible with Rust 1.93+ stricter UB checks
+[workspace.dependencies]
+once_cell = "1.21.3"
+
+# Force wasm-bindgen ecosystem to use compatible once_cell
+[patch.crates-io]
+once_cell = { git = "https://github.com/matklad/once_cell", branch = "master" }
+wasm-bindgen = { git = "https://github.com/rustwasm/wasm-bindgen", branch = "main" }
+wasm-bindgen-futures = { git = "https://github.com/rustwasm/wasm-bindgen", branch = "main" }
+js-sys = { git = "https://github.com/rustwasm/wasm-bindgen", branch = "main" }
+web-sys = { git = "https://github.com/rustwasm/wasm-bindgen", branch = "main" }
