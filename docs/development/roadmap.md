@@ -88,6 +88,7 @@ Status legend:
 - [x] 2D pan/zoom + 3D orbit controls (deterministic/no inertia)
 - [ ] Time slider (drives `Time` window)
 - [ ] Attribute filter UI (drives core query filters)
+- [x] Catalog: persist uploads in-browser + browse/add/remove via left-panel tab
 - [ ] Analysis panel (calls `compute` APIs)
 - [ ] Debug/metrics overlay
 

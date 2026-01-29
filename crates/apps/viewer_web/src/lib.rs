@@ -3,9 +3,11 @@ use gloo_net::http::Request;
 use std::cell::RefCell;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 
+use catalog::{CatalogEntry, CatalogStore};
 use formats::SceneManifest;
 use foundation::math::{WGS84_A, WGS84_B, ecef_to_geodetic};
 use layers::symbology::LayerStyle;
@@ -108,6 +110,7 @@ struct ViewerState {
     regions_positions: Option<Vec<[f32; 3]>>,
 
     uploaded_name: Option<String>,
+    uploaded_catalog_id: Option<String>,
     uploaded_centers: Option<Vec<[f32; 3]>>,
     uploaded_corridors_positions: Option<Vec<[f32; 3]>>,
     uploaded_regions_positions: Option<Vec<[f32; 3]>>,
@@ -163,6 +166,7 @@ thread_local! {
         regions_positions: None,
 
         uploaded_name: None,
+        uploaded_catalog_id: None,
         uploaded_centers: None,
         uploaded_corridors_positions: None,
         uploaded_regions_positions: None,
@@ -183,6 +187,187 @@ thread_local! {
         camera: CameraState::default(),
         camera_2d: Camera2DState::default(),
     });
+}
+
+#[derive(Debug)]
+enum ViewerCatalogStore {
+    Local(catalog::LocalStorageCatalogStore),
+    Memory(catalog::InMemoryCatalogStore),
+}
+
+impl ViewerCatalogStore {
+    fn new() -> Self {
+        match catalog::LocalStorageCatalogStore::new("atlas.catalog.v1") {
+            Ok(s) => ViewerCatalogStore::Local(s),
+            Err(_) => ViewerCatalogStore::Memory(catalog::InMemoryCatalogStore::new()),
+        }
+    }
+
+    fn upsert_avc_bytes(
+        &mut self,
+        entry: CatalogEntry,
+        avc_bytes: &[u8],
+    ) -> Result<(), catalog::CatalogError> {
+        match self {
+            ViewerCatalogStore::Local(s) => s.upsert_avc_bytes(entry, avc_bytes),
+            ViewerCatalogStore::Memory(s) => s.upsert_avc_bytes(entry, avc_bytes),
+        }
+    }
+
+    fn get_avc_bytes(&self, id: &str) -> Result<Vec<u8>, catalog::CatalogError> {
+        match self {
+            ViewerCatalogStore::Local(s) => {
+                s.get_avc_bytes(id)?.ok_or(catalog::CatalogError::NotFound)
+            }
+            ViewerCatalogStore::Memory(s) => {
+                s.get_avc_bytes(id)?.ok_or(catalog::CatalogError::NotFound)
+            }
+        }
+    }
+}
+
+impl CatalogStore for ViewerCatalogStore {
+    fn list(&self) -> Result<Vec<CatalogEntry>, catalog::CatalogError> {
+        match self {
+            ViewerCatalogStore::Local(s) => s.list(),
+            ViewerCatalogStore::Memory(s) => s.list(),
+        }
+    }
+
+    fn get(&self, id: &str) -> Result<Option<CatalogEntry>, catalog::CatalogError> {
+        match self {
+            ViewerCatalogStore::Local(s) => s.get(id),
+            ViewerCatalogStore::Memory(s) => s.get(id),
+        }
+    }
+
+    fn upsert(&mut self, entry: CatalogEntry) -> Result<(), catalog::CatalogError> {
+        match self {
+            ViewerCatalogStore::Local(s) => s.upsert(entry),
+            ViewerCatalogStore::Memory(s) => s.upsert(entry),
+        }
+    }
+
+    fn delete(&mut self, id: &str) -> Result<bool, catalog::CatalogError> {
+        match self {
+            ViewerCatalogStore::Local(s) => s.delete(id),
+            ViewerCatalogStore::Memory(s) => s.delete(id),
+        }
+    }
+}
+
+thread_local! {
+    static CATALOG: RefCell<ViewerCatalogStore> = RefCell::new(ViewerCatalogStore::new());
+}
+
+// IndexedDB (best-effort) storage for AVC bytes.
+// This avoids LocalStorage quota issues and avoids base64 megastring allocations.
+#[wasm_bindgen(inline_js = "
+let __atlas_idb_promise = null;
+
+function __atlas_open_db() {
+    if (__atlas_idb_promise) return __atlas_idb_promise;
+
+    __atlas_idb_promise = new Promise((resolve, reject) => {
+        try {
+            const req = indexedDB.open('atlas', 1);
+            req.onupgradeneeded = () => {
+                const db = req.result;
+                if (!db.objectStoreNames.contains('avc')) {
+                    db.createObjectStore('avc');
+                }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error || new Error('IndexedDB open failed'));
+        } catch (e) {
+            reject(e);
+        }
+    });
+
+    return __atlas_idb_promise;
+}
+
+export async function atlas_idb_put_avc(id, bytes) {
+    const db = await __atlas_open_db();
+    return await new Promise((resolve, reject) => {
+        try {
+            const tx = db.transaction(['avc'], 'readwrite');
+            const store = tx.objectStore('avc');
+            // Store as Uint8Array (structured clone supports typed arrays).
+            store.put(bytes, id);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => reject(tx.error || new Error('IndexedDB put failed'));
+            tx.onabort = () => reject(tx.error || new Error('IndexedDB put aborted'));
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+export async function atlas_idb_get_avc(id) {
+    const db = await __atlas_open_db();
+    return await new Promise((resolve, reject) => {
+        try {
+            const tx = db.transaction(['avc'], 'readonly');
+            const store = tx.objectStore('avc');
+            const req = store.get(id);
+            req.onsuccess = () => resolve(req.result ?? null);
+            req.onerror = () => reject(req.error || new Error('IndexedDB get failed'));
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+
+export async function atlas_idb_delete_avc(id) {
+    const db = await __atlas_open_db();
+    return await new Promise((resolve, reject) => {
+        try {
+            const tx = db.transaction(['avc'], 'readwrite');
+            const store = tx.objectStore('avc');
+            store.delete(id);
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = () => reject(tx.error || new Error('IndexedDB delete failed'));
+            tx.onabort = () => reject(tx.error || new Error('IndexedDB delete aborted'));
+        } catch (e) {
+            reject(e);
+        }
+    });
+}
+")]
+extern "C" {
+    #[wasm_bindgen(catch)]
+    fn atlas_idb_put_avc(id: &str, bytes: &[u8]) -> Result<js_sys::Promise, JsValue>;
+
+    #[wasm_bindgen(catch)]
+    fn atlas_idb_get_avc(id: &str) -> Result<js_sys::Promise, JsValue>;
+
+    #[wasm_bindgen(catch)]
+    fn atlas_idb_delete_avc(id: &str) -> Result<js_sys::Promise, JsValue>;
+}
+
+async fn idb_put_avc_bytes(id: &str, bytes: &[u8]) -> Result<(), JsValue> {
+    let promise = atlas_idb_put_avc(id, bytes)?;
+    JsFuture::from(promise).await?;
+    Ok(())
+}
+
+async fn idb_get_avc_bytes(id: &str) -> Result<Option<Vec<u8>>, JsValue> {
+    let promise = atlas_idb_get_avc(id)?;
+    let v = JsFuture::from(promise).await?;
+    if v.is_null() || v.is_undefined() {
+        return Ok(None);
+    }
+    let arr = js_sys::Uint8Array::new(&v);
+    let mut out = vec![0u8; arr.length() as usize];
+    arr.copy_to(&mut out);
+    Ok(Some(out))
+}
+
+async fn idb_delete_avc(id: &str) -> Result<(), JsValue> {
+    let promise = atlas_idb_delete_avc(id)?;
+    JsFuture::from(promise).await?;
+    Ok(())
 }
 
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
@@ -735,7 +920,13 @@ fn build_corridor_vertices(
     out
 }
 
-fn rebuild_overlays_and_upload() {
+fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
+    // Budget guardrails: the web viewer will trap on extremely large GPU buffers.
+    // Keep these conservative; we can revisit once we stream + chunk uploads.
+    const MAX_UPLOADED_POINTS: usize = 100_000;
+    const MAX_UPLOADED_LINE_SEGMENTS: usize = 150_000;
+    const MAX_UPLOADED_POLY_VERTS: usize = 600_000;
+
     STATE.with(|state| {
         let mut s = state.borrow_mut();
 
@@ -775,6 +966,31 @@ fn rebuild_overlays_and_upload() {
         // Uploaded
         if let Some(w) = s.uploaded_world.as_ref() {
             let snap = layer.extract(w);
+
+            let uploaded_points = snap.points.len();
+            let uploaded_line_segments: usize = snap
+                .lines
+                .iter()
+                .map(|line| line.len().saturating_sub(1))
+                .sum();
+            let uploaded_poly_verts = snap.area_triangles.len();
+
+            if uploaded_points > MAX_UPLOADED_POINTS {
+                return Err(JsValue::from_str(
+                    "Upload too complex for the web viewer (too many points).",
+                ));
+            }
+            if uploaded_line_segments > MAX_UPLOADED_LINE_SEGMENTS {
+                return Err(JsValue::from_str(
+                    "Upload too complex for the web viewer (too many line segments).",
+                ));
+            }
+            if uploaded_poly_verts > MAX_UPLOADED_POLY_VERTS {
+                return Err(JsValue::from_str(
+                    "Upload too complex for the web viewer (too many polygon triangles).",
+                ));
+            }
+
             s.uploaded_centers = Some(
                 snap.points
                     .into_iter()
@@ -782,7 +998,7 @@ fn rebuild_overlays_and_upload() {
                     .collect::<Vec<_>>(),
             );
             s.uploaded_corridors_positions = Some({
-                let mut out: Vec<[f32; 3]> = Vec::new();
+                let mut out: Vec<[f32; 3]> = Vec::with_capacity(uploaded_line_segments * 2);
                 for line in snap.lines {
                     for seg in line.windows(2) {
                         out.push(ecef_vec3_to_viewer_f32(seg[0]));
@@ -924,7 +1140,9 @@ fn rebuild_overlays_and_upload() {
             s.pending_corridors = Some(lines);
             s.pending_regions = Some(polys);
         }
-    });
+
+        Ok(())
+    })
 }
 
 #[wasm_bindgen(start)]
@@ -1200,7 +1418,7 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
                 s.cities_world = Some(world);
                 s.cities_style.visible = true;
             });
-            rebuild_overlays_and_upload();
+            let _ = rebuild_overlays_and_upload();
             let _ = render_scene();
         });
     }
@@ -1225,7 +1443,7 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
                 s.corridors_world = Some(world);
                 s.corridors_style.visible = true;
             });
-            rebuild_overlays_and_upload();
+            let _ = rebuild_overlays_and_upload();
             let _ = render_scene();
         });
     }
@@ -1250,7 +1468,7 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
                 s.regions_world = Some(world);
                 s.regions_style.visible = true;
             });
-            rebuild_overlays_and_upload();
+            let _ = rebuild_overlays_and_upload();
             let _ = render_scene();
         });
     }
@@ -1262,7 +1480,7 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
             s.uploaded_corridors_style.visible = s.uploaded_count_lines > 0;
             s.uploaded_regions_style.visible = s.uploaded_count_polys > 0;
         });
-        rebuild_overlays_and_upload();
+        let _ = rebuild_overlays_and_upload();
     }
 
     // Render immediately so selection changes are responsive.
@@ -1280,7 +1498,7 @@ pub fn set_city_marker_size(size: f64) -> Result<(), JsValue> {
         s.city_marker_size = size;
     });
 
-    rebuild_overlays_and_upload();
+    let _ = rebuild_overlays_and_upload();
     render_scene()
 }
 
@@ -1290,7 +1508,7 @@ pub fn set_line_width_px(width_px: f64) -> Result<(), JsValue> {
     STATE.with(|state| {
         state.borrow_mut().line_width_px = width_px;
     });
-    rebuild_overlays_and_upload();
+    let _ = rebuild_overlays_and_upload();
     render_scene()
 }
 
@@ -1332,7 +1550,7 @@ pub fn set_layer_visible(id: &str, visible: bool) -> Result<(), JsValue> {
             st.visible = visible;
         }
     });
-    rebuild_overlays_and_upload();
+    let _ = rebuild_overlays_and_upload();
     render_scene()
 }
 
@@ -1359,7 +1577,7 @@ pub fn set_layer_color_hex(id: &str, hex: &str) -> Result<(), JsValue> {
             st.color[2] = rgb[2];
         }
     });
-    rebuild_overlays_and_upload();
+    let _ = rebuild_overlays_and_upload();
     render_scene()
 }
 
@@ -1372,7 +1590,7 @@ pub fn set_layer_opacity(id: &str, opacity: f64) -> Result<(), JsValue> {
             st.color[3] = a;
         }
     });
-    rebuild_overlays_and_upload();
+    let _ = rebuild_overlays_and_upload();
     render_scene()
 }
 
@@ -1385,7 +1603,7 @@ pub fn set_layer_lift(id: &str, lift: f64) -> Result<(), JsValue> {
             st.lift = lift;
         }
     });
-    rebuild_overlays_and_upload();
+    let _ = rebuild_overlays_and_upload();
     render_scene()
 }
 
@@ -1395,10 +1613,19 @@ pub fn get_uploaded_summary() -> Result<JsValue, JsValue> {
     STATE.with(|state| {
         let s = state.borrow();
         let name = s.uploaded_name.clone().unwrap_or_else(|| "".to_string());
+        let catalog_id = s
+            .uploaded_catalog_id
+            .clone()
+            .unwrap_or_else(|| "".to_string());
         let _ = js_sys::Reflect::set(
             &summary,
             &JsValue::from_str("name"),
             &JsValue::from_str(&name),
+        );
+        let _ = js_sys::Reflect::set(
+            &summary,
+            &JsValue::from_str("catalog_id"),
+            &JsValue::from_str(&catalog_id),
         );
         let _ = js_sys::Reflect::set(
             &summary,
@@ -1417,6 +1644,129 @@ pub fn get_uploaded_summary() -> Result<JsValue, JsValue> {
         );
     });
     Ok(summary.into())
+}
+
+#[wasm_bindgen]
+pub fn clear_uploaded() -> Result<(), JsValue> {
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.uploaded_name = None;
+        s.uploaded_catalog_id = None;
+        s.uploaded_world = None;
+        s.uploaded_centers = None;
+        s.uploaded_corridors_positions = None;
+        s.uploaded_regions_positions = None;
+        s.uploaded_count_points = 0;
+        s.uploaded_count_lines = 0;
+        s.uploaded_count_polys = 0;
+        s.uploaded_points_style.visible = false;
+        s.uploaded_corridors_style.visible = false;
+        s.uploaded_regions_style.visible = false;
+    });
+    let _ = rebuild_overlays_and_upload();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn catalog_list() -> Result<JsValue, JsValue> {
+    let arr = js_sys::Array::new();
+    let entries = CATALOG
+        .with(|cat| cat.borrow().list())
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    for e in entries {
+        let o = js_sys::Object::new();
+        let _ = js_sys::Reflect::set(&o, &JsValue::from_str("id"), &JsValue::from_str(&e.id));
+        let _ = js_sys::Reflect::set(&o, &JsValue::from_str("name"), &JsValue::from_str(&e.name));
+        let _ = js_sys::Reflect::set(
+            &o,
+            &JsValue::from_str("points"),
+            &JsValue::from_f64(e.count_points as f64),
+        );
+        let _ = js_sys::Reflect::set(
+            &o,
+            &JsValue::from_str("lines"),
+            &JsValue::from_f64(e.count_lines as f64),
+        );
+        let _ = js_sys::Reflect::set(
+            &o,
+            &JsValue::from_str("polygons"),
+            &JsValue::from_f64(e.count_polys as f64),
+        );
+        let _ = js_sys::Reflect::set(
+            &o,
+            &JsValue::from_str("created_at_ms"),
+            &JsValue::from_f64(e.created_at_ms as f64),
+        );
+        arr.push(&o);
+    }
+
+    Ok(arr.into())
+}
+
+#[wasm_bindgen]
+pub async fn catalog_delete(id: String) -> Result<bool, JsValue> {
+    // Best-effort: delete bytes from IndexedDB first.
+    let _ = idb_delete_avc(&id).await;
+
+    CATALOG
+        .with(|cat| cat.borrow_mut().delete(&id))
+        .map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+#[wasm_bindgen]
+pub async fn catalog_load(id: String) -> Result<JsValue, JsValue> {
+    let entry = CATALOG
+        .with(|cat| cat.borrow().get(&id))
+        .map_err(|e| JsValue::from_str(&e.to_string()))?
+        .ok_or_else(|| JsValue::from_str("catalog entry not found"))?;
+
+    // Prefer IndexedDB bytes.
+    let bytes = match idb_get_avc_bytes(&id).await {
+        Ok(Some(b)) => b,
+        _ => CATALOG
+            .with(|cat| cat.borrow().get_avc_bytes(&id))
+            .map_err(|e| JsValue::from_str(&e.to_string()))?,
+    };
+
+    let chunk = formats::VectorChunk::from_avc_bytes(&bytes)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    // Count primitives for UI.
+    let mut count_points = 0usize;
+    let mut count_lines = 0usize;
+    let mut count_polys = 0usize;
+    for f in &chunk.features {
+        match &f.geometry {
+            formats::VectorGeometry::Point(_) => count_points += 1,
+            formats::VectorGeometry::MultiPoint(v) => count_points += v.len(),
+            formats::VectorGeometry::LineString(_) => count_lines += 1,
+            formats::VectorGeometry::MultiLineString(v) => count_lines += v.len(),
+            formats::VectorGeometry::Polygon(_) => count_polys += 1,
+            formats::VectorGeometry::MultiPolygon(v) => count_polys += v.len(),
+        }
+    }
+
+    let world = world_from_vector_chunk(&chunk, None);
+
+    STATE.with(|state| {
+        let mut s = state.borrow_mut();
+        s.uploaded_name = Some(entry.name.clone());
+        s.uploaded_catalog_id = Some(entry.id.clone());
+        s.uploaded_world = Some(world);
+        s.uploaded_count_points = count_points;
+        s.uploaded_count_lines = count_lines;
+        s.uploaded_count_polys = count_polys;
+
+        s.dataset = "__uploaded__".to_string();
+        s.uploaded_points_style.visible = count_points > 0;
+        s.uploaded_corridors_style.visible = count_lines > 0;
+        s.uploaded_regions_style.visible = count_polys > 0;
+    });
+
+    rebuild_overlays_and_upload()?;
+    let _ = render_scene();
+    get_uploaded_summary()
 }
 
 fn world_to_lon_lat_deg(p: [f64; 3]) -> (f64, f64) {
@@ -1573,7 +1923,7 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
             s.selection_line_positions = None;
             s.selection_poly_positions = None;
         });
-        rebuild_overlays_and_upload();
+        let _ = rebuild_overlays_and_upload();
         let _ = render_scene();
         js_sys::Reflect::set(&out, &JsValue::from_str("picked"), &JsValue::FALSE)?;
         return Ok(out.into());
@@ -1763,7 +2113,7 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
             s.selection_line_positions = line;
             s.selection_poly_positions = poly;
         });
-        rebuild_overlays_and_upload();
+        let _ = rebuild_overlays_and_upload();
         js_sys::Reflect::set(&out, &JsValue::from_str("picked"), &JsValue::TRUE)?;
         js_sys::Reflect::set(&out, &JsValue::from_str("kind"), &JsValue::from_str(&kind))?;
 
@@ -1789,7 +2139,7 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
         s.selection_line_positions = None;
         s.selection_poly_positions = None;
     });
-    rebuild_overlays_and_upload();
+    let _ = rebuild_overlays_and_upload();
     let _ = render_scene();
     js_sys::Reflect::set(&out, &JsValue::from_str("picked"), &JsValue::FALSE)?;
     Ok(out.into())
@@ -1850,7 +2200,7 @@ fn cursor_click_2d(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
         }
     });
 
-    rebuild_overlays_and_upload();
+    let _ = rebuild_overlays_and_upload();
     let _ = render_scene();
 
     if let Some((kind, center, _lon_click, _lat_click)) = picked {
@@ -1868,9 +2218,24 @@ fn cursor_click_2d(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
 }
 
 #[wasm_bindgen]
-pub fn load_geojson_file(name: String, geojson_text: String) -> Result<JsValue, JsValue> {
+pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsValue, JsValue> {
+    // Guardrails: large uploads can exceed wasm memory or browser storage limits.
+    // (We currently persist catalog entries via LocalStorage; IndexedDB/DuckDB comes next.)
+    const MAX_GEOJSON_TEXT_BYTES: usize = 8 * 1024 * 1024;
+    // NOTE: catalog persistence is best-effort. We store AVC in chunked LocalStorage keys.
+
+    if geojson_text.len() > MAX_GEOJSON_TEXT_BYTES {
+        return Err(JsValue::from_str(
+            "Upload too large for the web viewer (max 8MiB GeoJSON).",
+        ));
+    }
+
+    web_sys::console::error_1(&JsValue::from_str("upload: parsing GeoJSON"));
+
     let chunk = formats::VectorChunk::from_geojson_str(&geojson_text)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    web_sys::console::error_1(&JsValue::from_str("upload: parsed GeoJSON"));
 
     // Count primitives for UI.
     let mut count_points = 0usize;
@@ -1887,11 +2252,113 @@ pub fn load_geojson_file(name: String, geojson_text: String) -> Result<JsValue, 
         }
     }
 
+    // Store the uploaded data in Atlas' binary format (AVC) via the catalog.
+    // If the payload is too large for the current LocalStorage-based store, we still load it
+    // into the scene but skip persistence (avoids wasm memory traps).
+    web_sys::console::error_1(&JsValue::from_str("upload: encoding AVC"));
+    let avc_bytes = chunk
+        .to_avc_bytes()
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    web_sys::console::error_1(&JsValue::from_str("upload: encoded AVC"));
+    let now_ms = js_sys::Date::now().max(0.0) as u64;
+
+    let catalog_id = catalog::id_for_avc_bytes(&avc_bytes);
+    web_sys::console::error_1(&JsValue::from_str("upload: persisting to catalog"));
+
+    let mut catalog_error: Option<String> = None;
+    let mut created_at_ms = now_ms;
+    let mut catalog_persisted = false;
+
+    // 1) Try IndexedDB for bytes + LocalStorage for metadata.
+    match idb_put_avc_bytes(&catalog_id, &avc_bytes).await {
+        Ok(()) => {
+            let meta_res = CATALOG.with(|cat| {
+                let mut cat = cat.borrow_mut();
+                let existing = cat.get(&catalog_id)?;
+                created_at_ms = existing.as_ref().map(|e| e.created_at_ms).unwrap_or(now_ms);
+                cat.upsert(CatalogEntry {
+                    id: catalog_id.clone(),
+                    name: name.clone(),
+                    avc_base64: String::new(),
+                    count_points,
+                    count_lines,
+                    count_polys,
+                    created_at_ms,
+                })?;
+                Ok::<(), catalog::CatalogError>(())
+            });
+            match meta_res {
+                Ok(()) => {
+                    catalog_persisted = true;
+                }
+                Err(e) => {
+                    catalog_error = Some(e.to_string());
+                    let _ = idb_delete_avc(&catalog_id).await;
+                }
+            }
+        }
+        Err(e) => {
+            catalog_error = Some(format!(
+                "IndexedDB failed: {}",
+                e.as_string().unwrap_or_else(|| format!("{e:?}"))
+            ));
+        }
+    }
+
+    // 2) Fallback: chunked LocalStorage (catalog crate) if IDB path failed.
+    if !catalog_persisted {
+        let persisted = CATALOG.with(|cat| {
+            let mut cat = cat.borrow_mut();
+            let existing = cat.get(&catalog_id)?;
+            created_at_ms = existing.as_ref().map(|e| e.created_at_ms).unwrap_or(now_ms);
+            cat.upsert_avc_bytes(
+                CatalogEntry {
+                    id: catalog_id.clone(),
+                    name: name.clone(),
+                    avc_base64: String::new(),
+                    count_points,
+                    count_lines,
+                    count_polys,
+                    created_at_ms,
+                },
+                &avc_bytes,
+            )?;
+            Ok::<(), catalog::CatalogError>(())
+        });
+        match persisted {
+            Ok(()) => {
+                catalog_persisted = true;
+                catalog_error = None;
+            }
+            Err(e) => {
+                catalog_error = Some(e.to_string());
+            }
+        }
+    }
+
+    if catalog_persisted {
+        web_sys::console::error_1(&JsValue::from_str("upload: persisted to catalog"));
+    } else {
+        web_sys::console::error_1(&JsValue::from_str(&format!(
+            "upload: catalog persist skipped ({})",
+            catalog_error
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string())
+        )));
+    }
+
     let world = world_from_vector_chunk(&chunk, None);
+
+    web_sys::console::error_1(&JsValue::from_str("upload: ingested world"));
 
     STATE.with(|state| {
         let mut s = state.borrow_mut();
         s.uploaded_name = Some(name.clone());
+        s.uploaded_catalog_id = if catalog_persisted {
+            Some(catalog_id.clone())
+        } else {
+            None
+        };
         s.uploaded_world = Some(world);
         s.uploaded_count_points = count_points;
         s.uploaded_count_lines = count_lines;
@@ -1904,7 +2371,9 @@ pub fn load_geojson_file(name: String, geojson_text: String) -> Result<JsValue, 
         s.uploaded_regions_style.visible = s.uploaded_count_polys > 0;
     });
 
-    rebuild_overlays_and_upload();
+    web_sys::console::error_1(&JsValue::from_str("upload: rebuilding overlays"));
+    rebuild_overlays_and_upload()?;
+    web_sys::console::error_1(&JsValue::from_str("upload: rebuilt overlays"));
     let _ = render_scene();
 
     let summary = js_sys::Object::new();
@@ -1913,6 +2382,26 @@ pub fn load_geojson_file(name: String, geojson_text: String) -> Result<JsValue, 
         &JsValue::from_str("name"),
         &JsValue::from_str(&name),
     )?;
+    let _ = js_sys::Reflect::set(
+        &summary,
+        &JsValue::from_str("catalog_id"),
+        &JsValue::from_str(&catalog_id),
+    );
+    let _ = js_sys::Reflect::set(
+        &summary,
+        &JsValue::from_str("catalog_persisted"),
+        &JsValue::from_bool(catalog_persisted),
+    );
+    let _ = js_sys::Reflect::set(
+        &summary,
+        &JsValue::from_str("catalog_error"),
+        &JsValue::from_str(&catalog_error.unwrap_or_default()),
+    );
+    let _ = js_sys::Reflect::set(
+        &summary,
+        &JsValue::from_str("created_at_ms"),
+        &JsValue::from_f64(created_at_ms as f64),
+    );
     // Legacy permissive uploader counters (kept for UI compatibility).
     let _ = js_sys::Reflect::set(
         &summary,
@@ -2014,6 +2503,8 @@ pub fn load_dataset(url: String) {
                 manifest.package_id
             ));
 
+            s.uploaded_catalog_id = None;
+
             s.uploaded_world = Some(world);
             s.uploaded_count_points = count_points;
             s.uploaded_count_lines = count_lines;
@@ -2029,7 +2520,7 @@ pub fn load_dataset(url: String) {
             s.time_end_s = (manifest.chunks.len().max(1) as f64) * 1.5;
         });
 
-        rebuild_overlays_and_upload();
+        let _ = rebuild_overlays_and_upload();
         let _ = render_scene();
     });
 }

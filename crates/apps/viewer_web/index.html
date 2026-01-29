@@ -254,6 +254,7 @@
         <div class="tabs">
           <button id="tab-general-btn" class="tab-btn active" type="button">General</button>
           <button id="tab-layers-btn" class="tab-btn" type="button">Layers</button>
+          <button id="tab-catalog-btn" class="tab-btn" type="button">Catalog</button>
           <button id="tab-settings-btn" class="tab-btn" type="button">Settings</button>
         </div>
 
@@ -430,6 +431,19 @@
           </div>
         </div>
 
+        <div id="tab-catalog" class="tab-page hidden">
+          <div class="section">
+            <h3>Catalog</h3>
+            <div style="font-size:12px; color:#94a3b8; line-height:1.35; margin-bottom:10px;">
+              Uploaded datasets are stored locally (in AVC format) and listed here.
+            </div>
+            <div id="catalog-list" style="display:flex; flex-direction:column; gap:10px;"></div>
+            <div id="catalog-empty" style="font-size:12px; color:#94a3b8; line-height:1.35;">
+              No catalog entries yet. Upload a GeoJSON file in the General tab.
+            </div>
+          </div>
+        </div>
+
         <div id="tab-settings" class="tab-page hidden">
           <div class="section">
             <h3>Lighting</h3>
@@ -567,10 +581,15 @@
       function wireUi(wasm) {
         const tabGeneralBtn = document.getElementById("tab-general-btn");
         const tabLayersBtn = document.getElementById("tab-layers-btn");
+        const tabCatalogBtn = document.getElementById("tab-catalog-btn");
         const tabSettingsBtn = document.getElementById("tab-settings-btn");
         const tabGeneral = document.getElementById("tab-general");
         const tabLayers = document.getElementById("tab-layers");
+        const tabCatalog = document.getElementById("tab-catalog");
         const tabSettings = document.getElementById("tab-settings");
+
+        const catalogList = document.getElementById("catalog-list");
+        const catalogEmpty = document.getElementById("catalog-empty");
 
         const dataset = document.getElementById("dataset");
         const fileGeoJson = document.getElementById("file-geojson");
@@ -635,7 +654,7 @@
         const layerUploadedRegionsOpacity = document.getElementById("layer-uploaded-regions-opacity");
         const layerUploadedRegionsLift = document.getElementById("layer-uploaded-regions-lift");
 
-        function setUploadedInfo({ name, points, lines, polygons, skipped_coords, fixed_swapped, fixed_web_mercator, error }) {
+        function setUploadedInfo({ name, points, lines, polygons, catalog_persisted, catalog_error, skipped_coords, fixed_swapped, fixed_web_mercator, error }) {
           if (error) {
             uploadedInfo.innerHTML = `<div style="color:#fca5a5;">Upload error: ${String(error)}</div>`;
             return;
@@ -649,10 +668,13 @@
           const swapped = Number(fixed_swapped ?? 0);
           const merc = Number(fixed_web_mercator ?? 0);
           const hasDiag = (skipped + swapped + merc) > 0;
+          const persisted = catalog_persisted === undefined ? null : !!catalog_persisted;
+          const catErr = String(catalog_error ?? "").trim();
 
           uploadedInfo.innerHTML = `
             <div><span style="color:#93c5fd;">Uploaded:</span> ${name}</div>
             <div style="color:#94a3b8;">Points: ${points ?? 0} • Lines: ${lines ?? 0} • Polygons: ${polygons ?? 0}</div>
+            ${persisted === null ? "" : (persisted ? `<div style="color:#86efac; font-size:12px;">Saved to Catalog.</div>` : `<div style="color:#fbbf24; font-size:12px;">Not saved to Catalog.</div>${catErr ? `<div style=\"color:#94a3b8; font-size:12px;\">${catErr}</div>` : ``}`) }
             ${hasDiag ? `<div style="color:#94a3b8;">Coords: fixed swap ${swapped} • fixed mercator ${merc} • skipped ${skipped}</div>` : ""}
           `;
         }
@@ -685,20 +707,158 @@
         function setTab(which) {
           const isGeneral = which === "general";
           const isLayers = which === "layers";
+          const isCatalog = which === "catalog";
           const isSettings = which === "settings";
 
           tabGeneralBtn.classList.toggle("active", isGeneral);
           tabLayersBtn.classList.toggle("active", isLayers);
+          tabCatalogBtn.classList.toggle("active", isCatalog);
           tabSettingsBtn.classList.toggle("active", isSettings);
 
           tabGeneral.classList.toggle("hidden", !isGeneral);
           tabLayers.classList.toggle("hidden", !isLayers);
+          tabCatalog.classList.toggle("hidden", !isCatalog);
           tabSettings.classList.toggle("hidden", !isSettings);
         }
 
         tabGeneralBtn.addEventListener("click", () => setTab("general"));
         tabLayersBtn.addEventListener("click", () => setTab("layers"));
+        tabCatalogBtn.addEventListener("click", () => {
+          setTab("catalog");
+          // Always refresh on open.
+          renderCatalog();
+        });
         tabSettingsBtn.addEventListener("click", () => setTab("settings"));
+
+        function applyUploadedSummary(summary, labelName) {
+          const uploadedId = "__uploaded__";
+          const displayName = labelName || summary?.name || "uploaded";
+
+          // Add/update an Uploaded option in the dataset dropdown.
+          let opt = Array.from(dataset.options).find((o) => o.value === uploadedId);
+          if (!opt) {
+            opt = document.createElement("option");
+            opt.value = uploadedId;
+            dataset.appendChild(opt);
+          }
+          opt.textContent = `uploaded (${displayName})`;
+          dataset.value = uploadedId;
+
+          setUploadedInfo({
+            name: displayName,
+            points: summary?.points ?? 0,
+            lines: summary?.lines ?? 0,
+            polygons: summary?.polygons ?? 0,
+          });
+
+          layerUploadedPointsLabel.textContent = `Uploaded points (${displayName})`;
+          layerUploadedCorridorsLabel.textContent = `Uploaded lines (${displayName})`;
+          layerUploadedRegionsLabel.textContent = `Uploaded polygons (${displayName})`;
+          layerUploadedPoints.checked = (summary?.points ?? 0) > 0;
+          layerUploadedCorridors.checked = (summary?.lines ?? 0) > 0;
+          layerUploadedRegions.checked = (summary?.polygons ?? 0) > 0;
+
+          try { wasm.set_dataset(uploadedId); } catch (err) { /* ignore */ }
+        }
+
+        function clearUploadedUi() {
+          setUploadedInfo({ name: "", points: 0, lines: 0, polygons: 0 });
+          layerUploadedPointsLabel.textContent = "Uploaded points";
+          layerUploadedCorridorsLabel.textContent = "Uploaded lines";
+          layerUploadedRegionsLabel.textContent = "Uploaded polygons";
+          layerUploadedPoints.checked = false;
+          layerUploadedCorridors.checked = false;
+          layerUploadedRegions.checked = false;
+        }
+
+        async function renderCatalog() {
+          if (!catalogList || !catalogEmpty) return;
+
+          let entries = [];
+          try {
+            entries = wasm.catalog_list?.() ?? [];
+          } catch (err) {
+            console.error("catalog_list failed", err);
+            catalogList.innerHTML = "<div style=\"color:#fca5a5; font-size:12px;\">Catalog unavailable.</div>";
+            catalogEmpty.style.display = "none";
+            return;
+          }
+
+          let currentCatalogId = "";
+          try {
+            const s = wasm.get_uploaded_summary?.();
+            currentCatalogId = String(s?.catalog_id ?? "");
+          } catch (err) {
+            currentCatalogId = "";
+          }
+
+          catalogList.innerHTML = "";
+          const hasAny = Array.isArray(entries) && entries.length > 0;
+          catalogEmpty.style.display = hasAny ? "none" : "block";
+          if (!hasAny) return;
+
+          for (const e of entries) {
+            const id = String(e?.id ?? "");
+            const name = String(e?.name ?? id);
+            const pts = Number(e?.points ?? 0);
+            const lines = Number(e?.lines ?? 0);
+            const polys = Number(e?.polygons ?? 0);
+            const loaded = id && currentCatalogId && id === currentCatalogId;
+
+            const row = document.createElement("div");
+            row.className = "section";
+            row.style.padding = "10px";
+            row.innerHTML = `
+              <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+                <div style="font-weight:700;">${name}</div>
+                ${loaded ? '<div style="font-size:11px; color:#86efac; font-weight:700;">Loaded</div>' : ''}
+              </div>
+              <div style="font-size:12px; color:#94a3b8; margin-top:6px;">Points: ${pts} • Lines: ${lines} • Polygons: ${polys}</div>
+              <div style="display:flex; gap:8px; margin-top:10px;">
+                <button type="button" data-action="toggle">${loaded ? "Remove from scene" : "Add to scene"}</button>
+                <button type="button" data-action="delete" style="border-color:#7f1d1d;">Delete</button>
+              </div>
+            `;
+
+            const btnToggle = row.querySelector('button[data-action="toggle"]');
+            const btnDelete = row.querySelector('button[data-action="delete"]');
+
+            btnToggle?.addEventListener("click", async () => {
+              try {
+                if (loaded) {
+                  wasm.clear_uploaded?.();
+                  clearUploadedUi();
+                } else {
+                  const summary = await wasm.catalog_load(id);
+                  applyUploadedSummary(summary, name);
+                }
+                renderCatalog();
+              } catch (err) {
+                console.error("catalog toggle failed", err);
+                setStatus("Catalog load failed (see console)");
+              }
+            });
+
+            btnDelete?.addEventListener("click", async () => {
+              try {
+                if (loaded) {
+                  wasm.clear_uploaded?.();
+                  clearUploadedUi();
+                }
+                await wasm.catalog_delete(id);
+                renderCatalog();
+              } catch (err) {
+                console.error("catalog delete failed", err);
+                setStatus("Catalog delete failed (see console)");
+              }
+            });
+
+            catalogList.appendChild(row);
+          }
+        }
+
+        // Initial render.
+        renderCatalog();
 
         let viewMode = "3d"; // 2d | 3d
 
@@ -920,10 +1080,86 @@
           const file = fileGeoJson.files && fileGeoJson.files[0];
           if (!file) return;
 
+          const MAX_GEOJSON_BYTES = 8 * 1024 * 1024;
+          if (file.size > MAX_GEOJSON_BYTES) {
+            setStatus(`Upload too large (max 8MiB): ${file.name}`);
+            setUploadedInfo({
+              error: `Upload too large for the web viewer (max 8MiB). File is ${file.size} bytes.`,
+            });
+            // allow re-uploading the same file
+            fileGeoJson.value = "";
+            return;
+          }
+
           try {
             setStatus(`Loading ${file.name}…`);
             const text = await file.text();
+
+            // Preflight in JS to avoid trapping the wasm module on overly complex GeoJSON.
+            // This is intentionally conservative; the web viewer isn't meant for massive uploads.
+            const MAX_FEATURES = 20_000;
+            const MAX_COORD_PAIRS = 500_000;
+            try {
+              const geo = JSON.parse(text);
+              if (geo && geo.type === "FeatureCollection" && Array.isArray(geo.features)) {
+                let coordPairs = 0;
+
+                function countPoint(pt) {
+                  if (Array.isArray(pt) && pt.length >= 2) coordPairs += 1;
+                }
+                function countLine(line) {
+                  if (!Array.isArray(line)) return;
+                  for (const pt of line) countPoint(pt);
+                }
+                function countPolygon(poly) {
+                  if (!Array.isArray(poly)) return;
+                  for (const ring of poly) countLine(ring);
+                }
+                function countGeometry(g) {
+                  if (!g || typeof g !== "object") return;
+                  const t = g.type;
+                  const c = g.coordinates;
+                  if (t === "Point") countPoint(c);
+                  else if (t === "MultiPoint") {
+                    if (Array.isArray(c)) for (const pt of c) countPoint(pt);
+                  } else if (t === "LineString") countLine(c);
+                  else if (t === "MultiLineString") {
+                    if (Array.isArray(c)) for (const line of c) countLine(line);
+                  } else if (t === "Polygon") countPolygon(c);
+                  else if (t === "MultiPolygon") {
+                    if (Array.isArray(c)) for (const poly of c) countPolygon(poly);
+                  } else if (t === "GeometryCollection") {
+                    if (Array.isArray(g.geometries)) for (const gg of g.geometries) countGeometry(gg);
+                  }
+                }
+
+                if (geo.features.length > MAX_FEATURES) {
+                  throw new Error(`Too many features (${geo.features.length}). Max is ${MAX_FEATURES}.`);
+                }
+
+                for (const f of geo.features) {
+                  countGeometry(f && f.geometry);
+                  if (coordPairs > MAX_COORD_PAIRS) {
+                    throw new Error(
+                      `Too many coordinates (${coordPairs}). Max is ${MAX_COORD_PAIRS}.`
+                    );
+                  }
+                }
+              }
+            } catch (preflightErr) {
+              // If JSON parses but is too large/complex, stop before calling wasm.
+              // If JSON is invalid, we also stop here with a clearer error.
+              setStatus(`Upload rejected: ${file.name}`);
+              setUploadedInfo({
+                error: preflightErr?.message ?? String(preflightErr),
+              });
+              return;
+            }
+
             const summary = await wasm.load_geojson_file(file.name, text);
+
+            // Refresh catalog (upload is persisted in AVC form when it fits local storage).
+            renderCatalog();
 
             // Add/update an Uploaded option in the dataset dropdown.
             const uploadedId = "__uploaded__";
@@ -941,6 +1177,8 @@
               points: summary?.points ?? 0,
               lines: summary?.lines ?? 0,
               polygons: summary?.polygons ?? 0,
+              catalog_persisted: summary?.catalog_persisted,
+              catalog_error: summary?.catalog_error,
             });
 
             // Enable uploaded layers (if present) and label them.
@@ -951,7 +1189,11 @@
             layerUploadedCorridors.checked = (summary?.lines ?? 0) > 0;
             layerUploadedRegions.checked = (summary?.polygons ?? 0) > 0;
 
-            setStatus(`Uploaded: ${file.name}`);
+            if (summary?.catalog_persisted) {
+              setStatus(`Uploaded & saved: ${file.name}`);
+            } else {
+              setStatus(`Uploaded (not saved to Catalog): ${file.name}`);
+            }
           } catch (err) {
             console.error("GeoJSON upload failed", err);
             setStatus("Upload failed (see console)");

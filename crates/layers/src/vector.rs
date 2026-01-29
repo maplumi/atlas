@@ -44,6 +44,19 @@ impl VectorLayer {
 }
 
 fn triangulate_area_rings(rings: &[Vec<Vec3>]) -> Vec<Vec3> {
+    const MAX_RING_VERTICES: usize = 50_000;
+    const MAX_TOTAL_VERTICES: usize = 200_000;
+
+    fn is_finite_vec3(v: Vec3) -> bool {
+        v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
+    }
+
+    fn drop_consecutive_duplicates(points: &mut Vec<Vec3>) {
+        points.dedup_by(|a, b| {
+            (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9 && (a.z - b.z).abs() < 1e-9
+        });
+    }
+
     // Triangulate in a local tangent plane at the centroid of the outer ring.
     // This is a pragmatic choice for rendering and matches the viewer's approach.
     let Some(outer) = rings.first() else {
@@ -65,31 +78,70 @@ fn triangulate_area_rings(rings: &[Vec<Vec3>]) -> Vec<Vec3> {
     let east = normalize(cross(up, n));
     let north = cross(n, east);
 
+    // Degenerate basis (or invalid normal) -> skip triangulation rather than risk NaNs.
+    let east_l2 = dot(east, east);
+    let north_l2 = dot(north, north);
+    if !(east_l2.is_finite() && north_l2.is_finite()) || east_l2 < 1e-20 || north_l2 < 1e-20 {
+        return Vec::new();
+    }
+
     // Flatten rings into 2D coordinates + a parallel 3D vertex list.
     // Also remove a closing duplicate point if present.
     let mut vertices_3d: Vec<Vec3> = Vec::new();
     let mut coords_2d: Vec<f64> = Vec::new();
     let mut hole_indices: Vec<usize> = Vec::new();
 
-    for (ring_i, ring) in rings.iter().enumerate() {
-        let mut ring_pts: Vec<Vec3> = ring.clone();
+    // GeoJSON polygon rings are "outer first, then holes", but we may skip degenerate rings.
+    // Track the first *accepted* ring as the outer ring; only then are subsequent rings holes.
+    let mut have_outer = false;
+
+    for ring in rings {
+        if ring.len() > MAX_RING_VERTICES {
+            continue;
+        }
+
+        let mut ring_pts: Vec<Vec3> = ring
+            .iter()
+            .copied()
+            .filter(|p| is_finite_vec3(*p))
+            .collect();
         drop_closing_duplicate(&mut ring_pts);
+        drop_consecutive_duplicates(&mut ring_pts);
         if ring_pts.len() < 3 {
             continue;
         }
 
-        if ring_i > 0 {
-            hole_indices.push(vertices_3d.len());
-        }
-
+        // Project ring into tangent plane; if any projection goes invalid, skip the ring.
+        let mut tmp_vertices: Vec<Vec3> = Vec::with_capacity(ring_pts.len());
+        let mut tmp_coords: Vec<f64> = Vec::with_capacity(ring_pts.len() * 2);
+        let mut projection_ok = true;
         for p in ring_pts {
             let v = Vec3::new(p.x - origin.x, p.y - origin.y, p.z - origin.z);
             let x = dot(v, east);
             let y = dot(v, north);
-            coords_2d.push(x);
-            coords_2d.push(y);
-            vertices_3d.push(p);
+            if !(x.is_finite() && y.is_finite()) {
+                projection_ok = false;
+                break;
+            }
+            tmp_coords.push(x);
+            tmp_coords.push(y);
+            tmp_vertices.push(p);
         }
+        if !projection_ok || tmp_vertices.len() < 3 {
+            continue;
+        }
+
+        if vertices_3d.len().saturating_add(tmp_vertices.len()) > MAX_TOTAL_VERTICES {
+            return Vec::new();
+        }
+
+        if have_outer {
+            hole_indices.push(vertices_3d.len());
+        } else {
+            have_outer = true;
+        }
+        coords_2d.extend(tmp_coords);
+        vertices_3d.extend(tmp_vertices);
     }
 
     if vertices_3d.len() < 3 {
