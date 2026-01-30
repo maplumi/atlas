@@ -21,7 +21,7 @@ echo "[dem] download COGs -> $TERRAIN_RAW"
   --stac-url "$STAC_URL" \
   download \
   --collection "$TERRAIN_COLLECTION" \
-  --bbox "$TERRAIN_BBOX" \
+  --bbox="$TERRAIN_BBOX" \
   --out "$TERRAIN_RAW" \
   --limit "$TERRAIN_LIMIT"
 

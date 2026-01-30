@@ -5,7 +5,7 @@ services:
       context: .
       dockerfile: crates/apps/web/Dockerfile
     ports:
-      - "8080:80"
+      - "8082:80"
     depends_on:
       - server
 
@@ -15,7 +15,7 @@ services:
       context: .
       dockerfile: crates/apps/server/Dockerfile
     ports:
-      - "9100:9100"
+      - "9102:9100"
     environment:
       TERRAIN_ADDR: "0.0.0.0:9100"
       TERRAIN_ROOT: "/data/terrain"
@@ -30,8 +30,8 @@ services:
       dockerfile: crates/apps/server/Dockerfile.dem-pipeline
     environment:
       STAC_URL: "https://copernicus-dem-30m-stac.s3.amazonaws.com"
-      TERRAIN_COLLECTION: "${TERRAIN_COLLECTION}"
-      TERRAIN_BBOX: "${TERRAIN_BBOX}"
+      TERRAIN_COLLECTION: "${TERRAIN_COLLECTION:-dem_cop_30}"
+      TERRAIN_BBOX: "${TERRAIN_BBOX:--180,-90,180,90}"
       TERRAIN_LIMIT: "${TERRAIN_LIMIT:-200}"
       TERRAIN_ZOOM_MIN: "${TERRAIN_ZOOM_MIN:-0}"
       TERRAIN_ZOOM_MAX: "${TERRAIN_ZOOM_MAX:-2}"
