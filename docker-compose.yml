@@ -1,19 +1,19 @@
 services:
-  viewer_web:
+  web:
     image: atlas-viewer:${ATLAS_TAG:-dev}
     build:
       context: .
-      dockerfile: crates/apps/viewer_web/Dockerfile
+      dockerfile: crates/apps/web/Dockerfile
     ports:
       - "8080:80"
     depends_on:
-      - terrain_server
+      - server
 
-  terrain_server:
+  server:
     image: atlas-server:${ATLAS_TAG:-dev}
     build:
       context: .
-      dockerfile: crates/apps/terrain_server/Dockerfile
+      dockerfile: crates/apps/server/Dockerfile
     ports:
       - "9100:9100"
     environment:
@@ -22,3 +22,23 @@ services:
       STAC_URL: "https://copernicus-dem-30m-stac.s3.amazonaws.com"
     volumes:
       - ./data/terrain:/data/terrain
+
+  dem-pipeline:
+    image: atlas-dem-pipeline:${ATLAS_TAG:-dev}
+    build:
+      context: .
+      dockerfile: crates/apps/server/Dockerfile.dem-pipeline
+    environment:
+      STAC_URL: "https://copernicus-dem-30m-stac.s3.amazonaws.com"
+      TERRAIN_COLLECTION: "${TERRAIN_COLLECTION}"
+      TERRAIN_BBOX: "${TERRAIN_BBOX}"
+      TERRAIN_LIMIT: "${TERRAIN_LIMIT:-200}"
+      TERRAIN_ZOOM_MIN: "${TERRAIN_ZOOM_MIN:-0}"
+      TERRAIN_ZOOM_MAX: "${TERRAIN_ZOOM_MAX:-2}"
+      TERRAIN_TILE_SIZE: "${TERRAIN_TILE_SIZE:-256}"
+      TERRAIN_SAMPLE_STEP: "${TERRAIN_SAMPLE_STEP:-4}"
+      TERRAIN_NO_DATA: "${TERRAIN_NO_DATA:--9999}"
+      TERRAIN_FORCE_REBUILD: "${TERRAIN_FORCE_REBUILD:-0}"
+    volumes:
+      - ./data/terrain:/data/terrain
+    restart: "no"

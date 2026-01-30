@@ -206,8 +206,7 @@ mod tests {
 
     #[test]
     fn loads_demo_assets_into_world() {
-        let root =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../apps/viewer_web/assets");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../apps/web/assets");
         let world = load_world_from_package_dir(root).expect("load world");
 
         // cities: 6 point features

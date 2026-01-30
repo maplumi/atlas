@@ -18,12 +18,61 @@ This document outlines a local‑static hosting approach for global DEM tiles, w
 ### Workflow
 1) Query STAC for tiles that intersect a region or a bounding box.
 2) Download tiles as COGs to a local cache.
-3) Preprocess into a **viewer‑friendly tile format** (heightmap tiles or mesh tiles).
+3) Preprocess into a **viewer‑friendly tile format** (heightmap tiles).
 4) Serve tiles via a static HTTP server (local).
+
+### Pipeline tool (GDAL)
+Convert the downloaded COGs into EPSG:4326 heightmap tiles:
+
+```
+./scripts/dem_pipeline.py \
+  --input data/terrain/raw \
+  --output data/terrain \
+  --zoom-min 0 \
+  --zoom-max 2 \
+  --tile-size 256 \
+  --sample-step 4
+```
+
+This produces:
+- `data/terrain/tiles/{z}/{x}/{y}.bin`
+- `data/terrain/metadata/tileset.json`
+
+### Pipeline container (deployment)
+Use the `dem-pipeline` service in docker-compose to run downloads + tiling during deployment.
+It is idempotent and skips existing downloads and tiles unless forced.
 
 ### Suggested Tile Format
 - Heightmap tiles (e.g., 256x256 or 512x512) in a compact binary format.
 - Per‑tile metadata: bounds, min/max elevation, and tile resolution.
+
+#### Tile binary
+- Format: little‑endian Float32 (meters)
+- Layout: row‑major, north→south rows, west→east columns
+- No‑data value: configurable (default: -9999)
+
+#### Tileset JSON
+`data/terrain/metadata/tileset.json`
+
+Example schema:
+```json
+{
+  "version": 1,
+  "tile_size": 256,
+  "zoom_min": 0,
+  "zoom_max": 2,
+  "data_type": "f32",
+  "tile_path_template": "tiles/{z}/{x}/{y}.bin",
+  "min_lon": -180.0,
+  "max_lon": 180.0,
+  "min_lat": -90.0,
+  "max_lat": 90.0,
+  "min_height": -1000.0,
+  "max_height": 9000.0,
+  "no_data": -9999.0,
+  "sample_step": 4
+}
+```
 
 ### Directory Layout (proposal)
 ```
@@ -45,6 +94,18 @@ Use a backend only if we need:
 Backend can expose:
 - `/terrain/tiles/{z}/{x}/{y}.bin`
 - `/terrain/tileset.json`
+- `/terrain/status` (download/progress)
+
+### Auto-download (server)
+The terrain backend can optionally auto-download DEM COGs on startup.
+
+Environment:
+- `TERRAIN_AUTO_DOWNLOAD=1`
+- `TERRAIN_COLLECTION=<stac-collection-id>`
+- `TERRAIN_BBOX=minLon,minLat,maxLon,maxLat`
+- `TERRAIN_LIMIT=200`
+
+Progress is exposed via `/terrain/status`.
 
 ## STAC Usage (Discovery)
 

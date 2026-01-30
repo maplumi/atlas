@@ -24,7 +24,7 @@ This file guides automated agents working in the `atlas` workspace. Follow the r
 
 ## Naming conventions (adopted)
 
-- Crates and modules: `snake_case` (e.g., `viewer_web`, `runtime`).
+- Crates and modules: `snake_case` (e.g., `web`, `runtime`).
 - Types and traits: `PascalCase`.
 - Functions and methods: `snake_case`.
 - Constants and statics: `SCREAMING_SNAKE_CASE`.

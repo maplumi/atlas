@@ -43,10 +43,10 @@ jobs:
         run: |
           cargo install mdbook --locked
 
-      - name: Build web app (viewer_web)
+      - name: Build web app (web)
         run: |
           mkdir -p dist
-          cd crates/apps/viewer_web
+          cd crates/apps/web
           trunk build --release --public-url /atlas/ --dist "$GITHUB_WORKSPACE/dist"
 
       - name: Sync releases into docs

@@ -37,17 +37,17 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build terrain_server image
+      - name: Build server image
         run: |
           docker build \
-            -f crates/apps/terrain_server/Dockerfile \
+            -f crates/apps/server/Dockerfile \
             -t atlas-server:${{ github.ref_name }} \
             .
 
-      - name: Build viewer_web image
+      - name: Build web image
         run: |
           docker build \
-            -f crates/apps/viewer_web/Dockerfile \
+            -f crates/apps/web/Dockerfile \
             -t atlas-viewer:${{ github.ref_name }} \
             .
 

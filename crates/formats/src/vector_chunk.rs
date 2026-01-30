@@ -392,7 +392,7 @@ mod tests {
 
     #[test]
     fn parses_demo_cities_points() {
-        let payload = include_str!("../../apps/viewer_web/assets/chunks/cities.json");
+        let payload = include_str!("../../apps/web/assets/chunks/cities.json");
         let chunk = VectorChunk::from_geojson_str(payload).expect("parse VectorChunk");
         assert_eq!(chunk.features.len(), 6);
         assert!(matches!(

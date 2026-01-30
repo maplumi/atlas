@@ -2,8 +2,8 @@
 
 This section lists runnable demos and what they prove.
 
-## Demo: Atlas Demo World (viewer_web)
-- Loads a scene package from `crates/apps/viewer_web/assets/scene.manifest.json`.
+## Demo: Atlas Demo World (web)
+- Loads a scene package from `crates/apps/web/assets/scene.manifest.json`.
 - Exercises both 2D and 3D rendering paths.
 
 ## Next demos (planned)

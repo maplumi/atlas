@@ -10,9 +10,9 @@ members = [
     "crates/gpu",
     "crates/layers",
     "crates/compute",
-    "crates/apps/viewer_web",
-    "crates/apps/viewer_native",
-    "crates/apps/terrain_server",
+    "crates/apps/web",
+    "crates/apps/native",
+    "crates/apps/server",
     "crates/tools"
 ]
 

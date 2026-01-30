@@ -11,9 +11,9 @@
 /node_modules/
 /dist/
 
-# Trunk output (viewer_web)
-/crates/apps/viewer_web/dist/
-/crates/apps/viewer_web/.trunk/
+# Trunk output (web)
+/crates/apps/web/dist/
+/crates/apps/web/.trunk/
 
 # mdBook output
 /docs/book/

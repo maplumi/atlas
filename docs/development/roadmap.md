@@ -67,7 +67,7 @@ Status legend:
 - [x] Layer styling model: visibility/color/lift (first pass) (`crates/layers/src/symbology.rs`)
 - [x] Core vector query API: kind + time + bbox + property filters (first pass) (`crates/layers/src/query.rs`)
 - [ ] Spatial filtering uses real geometry/index (currently bbox proxy uses entity transform)
-- [x] 3D point rendering fixed (screen-space pixel quads in WebGPU) (viewer_web)
+- [x] 3D point rendering fixed (screen-space pixel quads in WebGPU) (web)
 - [x] 2D point sizing is screen-pixel based (view-scale aware default)
 
 ## 8) Compute (analysis primitives)
@@ -82,7 +82,7 @@ Status legend:
 - [ ] Deterministic execution + resource limits
 
 ## 10) Viewer (apps: UX + wiring only)
-- [x] Web viewer: 2D/3D toggle with shared dataset/world (`crates/apps/viewer_web/`)
+- [x] Web viewer: 2D/3D toggle with shared dataset/world (`crates/apps/web/`)
 - [x] Map controls: toggle above zoom/home controls
 - [x] North/South orientation indicator (compass) wired to camera yaw
 - [x] 2D pan/zoom + 3D orbit controls (deterministic/no inertia)

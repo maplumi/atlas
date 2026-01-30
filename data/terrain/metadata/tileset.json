@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "tile_size": 256,
+  "zoom_min": 0,
+  "zoom_max": 2,
+  "data_type": "f32",
+  "tile_path_template": "tiles/{z}/{x}/{y}.bin",
+  "min_lon": 6.0,
+  "max_lon": 7.0,
+  "min_lat": 0.0,
+  "max_lat": 1.0,
+  "min_height": -8.3925981521606,
+  "max_height": 1976.3579101562,
+  "no_data": -9999.0,
+  "sample_step": 8
+}

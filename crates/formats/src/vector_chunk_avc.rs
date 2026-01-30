@@ -661,7 +661,7 @@ mod tests {
 
     #[test]
     fn avc_round_trip_demo_points_quantized() {
-        let payload = include_str!("../../apps/viewer_web/assets/chunks/cities.json");
+        let payload = include_str!("../../apps/web/assets/chunks/cities.json");
         let chunk = VectorChunk::from_geojson_str(payload).expect("parse");
 
         let bytes = encode_avc(&chunk).expect("encode");
@@ -683,7 +683,7 @@ mod tests {
 
     #[test]
     fn avc_round_trip_via_io_reader_writer() {
-        let payload = include_str!("../../apps/viewer_web/assets/chunks/cities.json");
+        let payload = include_str!("../../apps/web/assets/chunks/cities.json");
         let chunk = VectorChunk::from_geojson_str(payload).expect("parse");
 
         let mut bytes: Vec<u8> = Vec::new();

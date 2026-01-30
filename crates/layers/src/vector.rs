@@ -230,8 +230,7 @@ mod tests {
 
     #[test]
     fn extracts_demo_snapshot() {
-        let root =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../apps/viewer_web/assets");
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../apps/web/assets");
         let world = load_world_from_package_dir(root).expect("load world");
         let layer = VectorLayer::new(1);
         let snap = layer.extract(&world);

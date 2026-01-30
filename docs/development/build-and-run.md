@@ -1,37 +1,51 @@
 # Build and Run
 
 ## Native viewer
-- Build: `cargo build -p viewer_native`
-- Run: `cargo run -p viewer_native`
+- Build: `cargo build -p native`
+- Run: `cargo run -p native`
 
 ## Web viewer
 - Target: `wasm32-unknown-unknown`
-- Build: `cargo build -p viewer_web --target wasm32-unknown-unknown`
+- Build: `cargo build -p web --target wasm32-unknown-unknown`
 
 ### Built-in datasets (web)
-- Stored under `crates/apps/viewer_web/assets/` (e.g., `world.json`, `chunks/*.avc`).
-- Bundled at build time by Trunk via `copy-dir` in [crates/apps/viewer_web/index.html](crates/apps/viewer_web/index.html).
+- Stored under `crates/apps/web/assets/` (e.g., `world.json`, `chunks/*.avc`).
+- Bundled at build time by Trunk via `copy-dir` in [crates/apps/web/index.html](crates/apps/web/index.html).
 - Deployed as static assets under `/assets/` alongside the compiled WASM/JS bundle.
 
 ## Terrain backend (optional)
-- Run: `cargo run -p terrain_server`
+- Run: `cargo run -p server`
 - Environment:
 	- `TERRAIN_ROOT` (default: `data/terrain`)
 	- `TERRAIN_ADDR` (default: `127.0.0.1:9100`)
 	- `STAC_URL` (default: `https://copernicus-dem-30m-stac.s3.amazonaws.com`)
+	- `TERRAIN_AUTO_DOWNLOAD` (set to `1` to auto-download DEM COGs on startup)
+	- `TERRAIN_COLLECTION` (STAC collection id for auto-download)
+	- `TERRAIN_BBOX` (minLon,minLat,maxLon,maxLat for auto-download)
+	- `TERRAIN_LIMIT` (max items per STAC page; default `200`)
 - Endpoints:
 	- `GET /terrain/tileset.json`
 	- `GET /terrain/tiles/{z}/{x}/{y}.bin`
+	- `GET /terrain/status`
 	- `GET /stac/collections`
 	- `POST /stac/search`
 
 ### DEM downloader (local cache)
 - List collections:
-	- `cargo run -p terrain_server --bin terrain_fetch -- list-collections`
+	- `cargo run -p server --bin terrain_fetch -- list-collections`
 - Download a region (example bbox):
-	- `cargo run -p terrain_server --bin terrain_fetch -- download --collection <COLLECTION_ID> --bbox -10,35,10,45 --out data/terrain/raw --limit 200`
+	- `cargo run -p server --bin terrain_fetch -- download --collection <COLLECTION_ID> --bbox -10,35,10,45 --out data/terrain/raw --limit 200`
 - Download global in chunks:
-	- `cargo run -p terrain_server --bin terrain_fetch -- download-global --collection <COLLECTION_ID> --chunk-deg 10 --out data/terrain/raw --limit 200`
+	- `cargo run -p server --bin terrain_fetch -- download-global --collection <COLLECTION_ID> --chunk-deg 10 --out data/terrain/raw --limit 200`
+
+### DEM tiling (GDAL)
+Convert downloaded COGs into viewer tiles + tileset:
+
+Requires GDAL CLI tools (`gdalinfo`, `gdalbuildvrt`, `gdalwarp`, `gdal_translate`) in PATH.
+
+```
+./scripts/dem_pipeline.py --input data/terrain/raw --output data/terrain --zoom-min 0 --zoom-max 2 --tile-size 256 --sample-step 4
+```
 
 ## Docker deployment (UI + server)
 
@@ -43,6 +57,23 @@
 The terrain server serves tiles from `./data/terrain` on the host. Place preprocessed
 tiles under `data/terrain/tiles/{z}/{x}/{y}.bin` and a metadata file at
 `data/terrain/metadata/tileset.json`.
+
+### DEM pipeline (containerized)
+Use the DEM pipeline container to download COGs and generate tiles during deployment.
+It is idempotent and skips existing downloads and tiles unless forced.
+
+Required environment variables:
+- `TERRAIN_COLLECTION`
+- `TERRAIN_BBOX`
+
+Optional variables:
+- `TERRAIN_LIMIT` (default: `200`)
+- `TERRAIN_ZOOM_MIN` (default: `0`)
+- `TERRAIN_ZOOM_MAX` (default: `2`)
+- `TERRAIN_TILE_SIZE` (default: `256`)
+- `TERRAIN_SAMPLE_STEP` (default: `4`)
+- `TERRAIN_NO_DATA` (default: `-9999`)
+- `TERRAIN_FORCE_REBUILD` (default: `0`)
 
 ## Web ↔ backend integration (fallback-first)
 

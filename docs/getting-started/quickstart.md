@@ -3,15 +3,15 @@
 ## Build (native viewer)
 1. Install Rust stable and required toolchains
 2. Build:
-   - `cargo build -p viewer_native`
+   - `cargo build -p native`
 3. Run:
-   - `cargo run -p viewer_native`
+   - `cargo run -p native`
 
 ## Build (web viewer)
 1. Install wasm target:
    - `rustup target add wasm32-unknown-unknown`
 2. Build:
-   - `cargo build -p viewer_web --target wasm32-unknown-unknown`
+   - `cargo build -p web --target wasm32-unknown-unknown`
 
 ## Load a scene
 - Scenes are loaded from a scene package (`.scn` or directory-based package).

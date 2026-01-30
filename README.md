@@ -15,8 +15,9 @@ Workspace members (core crates):
 - `crates/gpu` — wgpu wrapper, render passes, buffers
 - `crates/layers` — layer abstractions (raster, vector, terrain, labels)
 - `crates/compute` — analysis, VM, programmable cartography
-- `crates/apps/viewer_web` — WASM/web viewer
-- `crates/apps/viewer_native` — native viewer binary
+- `crates/apps/web` — WASM/web viewer
+- `crates/apps/native` — native viewer binary
+- `crates/apps/server` — terrain backend
 - `crates/tools` — utilities and format tooling
 
 Quickstart
@@ -30,7 +31,7 @@ cargo build --workspace
 Build the native viewer:
 
 ```bash
-cargo build -p viewer_native
+cargo build -p native
 ```
 
 Notes

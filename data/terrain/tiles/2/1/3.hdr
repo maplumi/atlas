@@ -1,0 +1,16 @@
+ENVI
+description = {
+/data/terrain/tiles/2/1/3.bin}
+samples = 256
+lines   = 256
+bands   = 1
+header offset = 0
+file type = ENVI Standard
+data type = 4
+interleave = bil
+byte order = 0
+map info = {Geographic Lat/Lon, 1, 1, 6.24986111111111, 0.250138888888889, 0.0009765625, 0.0009765625,WGS-84}
+coordinate system string = {GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]}
+band names = {
+Band 1}
+data ignore value = -9999
