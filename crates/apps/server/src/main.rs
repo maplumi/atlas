@@ -51,7 +51,7 @@ async fn main() {
         .with_env_filter(EnvFilter::from_default_env())
         .init();
 
-    let terrain_root = env::var("TERRAIN_ROOT").unwrap_or_else(|_| "data/terrain".to_string());
+    let terrain_root = env::var("TERRAIN_ROOT").unwrap_or_else(|_| "/data/terrain".to_string());
     let stac_url = env::var("STAC_URL")
         .unwrap_or_else(|_| "https://copernicus-dem-30m-stac.s3.amazonaws.com".to_string());
     let addr: SocketAddr = env::var("TERRAIN_ADDR")

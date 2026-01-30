@@ -21,7 +21,7 @@ services:
       TERRAIN_ROOT: "/data/terrain"
       STAC_URL: "https://copernicus-dem-30m-stac.s3.amazonaws.com"
     volumes:
-      - ./data/terrain:/data/terrain
+      - terrain-data:/data/terrain
 
   dem-pipeline:
     image: atlas-dem-pipeline:${ATLAS_TAG:-dev}
@@ -40,5 +40,8 @@ services:
       TERRAIN_NO_DATA: "${TERRAIN_NO_DATA:--9999}"
       TERRAIN_FORCE_REBUILD: "${TERRAIN_FORCE_REBUILD:-0}"
     volumes:
-      - ./data/terrain:/data/terrain
+      - terrain-data:/data/terrain
     restart: "no"
+
+volumes:
+  terrain-data:

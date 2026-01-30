@@ -30,3 +30,6 @@ Thumbs.db
 # Misc
 *.swp
 .env
+
+# Local terrain data (generated)
+/data/terrain/
