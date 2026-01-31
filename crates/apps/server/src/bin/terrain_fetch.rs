@@ -1,3 +1,4 @@
+// Deprecated: terrain_fetch is no longer built. Use the streaming terrain backend.
 use std::env;
 use std::path::{Path, PathBuf};
 

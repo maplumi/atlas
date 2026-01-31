@@ -2,17 +2,22 @@
 name = "server"
 version = "0.1.0"
 edition = "2021"
+autobins = false
+
+[[bin]]
+name = "server"
+path = "src/main.rs"
 
 [dependencies]
 axum = "0.7"
 bytes = "1"
-clap = { version = "4", features = ["derive"] }
 futures-util = "0.3"
 http = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "sync"] }
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "sync", "process"] }
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

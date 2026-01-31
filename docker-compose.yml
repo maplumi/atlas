@@ -19,29 +19,22 @@ services:
     environment:
       TERRAIN_ADDR: "0.0.0.0:9100"
       TERRAIN_ROOT: "/data/terrain"
-      STAC_URL: "https://copernicus-dem-30m-stac.s3.amazonaws.com"
-    volumes:
-      - terrain-data:/data/terrain
-
-  dem-pipeline:
-    image: atlas-dem-pipeline:${ATLAS_TAG:-dev}
-    build:
-      context: .
-      dockerfile: crates/apps/server/Dockerfile.dem-pipeline
-    environment:
+      SURFACE_ROOT: "/data/terrain/surface"
       STAC_URL: "https://copernicus-dem-30m-stac.s3.amazonaws.com"
       TERRAIN_COLLECTION: "${TERRAIN_COLLECTION:-dem_cop_30}"
-      TERRAIN_BBOX: "${TERRAIN_BBOX:--180,-90,180,90}"
-      TERRAIN_LIMIT: "${TERRAIN_LIMIT:-200}"
-      TERRAIN_ZOOM_MIN: "${TERRAIN_ZOOM_MIN:-0}"
-      TERRAIN_ZOOM_MAX: "${TERRAIN_ZOOM_MAX:-2}"
       TERRAIN_TILE_SIZE: "${TERRAIN_TILE_SIZE:-256}"
+      TERRAIN_ZOOM_MIN: "${TERRAIN_ZOOM_MIN:-0}"
+      TERRAIN_ZOOM_MAX: "${TERRAIN_ZOOM_MAX:-8}"
       TERRAIN_SAMPLE_STEP: "${TERRAIN_SAMPLE_STEP:-4}"
       TERRAIN_NO_DATA: "${TERRAIN_NO_DATA:--9999}"
-      TERRAIN_FORCE_REBUILD: "${TERRAIN_FORCE_REBUILD:-0}"
+      TERRAIN_MIN_LON: "${TERRAIN_MIN_LON:--180}"
+      TERRAIN_MAX_LON: "${TERRAIN_MAX_LON:-180}"
+      TERRAIN_MIN_LAT: "${TERRAIN_MIN_LAT:--90}"
+      TERRAIN_MAX_LAT: "${TERRAIN_MAX_LAT:-90}"
+      TERRAIN_MAX_COGS_PER_TILE: "${TERRAIN_MAX_COGS_PER_TILE:-16}"
     volumes:
       - terrain-data:/data/terrain
-    restart: "no"
+      - ./data/terrain/surface:/data/terrain/surface:ro
 
 volumes:
   terrain-data:

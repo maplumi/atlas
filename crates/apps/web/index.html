@@ -88,6 +88,10 @@
         display: flex;
         gap: 8px;
       }
+      .panel-tabs {
+        display: flex;
+        gap: 8px;
+      }
       .tab-btn {
         flex: 1;
         padding: 8px 10px;
@@ -244,14 +248,84 @@
         margin-top: 8px;
       }
       .layer-row .mini { font-size: 11px; color: #94a3b8; }
+
+      .compact-tabs {
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        display: none;
+        flex-direction: column;
+        gap: 8px;
+        z-index: 18;
+      }
+      .compact-tabs .btn {
+        width: 40px;
+        height: 40px;
+        border-radius: 12px;
+        padding: 0;
+        margin: 0;
+        display: grid;
+        place-items: center;
+        font-weight: 800;
+      }
+      .compact-close {
+        display: none;
+        position: sticky;
+        top: 0;
+        align-self: flex-end;
+        margin-left: auto;
+        margin-bottom: 4px;
+        width: 32px;
+        height: 32px;
+        border-radius: 8px;
+        font-weight: 700;
+        z-index: 30;
+      }
+
+      @media (max-width: 900px) {
+        #app {
+          grid-template-columns: 1fr;
+        }
+        #side-panel {
+          position: absolute;
+          top: 0;
+          left: 0;
+          height: 100%;
+          width: min(88vw, 360px);
+          max-width: none;
+          transform: translateX(-105%);
+          transition: transform 0.2s ease;
+          z-index: 25;
+          box-shadow: 0 12px 24px rgba(2, 6, 23, 0.55);
+        }
+        #side-panel.compact-open {
+          transform: translateX(0);
+        }
+        #panel-toggle,
+        #panel-resize-handle {
+          display: none;
+        }
+        .panel-tabs {
+          display: none;
+        }
+        .compact-tabs {
+          display: flex;
+        }
+        .compact-close {
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+        }
+      }
     </style>
   </head>
   <body>
     <div id="app">
       <div id="side-panel">
         <button id="panel-toggle" type="button" title="Collapse panel">◀</button>
+        <button id="compact-panel-close" class="compact-close" type="button" title="Close panel">✕</button>
         <div id="panel-resize-handle"></div>
-        <div class="tabs">
+        <div class="panel-tabs">
           <button id="tab-general-btn" class="tab-btn active" type="button">General</button>
           <button id="tab-layers-btn" class="tab-btn" type="button">Layers</button>
           <button id="tab-catalog-btn" class="tab-btn" type="button">Catalog</button>
@@ -262,7 +336,7 @@
           <div class="section">
             <h3>Mode</h3>
             <div class="tabs">
-              <button id="mode-2d" class="tab-btn" type="button">2D</button>
+              <button id="mode-2d" class="tab-btn" type="button" disabled>2D</button>
               <button id="mode-3d" class="tab-btn active" type="button">3D</button>
             </div>
             <div style="font-size:12px; color:#94a3b8; line-height:1.35; margin-top:8px;">
@@ -291,7 +365,9 @@
           <div class="section">
             <h3>Status</h3>
             <div id="status-text" style="font-size:12px; color:#cbd5e1;">Ready</div>
-            <div id="dem-status-text" style="font-size:12px; color:#94a3b8; margin-top:6px;">DEM: unknown</div>
+            <div id="surface-status-text" style="font-size:12px; color:#94a3b8; margin-top:6px;">Surface: idle</div>
+            <div id="dem-status-text" style="font-size:12px; color:#94a3b8; margin-top:6px;">Terrain (backend): unknown</div>
+            <div id="terrain-client-status-text" style="font-size:12px; color:#94a3b8; margin-top:6px;">Terrain (client): idle</div>
             <div id="cursor-text" style="font-size:12px; color:#94a3b8; margin-top:6px;">Cursor: —</div>
             <div id="pick-text" style="font-size:12px; color:#94a3b8; margin-top:2px;">Pick: —</div>
           </div>
@@ -327,15 +403,23 @@
                 <input id="layer-world-base" type="checkbox" checked />
                 <span>World base (built-in)</span>
               </label>
-              <input id="layer-world-base-color" type="color" value="#1e7fd9" />
+              <input id="layer-world-base-color" type="color" value="#33a85a" />
               <div>
                 <div class="mini">Opacity</div>
-                <input id="layer-world-base-opacity" type="range" min="0" max="1" step="0.01" value="0.22" />
+                <input id="layer-world-base-opacity" type="range" min="0" max="1" step="0.01" value="0.85" />
               </div>
               <div>
                 <div class="mini">Lift</div>
                 <input id="layer-world-base-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
               </div>
+            </div>
+
+            <div class="layer-row">
+              <label class="checkbox">
+                <input id="layer-terrain" type="checkbox" />
+                <span>3D terrain mesh (streaming)</span>
+              </label>
+              <div style="font-size:12px; color:#94a3b8;">Loads on-demand tiles when enabled.</div>
             </div>
 
             <div class="layer-row">
@@ -464,11 +548,29 @@
               Syncs the globe lighting to your current system time.
             </div>
           </div>
+          <div class="section">
+            <h3>Globe rotation</h3>
+            <label class="checkbox">
+              <input id="toggle-auto-rotate" type="checkbox" checked />
+              <span>Auto-rotate globe</span>
+            </label>
+            <label for="auto-rotate-speed" style="margin-top:8px;">Rotation speed (deg/s)</label>
+            <div class="row">
+              <input id="auto-rotate-speed" type="range" min="0" max="0.05" step="0.0005" value="0.0042" />
+              <span id="auto-rotate-speed-value" class="value">0.0042</span>
+            </div>
+          </div>
         </div>
       </div>
       <div id="map-area">
         <canvas id="atlas-canvas-2d" width="1280" height="720" class="hidden"></canvas>
         <canvas id="atlas-canvas-3d" width="1280" height="720"></canvas>
+        <div id="compact-tabs" class="compact-tabs" aria-label="Panel shortcuts">
+          <button class="btn" data-tab="general" type="button" title="General">G</button>
+          <button class="btn" data-tab="layers" type="button" title="Layers">L</button>
+          <button class="btn" data-tab="catalog" type="button" title="Catalog">C</button>
+          <button class="btn" data-tab="settings" type="button" title="Settings">S</button>
+        </div>
         <div id="map-controls" class="map-controls" data-pos="right" aria-label="Map controls">
           <div class="map-controls-row" aria-label="View and compass">
             <button id="map-view" class="btn small" type="button" title="Toggle 2D/3D view">3D</button>
@@ -497,12 +599,19 @@
       function main(wasm) {
         wireUi(wasm);
         resizeCanvas(wasm);
-        window.addEventListener("resize", () => resizeCanvas(wasm));
+        window.addEventListener("resize", () => {
+          resizeCanvas(wasm);
+          if (!isCompactLayout()) {
+            document.getElementById("side-panel")?.classList.remove("compact-open");
+          }
+        });
         wasm.init_canvas_2d();
         wasm.init_wgpu();
         // preload base world layer
         try { wasm.load_base_world?.(); } catch (err) { console.error("load_base_world failed", err); }
         detectBackendAvailability();
+        startSurfaceStatusPolling(wasm);
+        startTerrainClientStatusPolling(wasm);
         startAnimation(wasm);
       }
 
@@ -510,8 +619,13 @@
         const override = window.ATLAS_BACKEND_URL || "";
         const host = window.location.hostname || "localhost";
         const scheme = window.location.protocol === "https:" ? "https" : "http";
-        const fallback = `${scheme}://${host}:9100`;
-        const candidates = [String(override || "").trim(), fallback].filter(Boolean);
+        const fallbackDocker = `${scheme}://${host}:9102`;
+        const fallbackLocal = `${scheme}://${host}:9100`;
+        const candidates = [
+          String(override || "").trim(),
+          fallbackDocker,
+          fallbackLocal,
+        ].filter(Boolean);
 
         for (const base of candidates) {
           try {
@@ -531,7 +645,7 @@
         window.__atlasBackendUrl = "";
         window.__atlasStacUrl = "https://copernicus-dem-30m-stac.s3.amazonaws.com";
         setStatus("Backend: offline (using defaults)");
-        setDemStatus("DEM: backend offline");
+        setDemStatus("Terrain (backend): offline");
       }
 
       function startAnimation(wasm) {
@@ -548,9 +662,14 @@
         window.requestAnimationFrame(loop);
       }
 
+      function isCompactLayout() {
+        return window.matchMedia("(max-width: 900px)").matches;
+      }
+
       function resizeCanvas(wasm) {
         const panel = document.getElementById("side-panel");
-        const width = window.innerWidth - panel.offsetWidth;
+        const compact = isCompactLayout();
+        const width = compact ? window.innerWidth : (window.innerWidth - panel.offsetWidth);
         const height = window.innerHeight;
         const canvas2d = document.getElementById("atlas-canvas-2d");
         const canvas3d = document.getElementById("atlas-canvas-3d");
@@ -569,36 +688,38 @@
         document.getElementById("dem-status-text").textContent = text;
       }
 
+      function setSurfaceStatus(text) {
+        document.getElementById("surface-status-text").textContent = text;
+      }
+
+      function setTerrainClientStatus(text) {
+        document.getElementById("terrain-client-status-text").textContent = text;
+      }
+
       function startTerrainStatusPolling(baseUrl) {
         async function poll() {
           if (!baseUrl) {
-            setDemStatus("DEM: backend offline");
+            setDemStatus("Terrain (backend): offline");
             return;
           }
           try {
             const resp = await fetch(`${baseUrl}/terrain/status`, { method: "GET" });
             if (!resp.ok) {
-              setDemStatus(`DEM: status unavailable (${resp.status})`);
+              setDemStatus(`Terrain (backend): status unavailable (${resp.status})`);
               return;
             }
             const data = await resp.json();
             const tiles = Number.isFinite(data.tiles_count) ? data.tiles_count : 0;
             const suffix = data.tiles_count_truncated ? "+" : "";
-            const downloadStatus = String(data.download_status || "").toLowerCase();
-            const downloaded = Number.isFinite(data.downloaded) ? data.downloaded : 0;
-            const total = Number.isFinite(data.download_total) ? data.download_total : 0;
-            const downloadSuffix = total > 0 ? ` (${downloaded}/${total})` : "";
-            if (downloadStatus === "running") {
-              setDemStatus(`DEM: downloading${downloadSuffix}`);
-            } else if (data.status === "ready") {
-              setDemStatus(`DEM: ready (${tiles}${suffix} tiles)`);
-            } else if (data.status === "partial") {
-              setDemStatus(`DEM: partial (${tiles}${suffix} tiles)`);
+            if (data.status === "ready") {
+              setDemStatus(`Terrain (backend): ready (${tiles}${suffix} cached)`);
+            } else if (data.status === "empty") {
+              setDemStatus("Terrain (backend): empty cache");
             } else {
-              setDemStatus("DEM: not found");
+              setDemStatus(`Terrain (backend): ${String(data.status || "unknown")}`);
             }
           } catch (err) {
-            setDemStatus("DEM: status error");
+            setDemStatus("Terrain (backend): status error");
           }
         }
 
@@ -606,7 +727,85 @@
         window.setInterval(poll, 10_000);
       }
 
+      function startTerrainClientStatusPolling(wasm) {
+        function poll() {
+          try {
+            if (!wasm.get_terrain_client_status) {
+              setTerrainClientStatus("Terrain (client): unavailable");
+              return;
+            }
+            const status = wasm.get_terrain_client_status();
+            const enabled = !!status.enabled;
+            const loading = !!status.loading;
+            const zoom = status.zoom !== undefined ? ` z${status.zoom}` : "";
+            const source = status.source ? ` @ ${status.source}` : "";
+            if (!enabled) {
+              setTerrainClientStatus("Terrain (client): disabled");
+              return;
+            }
+            if (loading) {
+              setTerrainClientStatus(`Terrain (client): loading${zoom}${source}`);
+              return;
+            }
+            if (status.last_error) {
+              setTerrainClientStatus(`Terrain (client): error (${status.last_error})`);
+              return;
+            }
+            if (status.tileset_loaded) {
+              setTerrainClientStatus(`Terrain (client): ready${zoom}${source}`);
+              return;
+            }
+            setTerrainClientStatus("Terrain (client): idle");
+          } catch (err) {
+            setTerrainClientStatus("Terrain (client): status error");
+          }
+        }
+
+        poll();
+        window.setInterval(poll, 3_000);
+      }
+
+      function startSurfaceStatusPolling(wasm) {
+        function poll() {
+          try {
+            if (!wasm.get_surface_status) {
+              setSurfaceStatus("Surface: unavailable");
+              return;
+            }
+            const status = wasm.get_surface_status();
+            const zoom = status.zoom !== undefined ? ` z${status.zoom}` : "";
+            const source = status.source ? ` @ ${status.source}` : "";
+            if (status.loading) {
+              setSurfaceStatus(`Surface: loading${zoom}${source}`);
+              return;
+            }
+            if (status.error) {
+              setSurfaceStatus(`Surface: error (${status.error})`);
+              return;
+            }
+            if (status.tileset_loaded) {
+              setSurfaceStatus(`Surface: tiles ready${zoom}${source}`);
+              return;
+            }
+            if (status.loaded) {
+              setSurfaceStatus(`Surface: ready${source}`);
+              return;
+            }
+            setSurfaceStatus("Surface: idle");
+          } catch (err) {
+            setSurfaceStatus("Surface: status error");
+          }
+        }
+
+        poll();
+        window.setInterval(poll, 2_000);
+      }
+
       function wireUi(wasm) {
+        const sidePanel = document.getElementById("side-panel");
+        const compactTabs = document.getElementById("compact-tabs");
+        const compactClose = document.getElementById("compact-panel-close");
+
         const tabGeneralBtn = document.getElementById("tab-general-btn");
         const tabLayersBtn = document.getElementById("tab-layers-btn");
         const tabCatalogBtn = document.getElementById("tab-catalog-btn");
@@ -623,6 +822,9 @@
         const uploadedInfo = document.getElementById("uploaded-info");
         const toggleGraticule = document.getElementById("toggle-graticule");
         const toggleRealSun = document.getElementById("toggle-real-sun");
+        const toggleAutoRotate = document.getElementById("toggle-auto-rotate");
+        const autoRotateSpeed = document.getElementById("auto-rotate-speed");
+        const autoRotateSpeedValue = document.getElementById("auto-rotate-speed-value");
         const citySize = document.getElementById("city-size");
         const citySizeValue = document.getElementById("city-size-value");
         const lineWidth = document.getElementById("line-width");
@@ -652,6 +854,8 @@
         const layerWorldBaseColor = document.getElementById("layer-world-base-color");
         const layerWorldBaseOpacity = document.getElementById("layer-world-base-opacity");
         const layerWorldBaseLift = document.getElementById("layer-world-base-lift");
+
+        const layerTerrain = document.getElementById("layer-terrain");
 
         const layerCities = document.getElementById("layer-cities");
         const layerCitiesColor = document.getElementById("layer-cities-color");
@@ -726,20 +930,29 @@
 
         function wireLayerControls() {
           function bind(id, checkbox, color, opacity, lift) {
-            checkbox.addEventListener("change", (e) => {
-              try { wasm.set_layer_visible(id, !!e.target.checked); } catch (err) { console.error(err); }
-            });
-            color.addEventListener("input", (e) => {
-              try { wasm.set_layer_color_hex(id, e.target.value); } catch (err) { console.error(err); }
-            });
-            opacity.addEventListener("input", (e) => {
-              try { wasm.set_layer_opacity(id, Number(e.target.value)); } catch (err) { console.error(err); }
-            });
-            lift.addEventListener("input", (e) => {
-              try { wasm.set_layer_lift(id, Number(e.target.value)); } catch (err) { console.error(err); }
-            });
+            if (checkbox) {
+              checkbox.addEventListener("change", (e) => {
+                try { wasm.set_layer_visible(id, !!e.target.checked); } catch (err) { console.error(err); }
+              });
+            }
+            if (color) {
+              color.addEventListener("input", (e) => {
+                try { wasm.set_layer_color_hex(id, e.target.value); } catch (err) { console.error(err); }
+              });
+            }
+            if (opacity) {
+              opacity.addEventListener("input", (e) => {
+                try { wasm.set_layer_opacity(id, Number(e.target.value)); } catch (err) { console.error(err); }
+              });
+            }
+            if (lift) {
+              lift.addEventListener("input", (e) => {
+                try { wasm.set_layer_lift(id, Number(e.target.value)); } catch (err) { console.error(err); }
+              });
+            }
           }
           bind("world_base", layerWorldBase, layerWorldBaseColor, layerWorldBaseOpacity, layerWorldBaseLift);
+          bind("terrain", layerTerrain, null, null, null);
           bind("cities", layerCities, layerCitiesColor, layerCitiesOpacity, layerCitiesLift);
           bind("air_corridors", layerCorridors, layerCorridorsColor, layerCorridorsOpacity, layerCorridorsLift);
           bind("regions", layerRegions, layerRegionsColor, layerRegionsOpacity, layerRegionsLift);
@@ -757,7 +970,7 @@
             try {
               const style = wasm.get_layer_style(id);
               if (!style) return;
-              checkbox.checked = !!style.visible;
+              if (checkbox) checkbox.checked = !!style.visible;
               if (color && style.color_hex) color.value = style.color_hex;
               if (opacity && style.opacity !== undefined) opacity.value = String(style.opacity);
               if (lift && style.lift !== undefined) lift.value = String(style.lift);
@@ -767,6 +980,7 @@
           }
 
           syncLayer("world_base", layerWorldBase, layerWorldBaseColor, layerWorldBaseOpacity, layerWorldBaseLift);
+          syncLayer("terrain", layerTerrain, null, null, null);
           syncLayer("cities", layerCities, layerCitiesColor, layerCitiesOpacity, layerCitiesLift);
           syncLayer("air_corridors", layerCorridors, layerCorridorsColor, layerCorridorsOpacity, layerCorridorsLift);
           syncLayer("regions", layerRegions, layerRegionsColor, layerRegionsOpacity, layerRegionsLift);
@@ -805,16 +1019,33 @@
           tabLayers.classList.toggle("hidden", !isLayers);
           tabCatalog.classList.toggle("hidden", !isCatalog);
           tabSettings.classList.toggle("hidden", !isSettings);
+
+          if (isCatalog) {
+            renderCatalog();
+          }
+          if (isCompactLayout() && sidePanel) {
+            sidePanel.classList.add("compact-open");
+          }
         }
 
         tabGeneralBtn.addEventListener("click", () => setTab("general"));
         tabLayersBtn.addEventListener("click", () => setTab("layers"));
-        tabCatalogBtn.addEventListener("click", () => {
-          setTab("catalog");
-          // Always refresh on open.
-          renderCatalog();
-        });
+        tabCatalogBtn.addEventListener("click", () => setTab("catalog"));
         tabSettingsBtn.addEventListener("click", () => setTab("settings"));
+
+        if (compactTabs) {
+          compactTabs.querySelectorAll("button[data-tab]").forEach((btn) => {
+            btn.addEventListener("click", () => {
+              const tab = btn.getAttribute("data-tab");
+              if (tab) setTab(tab);
+            });
+          });
+        }
+        if (compactClose && sidePanel) {
+          compactClose.addEventListener("click", () => {
+            sidePanel.classList.remove("compact-open");
+          });
+        }
 
         function applyUploadedSummary(summary, labelName) {
           const displayName = labelName || summary?.name || "uploaded";
@@ -971,10 +1202,10 @@
         // Initial render.
         renderCatalog();
 
-        let viewMode = "3d"; // 2d | 3d
+        let viewMode = "3d"; // 3d only (2d disabled)
 
         function applyViewMode(next) {
-          viewMode = next === "2d" ? "2d" : "3d";
+          viewMode = "3d";
           canvas2d.classList.toggle("hidden", viewMode !== "2d");
           canvas3d.classList.toggle("hidden", viewMode !== "3d");
           mode2dBtn?.classList.toggle("active", viewMode === "2d");
@@ -984,9 +1215,9 @@
           updateCompass();
         }
 
-        mode2dBtn?.addEventListener("click", () => applyViewMode("2d"));
+        mode2dBtn?.addEventListener("click", () => applyViewMode("3d"));
         mode3dBtn?.addEventListener("click", () => applyViewMode("3d"));
-        mapView?.addEventListener("click", () => applyViewMode(viewMode === "3d" ? "2d" : "3d"));
+        mapView?.addEventListener("click", () => applyViewMode("3d"));
 
         function activeCanvas() {
           return viewMode === "2d" ? canvas2d : canvas3d;
@@ -1128,7 +1359,7 @@
         function onWheel(e) {
           e.preventDefault();
           try {
-            wasm.camera_zoom(-e.deltaY);
+            wasm.camera_zoom(e.deltaY);
             updateCompass();
           } catch (err) {
             console.error("camera_zoom failed", err);
@@ -1325,6 +1556,42 @@
             console.error("set_real_time_sun_enabled failed", err);
           }
           syncMapToggles();
+        });
+
+        if (wasm.get_auto_rotate_settings) {
+          try {
+            const settings = wasm.get_auto_rotate_settings();
+            if (settings) {
+              if (toggleAutoRotate) toggleAutoRotate.checked = !!settings.enabled;
+              if (autoRotateSpeed && settings.speed_deg_per_s !== undefined) {
+                autoRotateSpeed.value = String(settings.speed_deg_per_s);
+              }
+              if (autoRotateSpeedValue && settings.speed_deg_per_s !== undefined) {
+                autoRotateSpeedValue.textContent = Number(settings.speed_deg_per_s).toFixed(4);
+              }
+            }
+          } catch (err) {
+            console.error("get_auto_rotate_settings failed", err);
+          }
+        }
+
+        toggleAutoRotate?.addEventListener("change", (e) => {
+          const enabled = !!e.target.checked;
+          try {
+            wasm.set_auto_rotate_enabled(enabled);
+          } catch (err) {
+            console.error("set_auto_rotate_enabled failed", err);
+          }
+        });
+
+        autoRotateSpeed?.addEventListener("input", (e) => {
+          const v = Number(e.target.value);
+          if (autoRotateSpeedValue) autoRotateSpeedValue.textContent = v.toFixed(4);
+          try {
+            wasm.set_auto_rotate_speed_deg_per_s(v);
+          } catch (err) {
+            console.error("set_auto_rotate_speed_deg_per_s failed", err);
+          }
         });
 
         function applyCitySize() {

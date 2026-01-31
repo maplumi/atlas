@@ -1,7 +1,13 @@
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
+
+use foundation::math::{Ecef, Vec3, ecef_to_geodetic};
+use layers::vector::VectorLayer;
+use scene::components::VectorGeometryKind;
+use serde::Serialize;
 
 fn main() {
     if let Err(e) = real_main() {
@@ -23,6 +29,7 @@ fn real_main() -> Result<(), String> {
         "pack" => cmd_pack(args),
         "manifest" => cmd_manifest(args),
         "unpack" => cmd_unpack(args),
+        "surface-tiles" => cmd_surface_tiles(args),
         _ => Err(usage()),
     }
 }
@@ -459,6 +466,300 @@ fn cmd_unpack(args: Vec<String>) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Debug, Serialize)]
+struct SurfaceTileset {
+    version: u32,
+    zoom_min: u32,
+    zoom_max: u32,
+    min_lon: f64,
+    max_lon: f64,
+    min_lat: f64,
+    max_lat: f64,
+    data_type: String,
+    coordinate_space: String,
+    tile_path_template: String,
+}
+
+fn cmd_surface_tiles(args: Vec<String>) -> Result<(), String> {
+    // atlas surface-tiles <input.geojson> <output_dir> [--zoom-min N] [--zoom-max N]
+    if args.len() < 2 {
+        return Err(usage());
+    }
+
+    let input = PathBuf::from(&args[0]);
+    let out_dir = PathBuf::from(&args[1]);
+
+    let mut zoom_min: u32 = 0;
+    let mut zoom_max: u32 = 4;
+
+    let mut i = 2;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--zoom-min" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--zoom-min requires a value".to_string());
+                }
+                zoom_min = args[i]
+                    .parse::<u32>()
+                    .map_err(|_| "--zoom-min must be an integer".to_string())?;
+            }
+            "--zoom-max" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--zoom-max requires a value".to_string());
+                }
+                zoom_max = args[i]
+                    .parse::<u32>()
+                    .map_err(|_| "--zoom-max must be an integer".to_string())?;
+            }
+            s if s.starts_with('-') => {
+                return Err(format!("unknown arg: {s}\n\n{}", usage()));
+            }
+            _ => {
+                return Err(format!("unexpected arg: {}\n\n{}", args[i], usage()));
+            }
+        }
+        i += 1;
+    }
+
+    if zoom_min > zoom_max {
+        return Err("zoom-min must be <= zoom-max".to_string());
+    }
+
+    let text = fs::read_to_string(&input).map_err(|e| format!("read {input:?}: {e}"))?;
+    let chunk = formats::VectorChunk::from_geojson_str(&text)
+        .map_err(|e| format!("decode geojson: {e}"))?;
+    let chunk = unwrap_antimeridian_chunk(&chunk);
+
+    let mut world = scene::World::new();
+    scene::prefabs::spawn_wgs84_globe(&mut world);
+    formats::ingest_vector_chunk(&mut world, &chunk, Some(VectorGeometryKind::Area));
+
+    let layer = VectorLayer::new(1);
+    let snap = layer.extract(&world);
+    let triangles = snap.area_triangles;
+
+    if triangles.is_empty() {
+        return Err("no polygons found in input".to_string());
+    }
+
+    fs::create_dir_all(&out_dir).map_err(|e| format!("create {out_dir:?}: {e}"))?;
+
+    let tileset = SurfaceTileset {
+        version: 1,
+        zoom_min,
+        zoom_max,
+        min_lon: -180.0,
+        max_lon: 180.0,
+        min_lat: -90.0,
+        max_lat: 90.0,
+        data_type: "f32-xyz".to_string(),
+        coordinate_space: "viewer".to_string(),
+        tile_path_template: "tiles/{z}/{x}/{y}.bin".to_string(),
+    };
+
+    let mut tiles: HashMap<(u32, u32, u32), Vec<[f32; 3]>> = HashMap::new();
+
+    for tri in triangles.chunks_exact(3) {
+        let a = tri[0];
+        let b = tri[1];
+        let c = tri[2];
+
+        let (lon_a, lat_a) = lon_lat_from_ecef(a);
+        let (lon_b, lat_b) = lon_lat_from_ecef(b);
+        let (lon_c, lat_c) = lon_lat_from_ecef(c);
+
+        let mut lat_min = lat_a.min(lat_b.min(lat_c));
+        let mut lat_max = lat_a.max(lat_b.max(lat_c));
+        lat_min = lat_min.clamp(tileset.min_lat, tileset.max_lat);
+        lat_max = lat_max.clamp(tileset.min_lat, tileset.max_lat);
+
+        let lon_ranges = antimeridian_lon_ranges([lon_a, lon_b, lon_c]);
+
+        let tri_view = [
+            ecef_vec3_to_viewer_f32(a),
+            ecef_vec3_to_viewer_f32(b),
+            ecef_vec3_to_viewer_f32(c),
+        ];
+
+        for z in zoom_min..=zoom_max {
+            let n = 2u32.pow(z);
+            let (y_min, y_max) = lat_range_to_tile_range(lat_min, lat_max, n, &tileset);
+
+            for (lon_min, lon_max) in &lon_ranges {
+                let (x_min, x_max) = lon_range_to_tile_range(*lon_min, *lon_max, n, &tileset);
+                for y in y_min..=y_max {
+                    for x in x_min..=x_max {
+                        tiles.entry((z, x, y)).or_default().extend(tri_view);
+                    }
+                }
+            }
+        }
+    }
+
+    for ((z, x, y), verts) in tiles {
+        if verts.is_empty() {
+            continue;
+        }
+
+        let tile_path = out_dir
+            .join("tiles")
+            .join(z.to_string())
+            .join(x.to_string())
+            .join(format!("{y}.bin"));
+        if let Some(parent) = tile_path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("create {parent:?}: {e}"))?;
+        }
+
+        let mut bytes: Vec<u8> = Vec::with_capacity(verts.len() * 3 * 4);
+        for v in verts {
+            bytes.extend_from_slice(&v[0].to_le_bytes());
+            bytes.extend_from_slice(&v[1].to_le_bytes());
+            bytes.extend_from_slice(&v[2].to_le_bytes());
+        }
+        fs::write(&tile_path, bytes).map_err(|e| format!("write {tile_path:?}: {e}"))?;
+    }
+
+    let tileset_path = out_dir.join("tileset.json");
+    let payload = serde_json::to_string_pretty(&tileset).map_err(|e| format!("json: {e}"))?;
+    fs::write(&tileset_path, payload).map_err(|e| format!("write {tileset_path:?}: {e}"))?;
+
+    eprintln!("wrote {}", tileset_path.display());
+    Ok(())
+}
+
+fn ecef_vec3_to_viewer_f32(p: Vec3) -> [f32; 3] {
+    [p.x as f32, p.z as f32, (-p.y) as f32]
+}
+
+fn lon_lat_from_ecef(p: Vec3) -> (f64, f64) {
+    let geo = ecef_to_geodetic(Ecef::new(p.x, p.y, p.z));
+    (geo.lon_rad.to_degrees(), geo.lat_rad.to_degrees())
+}
+
+fn antimeridian_lon_ranges(lons: [f64; 3]) -> Vec<(f64, f64)> {
+    let min_lon = lons[0].min(lons[1].min(lons[2]));
+    let max_lon = lons[0].max(lons[1].max(lons[2]));
+    let span = max_lon - min_lon;
+    if span <= 180.0 {
+        return vec![(min_lon, max_lon)];
+    }
+
+    let mut ranges = Vec::new();
+    let neg: Vec<f64> = lons.iter().copied().filter(|lon| *lon < 0.0).collect();
+    let pos: Vec<f64> = lons.iter().copied().filter(|lon| *lon >= 0.0).collect();
+    if !neg.is_empty() {
+        let min_neg = neg.iter().copied().fold(f64::INFINITY, f64::min);
+        ranges.push((min_neg, 180.0));
+    }
+    if !pos.is_empty() {
+        let max_pos = pos.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        ranges.push((-180.0, max_pos));
+    }
+
+    if ranges.is_empty() {
+        vec![(min_lon, max_lon)]
+    } else {
+        ranges
+    }
+}
+
+fn lon_range_to_tile_range(
+    lon_min: f64,
+    lon_max: f64,
+    n: u32,
+    tileset: &SurfaceTileset,
+) -> (u32, u32) {
+    let span = tileset.max_lon - tileset.min_lon;
+    let t_min = ((lon_min - tileset.min_lon) / span).clamp(0.0, 1.0 - 1e-9);
+    let t_max = ((lon_max - tileset.min_lon) / span).clamp(0.0, 1.0 - 1e-9);
+    let x_min = (t_min * n as f64).floor() as u32;
+    let x_max = (t_max * n as f64).floor() as u32;
+    (x_min.min(n - 1), x_max.min(n - 1))
+}
+
+fn lat_range_to_tile_range(
+    lat_min: f64,
+    lat_max: f64,
+    n: u32,
+    tileset: &SurfaceTileset,
+) -> (u32, u32) {
+    let span = tileset.max_lat - tileset.min_lat;
+    let t_min = ((tileset.max_lat - lat_max) / span).clamp(0.0, 1.0 - 1e-9);
+    let t_max = ((tileset.max_lat - lat_min) / span).clamp(0.0, 1.0 - 1e-9);
+    let y_min = (t_min * n as f64).floor() as u32;
+    let y_max = (t_max * n as f64).floor() as u32;
+    (y_min.min(n - 1), y_max.min(n - 1))
+}
+
+fn unwrap_antimeridian_chunk(chunk: &formats::VectorChunk) -> formats::VectorChunk {
+    use formats::{VectorChunk, VectorFeature, VectorGeometry};
+
+    let features = chunk
+        .features
+        .iter()
+        .map(|feat| {
+            let geometry = match &feat.geometry {
+                VectorGeometry::Polygon(rings) => {
+                    VectorGeometry::Polygon(rings.iter().map(|ring| unwrap_ring(ring)).collect())
+                }
+                VectorGeometry::MultiPolygon(polys) => VectorGeometry::MultiPolygon(
+                    polys
+                        .iter()
+                        .map(|poly| poly.iter().map(|ring| unwrap_ring(ring)).collect())
+                        .collect(),
+                ),
+                VectorGeometry::LineString(points) => {
+                    VectorGeometry::LineString(unwrap_ring(points))
+                }
+                VectorGeometry::MultiLineString(lines) => VectorGeometry::MultiLineString(
+                    lines.iter().map(|line| unwrap_ring(line)).collect(),
+                ),
+                other => other.clone(),
+            };
+
+            VectorFeature {
+                id: feat.id.clone(),
+                properties: feat.properties.clone(),
+                geometry,
+            }
+        })
+        .collect();
+
+    VectorChunk { features }
+}
+
+fn unwrap_ring(points: &[formats::GeoPoint]) -> Vec<formats::GeoPoint> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<formats::GeoPoint> = Vec::with_capacity(points.len());
+    let mut prev_lon = points[0].lon_deg;
+    out.push(formats::GeoPoint::new(prev_lon, points[0].lat_deg));
+
+    for p in points.iter().skip(1) {
+        let mut lon = p.lon_deg;
+        let mut delta = lon - prev_lon;
+        if delta > 180.0 {
+            lon -= 360.0;
+        } else if delta < -180.0 {
+            lon += 360.0;
+        }
+        delta = lon - prev_lon;
+        if delta > 180.0 {
+            lon -= 360.0;
+        } else if delta < -180.0 {
+            lon += 360.0;
+        }
+        prev_lon = lon;
+        out.push(formats::GeoPoint::new(lon, p.lat_deg));
+    }
+
+    out
+}
+
 fn to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -472,6 +773,6 @@ fn to_hex(bytes: &[u8]) -> String {
 fn usage() -> String {
     let exe = env::args().next().unwrap_or_else(|| "atlas".to_string());
     format!(
-        "Usage:\n  {exe} pack <input.geojson> <output.avc> [--blob-dir DIR] [--print-chunk-entry]\n  {exe} manifest <output_dir> <chunk.avc> [chunk2.avc ...] [--name NAME]\n  {exe} unpack <input.avc> <output.geojson>\n\nNotes:\n- Uses lon/lat quantization (1e-6 degrees).\n- Semantic round-trip: unpacked GeoJSON preserves geometry + properties, but JSON ordering may differ.\n- Blob storage is only active when --blob-dir is provided (stores original source bytes by content hash).\n- `manifest` writes a self-contained scene package directory with `scene.manifest.json`.\n"
+        "Usage:\n  {exe} pack <input.geojson> <output.avc> [--blob-dir DIR] [--print-chunk-entry]\n  {exe} manifest <output_dir> <chunk.avc> [chunk2.avc ...] [--name NAME]\n  {exe} unpack <input.avc> <output.geojson>\n  {exe} surface-tiles <input.geojson> <output_dir> [--zoom-min N] [--zoom-max N]\n\nNotes:\n- Uses lon/lat quantization (1e-6 degrees).\n- Semantic round-trip: unpacked GeoJSON preserves geometry + properties, but JSON ordering may differ.\n- Blob storage is only active when --blob-dir is provided (stores original source bytes by content hash).\n- `manifest` writes a self-contained scene package directory with `scene.manifest.json`.\n"
     )
 }

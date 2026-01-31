@@ -1,43 +1,15 @@
 #!/usr/bin/env python3
-import argparse
-import json
-import math
-import os
-import subprocess
 import sys
-from pathlib import Path
-
-GDAL_REQUIRED = ["gdalinfo", "gdalbuildvrt", "gdalwarp", "gdal_translate"]
 
 
-def run(cmd):
-    print("+", " ".join(str(c) for c in cmd))
-    subprocess.run(cmd, check=True)
+def main() -> int:
+    print("[dem] deprecated: the offline DEM tiling pipeline has been removed.")
+    print("[dem] use the streaming terrain backend instead (see docs/technical/terrain-streaming.md).")
+    return 1
 
 
-def require_gdal():
-    for tool in GDAL_REQUIRED:
-        if subprocess.call(["which", tool], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) != 0:
-            raise RuntimeError(f"Missing {tool} in PATH. Install GDAL CLI tools first.")
-
-
-def gdalinfo_stats(path: Path):
-    result = subprocess.run(
-        ["gdalinfo", "-stats", "-mm", "-json", str(path)],
-        check=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-    )
-    data = json.loads(result.stdout)
-    bands = data.get("bands") or []
-    if not bands:
-        return -1000.0, 9000.0
-    stats = bands[0].get("metadata", {}).get("", {})
-    min_v = stats.get("STATISTICS_MINIMUM")
-    max_v = stats.get("STATISTICS_MAXIMUM")
-    try:
-        return float(min_v), float(max_v)
+if __name__ == "__main__":
+    sys.exit(main())
     except Exception:
         return -1000.0, 9000.0
 

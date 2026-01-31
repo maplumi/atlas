@@ -90,6 +90,24 @@ struct TerrainTileset {
     sample_step: Option<u32>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[allow(dead_code)]
+struct SurfaceTileset {
+    #[serde(rename = "version")]
+    _version: u32,
+    zoom_min: u32,
+    zoom_max: u32,
+    #[serde(rename = "data_type")]
+    _data_type: String,
+    tile_path_template: String,
+    min_lon: f64,
+    max_lon: f64,
+    min_lat: f64,
+    max_lat: f64,
+    #[serde(default)]
+    coordinate_space: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct TerrainTile {
     z: u32,
@@ -101,7 +119,7 @@ struct TerrainTile {
 impl Default for CameraState {
     fn default() -> Self {
         Self {
-            yaw_rad: 0.6,
+            yaw_rad: 0.35,
             pitch_rad: 0.3,
             distance: 3.0 * WGS84_A,
             target: [0.0, 0.0, 0.0],
@@ -147,9 +165,20 @@ struct ViewerState {
 
     // CPU-side cached geometry in viewer coordinates.
     base_regions_positions: Option<Vec<[f32; 3]>>,
+    base_regions_mercator: Option<Vec<[f32; 2]>>,
     cities_centers: Option<Vec<[f32; 3]>>,
     corridors_positions: Option<Vec<[f32; 3]>>,
     regions_positions: Option<Vec<[f32; 3]>>,
+
+    base_world_loading: bool,
+    base_world_error: Option<String>,
+
+    surface_tileset: Option<SurfaceTileset>,
+    surface_positions: Option<Vec<[f32; 3]>>,
+    surface_zoom: Option<u32>,
+    surface_source: Option<String>,
+    surface_loading: bool,
+    surface_last_error: Option<String>,
 
     terrain_tileset: Option<TerrainTileset>,
     terrain_vertices: Option<Vec<OverlayVertex>>,
@@ -157,6 +186,11 @@ struct ViewerState {
     terrain_source: Option<String>,
     terrain_loading: bool,
     terrain_last_error: Option<String>,
+
+    auto_rotate_enabled: bool,
+    auto_rotate_speed_deg_per_s: f64,
+    auto_rotate_last_user_time_s: f64,
+    auto_rotate_resume_delay_s: f64,
 
     uploaded_name: Option<String>,
     uploaded_catalog_id: Option<String>,
@@ -204,7 +238,7 @@ thread_local! {
         city_marker_size: 4.0,
         line_width_px: 2.5,
 
-        base_regions_style: LayerStyle { visible: true, color: [0.12, 0.50, 0.85, 0.22], lift: 0.0002 },
+        base_regions_style: LayerStyle { visible: true, color: [0.20, 0.65, 0.35, 0.85], lift: 0.05 },
         cities_style: LayerStyle { visible: false, color: [1.0, 0.25, 0.25, 0.95], lift: 0.02 },
         corridors_style: LayerStyle { visible: false, color: [1.0, 0.85, 0.25, 0.90], lift: 0.0 },
         regions_style: LayerStyle { visible: false, color: [0.10, 0.90, 0.75, 0.30], lift: 0.0 },
@@ -212,7 +246,7 @@ thread_local! {
         uploaded_corridors_style: LayerStyle { visible: false, color: [0.85, 0.95, 0.60, 0.90], lift: 0.0 },
         uploaded_regions_style: LayerStyle { visible: false, color: [0.45, 0.75, 1.00, 0.25], lift: 0.0 },
         selection_style: LayerStyle { visible: true, color: [1.0, 1.0, 1.0, 0.95], lift: 0.02 },
-        terrain_style: LayerStyle { visible: true, color: [0.32, 0.72, 0.45, 0.95], lift: 0.0 },
+        terrain_style: LayerStyle { visible: false, color: [0.32, 0.72, 0.45, 0.95], lift: 0.0 },
 
         base_world: None,
         cities_world: None,
@@ -221,9 +255,20 @@ thread_local! {
         uploaded_world: None,
 
         base_regions_positions: None,
+        base_regions_mercator: None,
         cities_centers: None,
         corridors_positions: None,
         regions_positions: None,
+
+        base_world_loading: false,
+        base_world_error: None,
+
+        surface_tileset: None,
+        surface_positions: None,
+        surface_zoom: None,
+        surface_source: None,
+        surface_loading: false,
+        surface_last_error: None,
 
         terrain_tileset: None,
         terrain_vertices: None,
@@ -231,6 +276,11 @@ thread_local! {
         terrain_source: None,
         terrain_loading: false,
         terrain_last_error: None,
+
+        auto_rotate_enabled: true,
+        auto_rotate_speed_deg_per_s: 360.0 / 86400.0,
+        auto_rotate_last_user_time_s: 0.0,
+        auto_rotate_resume_delay_s: 1.2,
 
         uploaded_name: None,
         uploaded_catalog_id: None,
@@ -544,6 +594,15 @@ impl MercatorProjector {
             MERCATOR_MAX_LAT_DEG,
         );
         (lon, lat)
+    }
+
+    fn project_mercator_m(&self, x_m: f64, y_m: f64, w: f64, h: f64) -> (f64, f64) {
+        let dx = (x_m - self.center_x + 0.5 * self.world_width_m).rem_euclid(self.world_width_m)
+            - 0.5 * self.world_width_m;
+        let dy = y_m - self.center_y;
+        let x = w * 0.5 + dx * self.scale_px_per_m;
+        let y = h * 0.5 - dy * self.scale_px_per_m;
+        (x, y)
     }
 }
 
@@ -896,10 +955,31 @@ fn render_scene_2d() -> Result<(), JsValue> {
             ctx.fill();
         };
 
-        if state.base_regions_style.visible
-            && let Some(pos) = state.base_regions_positions.as_deref()
-        {
-            draw_poly_tris(pos, state.base_regions_style.color);
+        let draw_poly_tris_mercator = |pos: &[[f32; 2]], color: [f32; 4]| {
+            ctx_set_fill_style(ctx, &rgba_css(color));
+            ctx.begin_path();
+            for tri in pos.chunks_exact(3).take(200_000) {
+                let a = tri[0];
+                let b = tri[1];
+                let c = tri[2];
+                let (ax, ay) = projector.project_mercator_m(a[0] as f64, a[1] as f64, w, h);
+                let (bx, by) = projector.project_mercator_m(b[0] as f64, b[1] as f64, w, h);
+                let (cx, cy) = projector.project_mercator_m(c[0] as f64, c[1] as f64, w, h);
+
+                ctx.move_to(ax, ay);
+                ctx.line_to(bx, by);
+                ctx.line_to(cx, cy);
+                ctx.close_path();
+            }
+            ctx.fill();
+        };
+
+        if state.base_regions_style.visible {
+            if let Some(pos) = state.base_regions_mercator.as_deref() {
+                draw_poly_tris_mercator(pos, state.base_regions_style.color);
+            } else if let Some(pos) = state.base_regions_positions.as_deref() {
+                draw_poly_tris(pos, state.base_regions_style.color);
+            }
         }
         if state.regions_style.visible
             && let Some(pos) = state.regions_positions.as_deref()
@@ -1215,13 +1295,24 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
         let layer = VectorLayer::new(1);
 
         // Built-ins
-        s.base_regions_positions = s.base_world.as_ref().map(|w| {
-            let snap = layer.extract(w);
-            snap.area_triangles
-                .into_iter()
-                .map(ecef_vec3_to_viewer_f32)
-                .collect::<Vec<_>>()
-        });
+        if let Some(pos) = s.surface_positions.as_ref() {
+            let pos_vec = pos.clone();
+            let mercator = pos_vec.iter().map(viewer_to_mercator_m).collect();
+            s.base_regions_positions = Some(pos_vec);
+            s.base_regions_mercator = Some(mercator);
+        } else {
+            s.base_regions_positions = s.base_world.as_ref().map(|w| {
+                let snap = layer.extract(w);
+                snap.area_triangles
+                    .into_iter()
+                    .map(ecef_vec3_to_viewer_f32)
+                    .collect::<Vec<_>>()
+            });
+            s.base_regions_mercator = s
+                .base_regions_positions
+                .as_ref()
+                .map(|pos| pos.iter().map(viewer_to_mercator_m).collect());
+        }
         s.cities_centers = s.cities_world.as_ref().map(|w| {
             let snap = layer.extract(w);
             snap.points
@@ -1509,10 +1600,24 @@ fn init_canvas_2d_inner() -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn set_view_mode(mode: &str) -> Result<(), JsValue> {
-    let mode = ViewMode::from_str(mode);
+    let mode = match ViewMode::from_str(mode) {
+        ViewMode::TwoD => ViewMode::ThreeD,
+        ViewMode::ThreeD => ViewMode::ThreeD,
+    };
     with_state(|state| {
-        state.borrow_mut().view_mode = mode;
+        let mut s = state.borrow_mut();
+        s.view_mode = mode;
+        if mode == ViewMode::TwoD {
+            s.surface_positions = None;
+            s.surface_zoom = None;
+            s.base_regions_positions = None;
+        }
     });
+    if mode == ViewMode::TwoD {
+        ensure_surface_loaded();
+    } else if with_state(|state| state.borrow().terrain_style.visible) {
+        ensure_terrain_loaded();
+    }
     render_scene()
 }
 
@@ -1577,6 +1682,7 @@ pub fn set_camera_yaw_deg(yaw_deg: f64) -> Result<(), JsValue> {
 pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
+        s.auto_rotate_last_user_time_s = s.time_s;
         match s.view_mode {
             ViewMode::ThreeD => {
                 let speed = 0.005;
@@ -1605,6 +1711,7 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
 pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
+        s.auto_rotate_last_user_time_s = s.time_s;
         match s.view_mode {
             ViewMode::ThreeD => {
                 let cam = s.camera;
@@ -1621,8 +1728,8 @@ pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
 
                 let pan_scale = cam.distance * 0.002;
                 let delta = vec3_add(
-                    vec3_mul(right, -delta_x_px * pan_scale),
-                    vec3_mul(real_up, delta_y_px * pan_scale),
+                    vec3_mul(right, delta_x_px * pan_scale),
+                    vec3_mul(real_up, -delta_y_px * pan_scale),
                 );
                 s.camera.target = vec3_add(s.camera.target, delta);
             }
@@ -1647,6 +1754,7 @@ pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
 pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
+        s.auto_rotate_last_user_time_s = s.time_s;
         match s.view_mode {
             ViewMode::ThreeD => {
                 let cam = s.camera;
@@ -1690,7 +1798,7 @@ pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
                 s.camera.distance = dist;
             }
             ViewMode::TwoD => {
-                let zoom = (wheel_delta_y * 0.0015).exp();
+                let zoom = (-wheel_delta_y * 0.0015).exp();
                 s.camera_2d.zoom = clamp(s.camera_2d.zoom * zoom, 0.2, 200.0);
             }
         }
@@ -1754,7 +1862,7 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn load_base_world() {
-    ensure_base_world_loaded();
+    ensure_surface_loaded();
 }
 
 #[wasm_bindgen]
@@ -1969,10 +2077,19 @@ async fn fetch_geojson_chunk(url: &str) -> Result<formats::VectorChunk, JsValue>
 }
 
 fn ensure_base_world_loaded() {
-    let needs_load = with_state(|state| state.borrow().base_world.is_none());
+    let needs_load = with_state(|state| {
+        let s = state.borrow();
+        s.base_world.is_none() && s.surface_positions.is_none() && !s.surface_loading
+    });
     if !needs_load {
         return;
     }
+
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.base_world_loading = true;
+        s.base_world_error = None;
+    });
 
     spawn_local(async move {
         let chunk = match fetch_geojson_chunk("assets/world.json").await {
@@ -1982,9 +2099,16 @@ fn ensure_base_world_loaded() {
                     "Failed to fetch base world: {:?}",
                     err
                 )));
+                with_state(|state| {
+                    let mut s = state.borrow_mut();
+                    s.base_world_loading = false;
+                    s.base_world_error = Some("base world load failed".to_string());
+                });
                 return;
             }
         };
+
+        let chunk = unwrap_antimeridian_chunk(&chunk);
 
         let (_points, _lines, polys) = count_chunk_features(&chunk);
         let world = world_from_vector_chunk(&chunk, Some(VectorGeometryKind::Area));
@@ -1994,6 +2118,8 @@ fn ensure_base_world_loaded() {
             let mut s = state.borrow_mut();
             s.base_world = Some(world);
             s.base_count_polys = polys;
+            s.base_world_loading = false;
+            s.surface_last_error = None;
         });
 
         let _ = rebuild_overlays_and_upload();
@@ -2001,10 +2127,77 @@ fn ensure_base_world_loaded() {
     });
 }
 
+fn unwrap_antimeridian_chunk(chunk: &formats::VectorChunk) -> formats::VectorChunk {
+    use formats::{VectorChunk, VectorFeature, VectorGeometry};
+
+    let features = chunk
+        .features
+        .iter()
+        .map(|feat| {
+            let geometry = match &feat.geometry {
+                VectorGeometry::Polygon(rings) => {
+                    VectorGeometry::Polygon(rings.iter().map(|ring| unwrap_ring(ring)).collect())
+                }
+                VectorGeometry::MultiPolygon(polys) => VectorGeometry::MultiPolygon(
+                    polys
+                        .iter()
+                        .map(|poly| poly.iter().map(|ring| unwrap_ring(ring)).collect())
+                        .collect(),
+                ),
+                VectorGeometry::LineString(points) => {
+                    VectorGeometry::LineString(unwrap_ring(points))
+                }
+                VectorGeometry::MultiLineString(lines) => VectorGeometry::MultiLineString(
+                    lines.iter().map(|line| unwrap_ring(line)).collect(),
+                ),
+                other => other.clone(),
+            };
+
+            VectorFeature {
+                id: feat.id.clone(),
+                properties: feat.properties.clone(),
+                geometry,
+            }
+        })
+        .collect();
+
+    VectorChunk { features }
+}
+
+fn unwrap_ring(points: &[formats::GeoPoint]) -> Vec<formats::GeoPoint> {
+    if points.is_empty() {
+        return Vec::new();
+    }
+
+    let mut out: Vec<formats::GeoPoint> = Vec::with_capacity(points.len());
+    let mut prev_lon = points[0].lon_deg;
+    out.push(formats::GeoPoint::new(prev_lon, points[0].lat_deg));
+
+    for p in points.iter().skip(1) {
+        let mut lon = p.lon_deg;
+        let mut delta = lon - prev_lon;
+        if delta > 180.0 {
+            lon -= 360.0;
+        } else if delta < -180.0 {
+            lon += 360.0;
+        }
+        delta = lon - prev_lon;
+        if delta > 180.0 {
+            lon -= 360.0;
+        } else if delta < -180.0 {
+            lon += 360.0;
+        }
+        prev_lon = lon;
+        out.push(formats::GeoPoint::new(lon, p.lat_deg));
+    }
+
+    out
+}
+
 fn ensure_builtin_layer_loaded(id: &str) {
     match id {
         "world_base" => {
-            ensure_base_world_loaded();
+            ensure_surface_loaded();
         }
         "cities" => {
             let needs_load = with_state(|state| state.borrow().cities_world.is_none());
@@ -2105,6 +2298,36 @@ fn backend_base_url() -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+fn surface_tileset_url(base: &str) -> String {
+    format!("{base}/surface/tileset.json")
+}
+
+fn surface_tile_url(
+    base: Option<&str>,
+    tileset: &SurfaceTileset,
+    z: u32,
+    x: u32,
+    y: u32,
+) -> String {
+    let path = tileset
+        .tile_path_template
+        .replace("{z}", &z.to_string())
+        .replace("{x}", &x.to_string())
+        .replace("{y}", &y.to_string());
+
+    match base {
+        Some(b) => {
+            let prefix = if b.ends_with('/') {
+                b.to_string()
+            } else {
+                format!("{b}/")
+            };
+            join_url(&prefix, &format!("surface/{path}"))
+        }
+        None => join_url("assets/surface/", &path),
+    }
+}
+
 fn terrain_tileset_url() -> String {
     if let Some(base) = backend_base_url() {
         format!("{base}/terrain/tileset.json")
@@ -2154,6 +2377,17 @@ fn decode_f32_le(bytes: &[u8]) -> Vec<f32> {
     let mut out = Vec::with_capacity(bytes.len() / 4);
     for chunk in bytes.chunks_exact(4) {
         out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    out
+}
+
+fn decode_f32_vec3(bytes: &[u8]) -> Vec<[f32; 3]> {
+    let mut out = Vec::with_capacity(bytes.len() / 12);
+    for chunk in bytes.chunks_exact(12) {
+        let x = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        let y = f32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+        let z = f32::from_le_bytes([chunk[8], chunk[9], chunk[10], chunk[11]]);
+        out.push([x, y, z]);
     }
     out
 }
@@ -2280,7 +2514,133 @@ fn desired_terrain_zoom(distance: f64, tileset: &TerrainTileset) -> u32 {
     z as u32
 }
 
+fn desired_surface_zoom(distance: f64, tileset: &SurfaceTileset) -> u32 {
+    let ratio = (WGS84_A / distance.max(1.0)).max(0.01);
+    let z = ratio.log2().floor() as i32 + 1;
+    let z = z.clamp(tileset.zoom_min as i32, tileset.zoom_max as i32);
+    z as u32
+}
+
+fn desired_surface_zoom_for_mode(mode: ViewMode, distance: f64, tileset: &SurfaceTileset) -> u32 {
+    if mode == ViewMode::TwoD {
+        return tileset.zoom_min;
+    }
+    desired_surface_zoom(distance, tileset)
+}
+
+fn ensure_surface_loaded() {
+    let surface_enabled = with_state(|state| state.borrow().base_regions_style.visible);
+    if !surface_enabled {
+        return;
+    }
+
+    let Some(backend) = backend_base_url() else {
+        with_state(|state| {
+            let mut s = state.borrow_mut();
+            s.surface_loading = false;
+            s.surface_last_error = Some("backend offline; using world.json".to_string());
+        });
+        ensure_base_world_loaded();
+        return;
+    };
+
+    let source = backend.clone();
+    let tileset_url = surface_tileset_url(&backend);
+
+    let should_load = with_state(|state| {
+        let s = state.borrow();
+        !s.surface_loading
+            && (s.surface_tileset.is_none()
+                || s.surface_tileset
+                    .as_ref()
+                    .map(|ts| desired_surface_zoom_for_mode(s.view_mode, s.camera.distance, ts))
+                    != s.surface_zoom
+                || s.surface_source.as_deref() != Some(&source))
+    });
+
+    if !should_load {
+        return;
+    }
+
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.surface_loading = true;
+        s.surface_last_error = None;
+    });
+
+    spawn_local(async move {
+        let tileset = match fetch_surface_tileset(&tileset_url).await {
+            Ok(ts) => ts,
+            Err(err) => {
+                with_state(|state| {
+                    let mut s = state.borrow_mut();
+                    s.surface_loading = false;
+                    s.surface_last_error = Some(
+                        err.as_string()
+                            .unwrap_or_else(|| "surface tileset error".to_string()),
+                    );
+                });
+                ensure_base_world_loaded();
+                return;
+            }
+        };
+
+        let zoom = desired_surface_zoom_for_mode(
+            with_state(|state| state.borrow().view_mode),
+            with_state(|state| state.borrow().camera.distance),
+            &tileset,
+        );
+        let n = 2u32.pow(zoom);
+        let mut positions: Vec<[f32; 3]> = Vec::new();
+        let backend = Some(backend);
+
+        for y in 0..n {
+            for x in 0..n {
+                let url = surface_tile_url(backend.as_deref(), &tileset, zoom, x, y);
+                let bytes = match fetch_binary(&url).await {
+                    Ok(b) => b,
+                    Err(_) => continue,
+                };
+                let mut verts = decode_f32_vec3(&bytes);
+                if !verts.is_empty() {
+                    positions.append(&mut verts);
+                }
+            }
+        }
+
+        if positions.is_empty() {
+            with_state(|state| {
+                let mut s = state.borrow_mut();
+                s.surface_loading = false;
+                s.surface_last_error = Some("no surface tiles".to_string());
+            });
+            ensure_base_world_loaded();
+            return;
+        }
+
+        let tri_count = positions.len() / 3;
+        with_state(|state| {
+            let mut s = state.borrow_mut();
+            s.surface_tileset = Some(tileset);
+            s.surface_positions = Some(positions);
+            s.surface_zoom = Some(zoom);
+            s.surface_source = Some(source);
+            s.surface_loading = false;
+            s.base_world = None;
+            s.base_count_polys = tri_count;
+        });
+
+        let _ = rebuild_overlays_and_upload();
+        let _ = render_scene();
+    });
+}
+
 fn ensure_terrain_loaded() {
+    let terrain_enabled = with_state(|state| state.borrow().terrain_style.visible);
+    if !terrain_enabled {
+        return;
+    }
+
     let (should_load, tileset_url, source) = with_state(|state| {
         let s = state.borrow();
         let tileset_url = terrain_tileset_url();
@@ -2406,6 +2766,102 @@ pub fn get_layer_style(id: &str) -> Result<JsValue, JsValue> {
 }
 
 #[wasm_bindgen]
+pub fn get_terrain_client_status() -> JsValue {
+    let (enabled, loading, last_error, zoom, source, tileset_loaded) = with_state(|state| {
+        let s = state.borrow();
+        (
+            s.terrain_style.visible,
+            s.terrain_loading,
+            s.terrain_last_error.clone(),
+            s.terrain_zoom,
+            s.terrain_source.clone(),
+            s.terrain_tileset.is_some(),
+        )
+    });
+
+    let o = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("enabled"),
+        &JsValue::from_bool(enabled),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("loading"),
+        &JsValue::from_bool(loading),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("tileset_loaded"),
+        &JsValue::from_bool(tileset_loaded),
+    );
+    if let Some(z) = zoom {
+        let _ = js_sys::Reflect::set(&o, &JsValue::from_str("zoom"), &JsValue::from_f64(z as f64));
+    }
+    if let Some(src) = source {
+        let _ = js_sys::Reflect::set(&o, &JsValue::from_str("source"), &JsValue::from_str(&src));
+    }
+    if let Some(err) = last_error {
+        let _ = js_sys::Reflect::set(
+            &o,
+            &JsValue::from_str("last_error"),
+            &JsValue::from_str(&err),
+        );
+    }
+    o.into()
+}
+
+#[wasm_bindgen]
+pub fn get_surface_status() -> JsValue {
+    let (loaded, loading, tileset_loaded, zoom, source, error) = with_state(|state| {
+        let s = state.borrow();
+        let loaded = s.surface_positions.is_some() || s.base_world.is_some();
+        let loading = s.surface_loading || s.base_world_loading;
+        let tileset_loaded = s.surface_tileset.is_some();
+        let zoom = s.surface_zoom;
+        let source = if s.surface_positions.is_some() {
+            s.surface_source.clone()
+        } else if s.base_world.is_some() {
+            Some("world.json".to_string())
+        } else {
+            None
+        };
+        let error = s
+            .surface_last_error
+            .clone()
+            .or_else(|| s.base_world_error.clone());
+        (loaded, loading, tileset_loaded, zoom, source, error)
+    });
+
+    let o = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("loaded"),
+        &JsValue::from_bool(loaded),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("loading"),
+        &JsValue::from_bool(loading),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("tileset_loaded"),
+        &JsValue::from_bool(tileset_loaded),
+    );
+    if let Some(z) = zoom {
+        let _ = js_sys::Reflect::set(&o, &JsValue::from_str("zoom"), &JsValue::from_f64(z as f64));
+    }
+    if let Some(src) = source {
+        let _ = js_sys::Reflect::set(&o, &JsValue::from_str("source"), &JsValue::from_str(&src));
+    }
+    if let Some(err) = error {
+        let _ = js_sys::Reflect::set(&o, &JsValue::from_str("error"), &JsValue::from_str(&err));
+    }
+    o.into()
+}
+
+#[wasm_bindgen]
 pub fn get_builtin_layers() -> Result<JsValue, JsValue> {
     let arr = js_sys::Array::new();
     with_state(|state| {
@@ -2455,6 +2911,48 @@ pub fn get_city_marker_size() -> f64 {
 #[wasm_bindgen]
 pub fn get_line_width_px() -> f64 {
     with_state(|state| state.borrow().line_width_px as f64)
+}
+
+#[wasm_bindgen]
+pub fn get_auto_rotate_settings() -> JsValue {
+    let (enabled, speed) = with_state(|state| {
+        let s = state.borrow();
+        (s.auto_rotate_enabled, s.auto_rotate_speed_deg_per_s)
+    });
+
+    let o = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("enabled"),
+        &JsValue::from_bool(enabled),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("speed_deg_per_s"),
+        &JsValue::from_f64(speed),
+    );
+    o.into()
+}
+
+#[wasm_bindgen]
+pub fn set_auto_rotate_enabled(enabled: bool) {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.auto_rotate_enabled = enabled;
+        s.auto_rotate_last_user_time_s = s.time_s;
+    });
+}
+
+#[wasm_bindgen]
+pub fn set_auto_rotate_speed_deg_per_s(speed: f64) {
+    if !speed.is_finite() {
+        return;
+    }
+    let clamped = speed.clamp(0.0, 2.0);
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.auto_rotate_speed_deg_per_s = clamped;
+    });
 }
 
 #[wasm_bindgen]
@@ -2683,6 +3181,13 @@ fn world_to_lon_lat_deg(p: [f64; 3]) -> (f64, f64) {
     let ecef = foundation::math::Ecef::new(p[0], -p[2], p[1]);
     let geo = ecef_to_geodetic(ecef);
     (geo.lon_rad.to_degrees(), geo.lat_rad.to_degrees())
+}
+
+fn viewer_to_mercator_m(p: &[f32; 3]) -> [f32; 2] {
+    let (lon, lat) = world_to_lon_lat_deg([p[0] as f64, p[1] as f64, p[2] as f64]);
+    let x = mercator_x_m(lon);
+    let y = mercator_y_m(lat);
+    [x as f32, y as f32]
 }
 
 fn ray_hit_globe(
@@ -3524,13 +4029,29 @@ pub fn advance_frame() -> Result<f64, JsValue> {
             s.time_s = 0.0;
             s.frame_index = 0;
         }
+
+        if s.view_mode == ViewMode::ThreeD && s.auto_rotate_enabled {
+            let idle = s.time_s - s.auto_rotate_last_user_time_s;
+            if idle >= s.auto_rotate_resume_delay_s {
+                let speed_rad = s.auto_rotate_speed_deg_per_s.to_radians();
+                s.camera.yaw_rad =
+                    (s.camera.yaw_rad + speed_rad * s.dt_s).rem_euclid(2.0 * std::f64::consts::PI);
+            }
+        }
     });
 
     if with_state(|state| {
         let s = state.borrow();
-        s.view_mode == ViewMode::ThreeD && s.frame_index % 120 == 0
+        s.view_mode == ViewMode::ThreeD && s.terrain_style.visible && s.frame_index % 120 == 0
     }) {
         ensure_terrain_loaded();
+    }
+
+    if with_state(|state| {
+        let s = state.borrow();
+        s.base_regions_style.visible && s.frame_index % 180 == 0
+    }) {
+        ensure_surface_loaded();
     }
 
     render_scene()?;
@@ -3589,12 +4110,29 @@ async fn init_wgpu_inner() -> Result<(), JsValue> {
         }
     });
 
-    ensure_terrain_loaded();
+    if with_state(|state| state.borrow().terrain_style.visible) {
+        ensure_terrain_loaded();
+    }
+    if with_state(|state| state.borrow().base_regions_style.visible) {
+        ensure_surface_loaded();
+    }
 
     render_scene()
 }
 
 async fn fetch_manifest(url: &str) -> Result<SceneManifest, JsValue> {
+    let resp = Request::get(url)
+        .send()
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    serde_json::from_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))
+}
+
+async fn fetch_surface_tileset(url: &str) -> Result<SurfaceTileset, JsValue> {
     let resp = Request::get(url)
         .send()
         .await

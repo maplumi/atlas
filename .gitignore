@@ -33,3 +33,7 @@ Thumbs.db
 
 # Local terrain data (generated)
 /data/terrain/
+
+# Generated surface tiles (do not commit)
+/crates/apps/web/assets/surface/
+/data/terrain/surface/
