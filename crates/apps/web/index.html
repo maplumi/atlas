@@ -816,13 +816,32 @@
         wasm.init_wgpu();
         // preload base world layer
         try { wasm.load_base_world?.(); } catch (err) { console.error("load_base_world failed", err); }
-        detectBackendAvailability();
+        detectBackendAvailability(wasm);
         startSurfaceStatusPolling(wasm);
         startTerrainClientStatusPolling(wasm);
         startAnimation(wasm);
       }
 
-      async function detectBackendAvailability() {
+      function getTerrainPreference() {
+        try {
+          const v = String(localStorage.getItem("atlas-terrain-enabled") || "").trim().toLowerCase();
+          if (v === "true") return true;
+          if (v === "false") return false;
+        } catch (_) {
+          // ignore
+        }
+        return null;
+      }
+
+      function setTerrainPreference(enabled) {
+        try {
+          localStorage.setItem("atlas-terrain-enabled", enabled ? "true" : "false");
+        } catch (_) {
+          // ignore
+        }
+      }
+
+      async function detectBackendAvailability(wasm) {
         const override = window.ATLAS_BACKEND_URL || "";
         const host = window.location.hostname || "localhost";
         const scheme = window.location.protocol === "https:" ? "https" : "http";
@@ -842,6 +861,18 @@
               window.__atlasStacUrl = `${base}/stac`;
               setStatus(`Backend: connected (${base})`);
               startTerrainStatusPolling(base);
+
+              // If a backend is available, enable streaming terrain by default.
+              // Persist the choice so users can opt out.
+              const pref = getTerrainPreference();
+              const shouldEnableTerrain = pref === null ? true : !!pref;
+              if (pref === null) setTerrainPreference(true);
+
+              if (shouldEnableTerrain) {
+                try { wasm?.set_layer_visible?.("terrain", true); } catch (err) { console.error("enable terrain failed", err); }
+                const cb = document.getElementById("layer-terrain");
+                if (cb) cb.checked = true;
+              }
               return;
             }
           } catch (err) {
@@ -1175,6 +1206,13 @@
         }
 
         wireLayerControls();
+
+        // Persist terrain preference (on/off) across reloads.
+        if (layerTerrain) {
+          layerTerrain.addEventListener("change", (e) => {
+            setTerrainPreference(!!e.target.checked);
+          });
+        }
         syncSymbologyControls();
 
         function syncSymbologyControls() {
