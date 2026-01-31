@@ -187,8 +187,10 @@ struct TerrainTile {
 impl Default for CameraState {
     fn default() -> Self {
         Self {
-            yaw_rad: 0.35,
-            pitch_rad: 0.3,
+            // Default view: center Africa (roughly central longitude/latitude).
+            // In this viewer, yaw ~ longitude and pitch ~ latitude for the point facing the camera.
+            yaw_rad: 20f64.to_radians(),
+            pitch_rad: 5f64.to_radians(),
             distance: 3.0 * WGS84_A,
             target: [0.0, 0.0, 0.0],
         }
@@ -308,14 +310,14 @@ thread_local! {
         city_marker_size: 4.0,
         line_width_px: 2.5,
 
-        base_regions_style: LayerStyle { visible: true, color: [0.20, 0.65, 0.35, 0.85], lift: 0.05 },
-        cities_style: LayerStyle { visible: false, color: [1.0, 0.25, 0.25, 0.95], lift: 0.02 },
+        base_regions_style: LayerStyle { visible: true, color: [0.20, 0.65, 0.35, 0.85], lift: 0.0 },
+        cities_style: LayerStyle { visible: false, color: [1.0, 0.25, 0.25, 0.95], lift: 0.0 },
         corridors_style: LayerStyle { visible: false, color: [1.0, 0.85, 0.25, 0.90], lift: 0.0 },
         regions_style: LayerStyle { visible: false, color: [0.10, 0.90, 0.75, 0.30], lift: 0.0 },
-        uploaded_points_style: LayerStyle { visible: false, color: [0.60, 0.95, 1.00, 0.95], lift: 0.02 },
+        uploaded_points_style: LayerStyle { visible: false, color: [0.60, 0.95, 1.00, 0.95], lift: 0.0 },
         uploaded_corridors_style: LayerStyle { visible: false, color: [0.85, 0.95, 0.60, 0.90], lift: 0.0 },
         uploaded_regions_style: LayerStyle { visible: false, color: [0.45, 0.75, 1.00, 0.25], lift: 0.0 },
-        selection_style: LayerStyle { visible: true, color: [1.0, 1.0, 1.0, 0.95], lift: 0.02 },
+        selection_style: LayerStyle { visible: true, color: [1.0, 1.0, 1.0, 0.95], lift: 0.0 },
         terrain_style: LayerStyle { visible: false, color: [0.32, 0.72, 0.45, 0.95], lift: 0.0 },
 
         base_world: None,
@@ -348,7 +350,7 @@ thread_local! {
         terrain_last_error: None,
 
         auto_rotate_enabled: true,
-        auto_rotate_speed_deg_per_s: 360.0 / 86400.0,
+        auto_rotate_speed_deg_per_s: 0.15,
         auto_rotate_last_user_time_s: 0.0,
         auto_rotate_resume_delay_s: 1.2,
 
@@ -815,10 +817,12 @@ fn camera_view_proj(camera: CameraState, canvas_width: f64, canvas_height: f64) 
         (canvas_width / canvas_height).max(1e-6)
     };
 
+    // Viewer coordinate system uses Y as north (ECEF Z) and Z as -east (negative ECEF Y).
+    // Keep camera yaw aligned with geodetic longitude (east-positive) in this space.
     let dir = [
         camera.pitch_rad.cos() * camera.yaw_rad.cos(),
         camera.pitch_rad.sin(),
-        camera.pitch_rad.cos() * camera.yaw_rad.sin(),
+        -camera.pitch_rad.cos() * camera.yaw_rad.sin(),
     ];
     let eye = vec3_add(camera.target, vec3_mul(dir, camera.distance));
     let view = mat4_look_at_rh(eye, camera.target, [0.0, 1.0, 0.0]);
@@ -1214,7 +1218,9 @@ fn unit_from_lon_lat_deg(lon_deg: f64, lat_deg: f64) -> [f64; 3] {
     let lon = lon_deg.to_radians();
     let lat = lat_deg.to_radians();
     let cos_lat = lat.cos();
-    [cos_lat * lon.cos(), lat.sin(), cos_lat * lon.sin()]
+    // Viewer coordinates are a permuted ECEF: viewer = (x, z, -y).
+    // This means +lon (east) corresponds to -Z in viewer space.
+    [cos_lat * lon.cos(), lat.sin(), -cos_lat * lon.sin()]
 }
 
 fn slerp_unit(a: [f64; 3], b: [f64; 3], t: f64) -> [f64; 3] {
@@ -1756,11 +1762,19 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
         s.auto_rotate_last_user_time_s = s.time_s;
         match s.view_mode {
             ViewMode::ThreeD => {
-                let speed = 0.005;
+                // Scale orbit sensitivity to viewport size so drag feels consistent.
+                // Roughly: dragging across the shorter side ~= 180 degrees.
+                let min_dim = s.canvas_width.min(s.canvas_height).max(1.0);
+                let speed = std::f64::consts::PI / min_dim;
                 // Screen drag direction should feel like you're "pushing" the globe.
                 // Up => rotate northward, left => clockwise.
                 s.camera.yaw_rad -= delta_x_px * speed;
                 s.camera.pitch_rad = clamp(s.camera.pitch_rad - delta_y_px * speed, -1.55, 1.55);
+
+                // Keep yaw bounded to avoid precision loss over time.
+                s.camera.yaw_rad = (s.camera.yaw_rad + std::f64::consts::PI)
+                    .rem_euclid(2.0 * std::f64::consts::PI)
+                    - std::f64::consts::PI;
             }
             ViewMode::TwoD => {
                 // In 2D, treat orbit as pan.
@@ -1792,7 +1806,7 @@ pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
                 let dir = [
                     cam.pitch_rad.cos() * cam.yaw_rad.cos(),
                     cam.pitch_rad.sin(),
-                    cam.pitch_rad.cos() * cam.yaw_rad.sin(),
+                    -cam.pitch_rad.cos() * cam.yaw_rad.sin(),
                 ];
                 let forward = vec3_normalize(vec3_mul(dir, -1.0));
                 let up = [0.0, 1.0, 0.0];
@@ -1842,7 +1856,7 @@ pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
                 let dir_cam = [
                     cam.pitch_rad.cos() * cam.yaw_rad.cos(),
                     cam.pitch_rad.sin(),
-                    cam.pitch_rad.cos() * cam.yaw_rad.sin(),
+                    -cam.pitch_rad.cos() * cam.yaw_rad.sin(),
                 ];
                 let dir_cam = vec3_normalize(dir_cam);
                 let eye = vec3_add(cam.target, vec3_mul(dir_cam, dist));
@@ -3306,7 +3320,7 @@ fn ray_hit_globe(
     let dir_cam = [
         camera.pitch_rad.cos() * camera.yaw_rad.cos(),
         camera.pitch_rad.sin(),
-        camera.pitch_rad.cos() * camera.yaw_rad.sin(),
+        -camera.pitch_rad.cos() * camera.yaw_rad.sin(),
     ];
     let eye = vec3_add(camera.target, vec3_mul(dir_cam, camera.distance));
     let forward = vec3_normalize(vec3_sub(camera.target, eye));

@@ -99,39 +99,58 @@
         height: 100%;
         position: relative;
         display: block;
+        --panel-width: 320px;
       }
       #side-panel {
-        background: var(--panel-bg);
-        border-left: 1px solid var(--panel-border);
-        padding: 16px;
+        background: var(--controls-bg);
+        border: 1px solid var(--controls-border);
+        backdrop-filter: blur(10px);
+        border-radius: 12px;
+        box-shadow: 0 12px 24px var(--shadow);
+        padding: 14px;
         display: flex;
         flex-direction: column;
-        gap: 16px;
-        position: fixed;
-        top: 0;
-        right: 0;
-        height: 100vh;
-        width: min(88vw, 380px);
+        gap: 14px;
+        position: absolute;
+        top: 12px;
+        left: 12px;
+        right: auto;
+        height: calc(100vh - 24px);
+        width: var(--panel-width);
         max-width: 600px;
         overflow-y: auto;
         overflow-x: hidden;
-        transform: translateX(105%);
-        transition: transform 0.2s ease;
-        z-index: 25;
-        box-shadow: 0 12px 24px var(--shadow);
-      }
-      #side-panel.compact-open {
-        transform: translateX(0);
+        transition: transform 0.2s ease, width 0.15s ease;
+        z-index: 20;
       }
       #panel-toggle {
-        display: none;
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        width: 34px;
+        height: 34px;
+        padding: 0;
+        border-radius: 10px;
+        border: 1px solid var(--btn-border);
+        background: var(--btn-bg);
+        color: var(--btn-fg);
+        cursor: pointer;
+        display: grid;
+        place-items: center;
       }
       #panel-toggle:hover {
         background: var(--btn-hover-bg);
         border-color: var(--accent-border);
       }
       #panel-resize-handle {
-        display: none;
+        display: block;
+        position: absolute;
+        top: 10px;
+        right: -6px;
+        width: 12px;
+        height: calc(100% - 20px);
+        cursor: ew-resize;
+        border-radius: 8px;
       }
       #panel-resize-handle:hover {
         background: rgba(59, 130, 246, 0.3);
@@ -144,6 +163,19 @@
         gap: 8px;
       }
       .panel-tabs {
+        display: flex;
+      }
+      #side-panel.collapsed {
+        width: 52px !important;
+        padding: 10px;
+        overflow: hidden;
+      }
+      #side-panel.collapsed #panel-resize-handle {
+        display: none;
+      }
+      #side-panel.collapsed .panel-tabs,
+      #side-panel.collapsed .tab-page,
+      #side-panel.collapsed #compact-panel-close {
         display: none;
       }
       .tab-btn {
@@ -188,11 +220,11 @@
         display: flex;
         flex-direction: column;
         gap: 8px;
-        padding: 10px;
-        border: 1px solid var(--controls-border);
-        background: var(--controls-bg);
-        backdrop-filter: blur(8px);
-        border-radius: 12px;
+        padding: 0;
+        border: none;
+        background: transparent;
+        backdrop-filter: none;
+        border-radius: 0;
         user-select: none;
       }
       .map-controls-row {
@@ -200,13 +232,17 @@
         gap: 8px;
         align-items: center;
         justify-content: flex-end;
-        padding-bottom: 4px;
-        border-bottom: 1px solid color-mix(in srgb, var(--panel-border) 75%, transparent);
-        margin-bottom: 2px;
+        padding-bottom: 0;
+        border-bottom: none;
+        margin-bottom: 0;
       }
       .map-controls[data-pos="left"] {
         left: 12px;
         right: auto;
+      }
+      .map-controls[data-pos="right"] {
+        right: 12px;
+        left: auto;
       }
       .map-controls .btn {
         width: 38px;
@@ -218,6 +254,16 @@
         place-items: center;
         font-weight: 800;
         line-height: 1;
+        background: transparent;
+        border: 1px solid var(--controls-border);
+        box-shadow: 0 12px 24px var(--shadow);
+      }
+      .map-controls .btn.active {
+        border-color: var(--accent-border);
+      }
+      .map-controls .btn:hover {
+        border-color: var(--accent-border);
+        box-shadow: 0 16px 28px var(--shadow);
       }
       .map-controls .btn.small {
         width: 38px;
@@ -330,18 +376,18 @@
 
       .compact-tabs {
         position: absolute;
-        top: 50%;
-        right: 12px;
-        left: auto;
-        transform: translateY(-50%);
-        display: flex;
+        top: 12px;
+        left: 12px;
+        right: auto;
+        transform: none;
+        display: none;
         flex-direction: column;
         gap: 8px;
-        padding: 10px;
-        border: 1px solid var(--controls-border);
-        background: var(--controls-bg);
-        backdrop-filter: blur(8px);
-        border-radius: 12px;
+        padding: 0;
+        border: none;
+        background: transparent;
+        backdrop-filter: none;
+        border-radius: 0;
         z-index: 18;
       }
       .compact-tabs .btn {
@@ -353,9 +399,20 @@
         display: grid;
         place-items: center;
         font-weight: 800;
+        border: 1px solid var(--controls-border);
+        background: transparent;
+        backdrop-filter: none;
+        box-shadow: 0 12px 24px var(--shadow);
+      }
+      .compact-tabs .btn.active {
+        border-color: var(--accent-border);
+      }
+      .compact-tabs .btn:hover {
+        border-color: var(--accent-border);
+        box-shadow: 0 16px 28px var(--shadow);
       }
       .compact-close {
-        display: inline-flex;
+        display: none;
         position: absolute;
         top: 12px;
         right: 12px;
@@ -369,6 +426,10 @@
       @media (max-width: 900px) {
         #side-panel {
           width: min(92vw, 380px);
+          transform: translateX(calc(-100% - 24px));
+        }
+        #side-panel.compact-open {
+          transform: translateX(0);
         }
         .compact-tabs { display: flex; }
         .compact-close {
@@ -641,8 +702,8 @@
             </label>
             <label for="auto-rotate-speed" style="margin-top:8px;">Rotation speed (deg/s)</label>
             <div class="row">
-              <input id="auto-rotate-speed" type="range" min="0" max="0.05" step="0.0005" value="0.0042" />
-              <span id="auto-rotate-speed-value" class="value">0.0042</span>
+              <input id="auto-rotate-speed" type="range" min="0" max="2" step="0.01" value="0.15" />
+              <span id="auto-rotate-speed-value" class="value">0.15</span>
             </div>
           </div>
         </div>
@@ -692,13 +753,11 @@
           </button>
         </div>
         <div id="map-controls" class="map-controls" data-pos="right" aria-label="Map controls">
-          <div class="map-controls-row" aria-label="View and compass">
-            <button id="map-view" class="btn small" type="button" title="Toggle 2D/3D view">3D</button>
-            <button id="map-compass" class="btn" type="button" title="North/South orientation">
-              <span id="compass-needle" aria-hidden="true"></span>
-              <span class="compass-label" aria-hidden="true">N</span>
-            </button>
-          </div>
+          <button id="map-view" class="btn small" type="button" title="Toggle 2D/3D view">3D</button>
+          <button id="map-compass" class="btn" type="button" title="North/South orientation">
+            <span id="compass-needle" aria-hidden="true"></span>
+            <span class="compass-label" aria-hidden="true">N</span>
+          </button>
           <button id="map-home" class="btn" type="button" title="Reset camera (R)">⌂</button>
           <button id="map-zoom-in" class="btn" type="button" title="Zoom in">+</button>
           <button id="map-zoom-out" class="btn" type="button" title="Zoom out">−</button>
@@ -749,7 +808,7 @@
         resizeCanvas(wasm);
         window.addEventListener("resize", () => {
           resizeCanvas(wasm);
-          if (!isCompactLayout()) {
+          if (isCompactLayout()) {
             document.getElementById("side-panel")?.classList.remove("compact-open");
           }
         });
@@ -815,9 +874,7 @@
       }
 
       function resizeCanvas(wasm) {
-        const panel = document.getElementById("side-panel");
-        const compact = isCompactLayout();
-        const width = compact ? window.innerWidth : (window.innerWidth - panel.offsetWidth);
+        const width = window.innerWidth;
         const height = window.innerHeight;
         const canvas2d = document.getElementById("atlas-canvas-2d");
         const canvas3d = document.getElementById("atlas-canvas-3d");
@@ -1179,7 +1236,7 @@
           if (isCatalog) {
             renderCatalog();
           }
-          if (sidePanel) {
+          if (sidePanel && isCompactLayout()) {
             sidePanel.classList.add("compact-open");
           }
         }
@@ -1203,9 +1260,9 @@
           });
         }
 
-        // Default: show the drawer on larger screens.
-        if (sidePanel && !isCompactLayout()) {
-          sidePanel.classList.add("compact-open");
+        // Start closed on compact layouts; opened by the right-side tab buttons.
+        if (sidePanel && isCompactLayout()) {
+          sidePanel.classList.remove("compact-open");
         }
 
         function applyUploadedSummary(summary, labelName) {
@@ -1853,6 +1910,7 @@
         const PANEL_DEFAULT_WIDTH = 320;
         const PANEL_MIN_WIDTH = 280;
         const PANEL_MAX_WIDTH = 600;
+        const PANEL_COLLAPSED_WIDTH = 52;
         
         const panel = document.getElementById("side-panel");
         const panelToggle = document.getElementById("panel-toggle");
@@ -1867,7 +1925,7 @@
           panel.classList.add("collapsed");
           panelToggle.textContent = "▶";
           panelToggle.title = "Expand panel";
-          app.style.setProperty("--panel-width", "0px");
+          app.style.setProperty("--panel-width", PANEL_COLLAPSED_WIDTH + "px");
         } else if (savedWidth) {
           app.style.setProperty("--panel-width", savedWidth + "px");
         } else {
@@ -1882,7 +1940,7 @@
           panelToggle.title = isCollapsed ? "Expand panel" : "Collapse panel";
           
           if (isCollapsed) {
-            app.style.setProperty("--panel-width", "0px");
+            app.style.setProperty("--panel-width", PANEL_COLLAPSED_WIDTH + "px");
             localStorage.setItem("panel-collapsed", "true");
           } else {
             // Get the most recent width from localStorage
