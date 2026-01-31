@@ -15,6 +15,9 @@ mod imp {
         pub queue: ::wgpu::Queue,
         pub config: ::wgpu::SurfaceConfiguration,
         pub _canvas: web_sys::HtmlCanvasElement,
+        pub clear_color: ::wgpu::Color,
+        pub globe_color: [f32; 3],
+        pub stars_alpha: f32,
         pub stars_pipeline: ::wgpu::RenderPipeline,
         pub stars_count: u32,
         pub pipeline: ::wgpu::RenderPipeline,
@@ -49,6 +52,8 @@ struct Globals {
     _pad0: f32,
     viewport: vec2<f32>,
     _pad1: vec2<f32>,
+    globe_color: vec3<f32>,
+    stars_alpha: f32,
 };
 
 @group(0) @binding(0)
@@ -74,7 +79,7 @@ fn fs_main(fs_in: VsOut) -> @location(0) vec4<f32> {
     let ndotl = max(dot(n, l), 0.0);
 
     // Simple globe-ish color ramp.
-    let base = vec3<f32>(0.10, 0.55, 0.85);
+    let base = globals.globe_color;
     let shade = 0.25 + 0.75 * ndotl;
     return vec4<f32>(base * shade, 1.0);
 }
@@ -87,6 +92,8 @@ struct Globals {
     _pad0: f32,
     viewport: vec2<f32>,
     _pad1: vec2<f32>,
+    globe_color: vec3<f32>,
+    stars_alpha: f32,
 };
 
 @group(0) @binding(0)
@@ -111,6 +118,8 @@ struct Globals {
     _pad0: f32,
     viewport: vec2<f32>,
     _pad1: vec2<f32>,
+    globe_color: vec3<f32>,
+    stars_alpha: f32,
 };
 
 @group(0) @binding(0)
@@ -163,7 +172,7 @@ fn vs_main(@builtin(vertex_index) vid: u32) -> VsOut {
 
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    return vec4<f32>(1.0, 1.0, 1.0, in.a);
+    return vec4<f32>(1.0, 1.0, 1.0, in.a * globals.stars_alpha);
 }
 "#;
 
@@ -174,6 +183,8 @@ struct Globals {
     _pad0: f32,
     viewport: vec2<f32>,
     _pad1: vec2<f32>,
+    globe_color: vec3<f32>,
+    stars_alpha: f32,
 };
 
 @group(0) @binding(0)
@@ -228,6 +239,8 @@ struct Globals {
     _pad0: f32,
     viewport: vec2<f32>,
     _pad1: vec2<f32>,
+    globe_color: vec3<f32>,
+    stars_alpha: f32,
 };
 
 @group(0) @binding(0)
@@ -293,6 +306,8 @@ struct Globals {
     _pad0: f32,
     viewport: vec2<f32>,
     _pad1: vec2<f32>,
+    globe_color: vec3<f32>,
+    stars_alpha: f32,
 };
 
 @group(0) @binding(0)
@@ -379,6 +394,19 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         _pad0: f32,
         viewport: [f32; 2],
         _pad1: [f32; 2],
+        globe_color: [f32; 3],
+        stars_alpha: f32,
+    }
+
+    pub fn set_theme(
+        ctx: &mut WgpuContext,
+        clear_color: ::wgpu::Color,
+        globe_color: [f32; 3],
+        stars_alpha: f32,
+    ) {
+        ctx.clear_color = clear_color;
+        ctx.globe_color = globe_color;
+        ctx.stars_alpha = stars_alpha;
     }
 
     fn create_depth_view(
@@ -1150,6 +1178,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             _pad0: 0.0,
             viewport: [1.0, 1.0],
             _pad1: [0.0, 0.0],
+            globe_color: [0.10, 0.55, 0.85],
+            stars_alpha: 1.0,
         };
         queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&globals));
 
@@ -1160,6 +1190,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             queue,
             config,
             _canvas: canvas_elem,
+            clear_color: ::wgpu::Color {
+                r: 0.004,
+                g: 0.008,
+                b: 0.016,
+                a: 1.0,
+            },
+            globe_color: [0.10, 0.55, 0.85],
+            stars_alpha: 1.0,
             stars_pipeline,
             stars_count: 1200,
             pipeline,
@@ -1304,6 +1342,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             _pad0: 0.0,
             viewport: [ctx.config.width as f32, ctx.config.height as f32],
             _pad1: [0.0, 0.0],
+            globe_color: ctx.globe_color,
+            stars_alpha: ctx.stars_alpha,
         };
         ctx.queue
             .write_buffer(&ctx.uniform_buffer, 0, bytemuck::bytes_of(&globals));
@@ -1323,12 +1363,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     resolve_target: None,
                     depth_slice: None,
                     ops: ::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Clear(::wgpu::Color {
-                            r: 0.004,
-                            g: 0.008,
-                            b: 0.016,
-                            a: 1.0,
-                        }),
+                        load: ::wgpu::LoadOp::Clear(ctx.clear_color),
                         store: ::wgpu::StoreOp::Store,
                     },
                 })],
@@ -1605,6 +1640,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
 #[cfg(not(target_arch = "wasm32"))]
 mod imp {
+    use ::wgpu;
     use wasm_bindgen::prelude::JsValue;
 
     #[derive(Debug, Default)]
@@ -1657,6 +1693,14 @@ mod imp {
 
     pub fn set_base_regions_points(_ctx: &mut WgpuContext, _points: &[OverlayVertex]) {}
 
+    pub fn set_theme(
+        _ctx: &mut WgpuContext,
+        _clear_color: wgpu::Color,
+        _globe_color: [f32; 3],
+        _stars_alpha: f32,
+    ) {
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn render_mesh(
         _ctx: &WgpuContext,
@@ -1678,5 +1722,5 @@ mod imp {
 pub use imp::{
     CityVertex, CorridorVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh,
     resize_wgpu, set_base_regions_points, set_cities_points, set_corridors_points,
-    set_regions_points, set_terrain_points,
+    set_regions_points, set_terrain_points, set_theme,
 };

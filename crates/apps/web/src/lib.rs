@@ -42,6 +42,74 @@ impl ViewMode {
     }
 }
 
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+enum Theme {
+    #[default]
+    Dark,
+    DeepDark,
+    Light,
+}
+
+impl Theme {
+    fn from_str(s: &str) -> Self {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "deep-dark" | "deep_dark" | "deep" | "black" => Theme::DeepDark,
+            "light" => Theme::Light,
+            _ => Theme::Dark,
+        }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+struct ThemePalette {
+    clear_color: ::wgpu::Color,
+    globe_color: [f32; 3],
+    stars_alpha: f32,
+    canvas_2d_clear: &'static str,
+    base_surface_color: [f32; 4],
+}
+
+fn palette_for(theme: Theme) -> ThemePalette {
+    match theme {
+        Theme::Dark => ThemePalette {
+            clear_color: ::wgpu::Color {
+                r: 0.004,
+                g: 0.008,
+                b: 0.016,
+                a: 1.0,
+            },
+            globe_color: [0.10, 0.55, 0.85],
+            stars_alpha: 1.0,
+            canvas_2d_clear: "#020617",
+            base_surface_color: [0.20, 0.65, 0.35, 0.85],
+        },
+        Theme::DeepDark => ThemePalette {
+            clear_color: ::wgpu::Color {
+                r: 0.001,
+                g: 0.002,
+                b: 0.004,
+                a: 1.0,
+            },
+            globe_color: [0.07, 0.45, 0.75],
+            stars_alpha: 1.1,
+            canvas_2d_clear: "#000000",
+            base_surface_color: [0.16, 0.55, 0.30, 0.88],
+        },
+        Theme::Light => ThemePalette {
+            clear_color: ::wgpu::Color {
+                r: 0.92,
+                g: 0.95,
+                b: 0.98,
+                a: 1.0,
+            },
+            globe_color: [0.18, 0.55, 0.85],
+            stars_alpha: 0.25,
+            canvas_2d_clear: "#f8fafc",
+            base_surface_color: [0.12, 0.55, 0.25, 0.55],
+        },
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct Camera2DState {
     pub center_lon_deg: f64,
@@ -133,6 +201,7 @@ struct ViewerState {
     canvas_width: f64,
     canvas_height: f64,
     view_mode: ViewMode,
+    theme: Theme,
     canvas_2d: Option<HtmlCanvasElement>,
     ctx_2d: Option<CanvasRenderingContext2d>,
     wgpu: Option<WgpuContext>,
@@ -230,6 +299,7 @@ thread_local! {
         canvas_width: 1280.0,
         canvas_height: 720.0,
         view_mode: ViewMode::ThreeD,
+        theme: Theme::Dark,
         canvas_2d: None,
         ctx_2d: None,
         wgpu: None,
@@ -882,7 +952,8 @@ fn render_scene_2d() -> Result<(), JsValue> {
         let h = state.canvas_height.max(1.0);
 
         // Clear.
-        ctx_set_fill_style(ctx, "#020617");
+        let clear = palette_for(state.theme).canvas_2d_clear;
+        ctx_set_fill_style(ctx, clear);
         ctx.fill_rect(0.0, 0.0, w, h);
 
         // Optional graticule (Web Mercator).
@@ -1686,8 +1757,10 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
         match s.view_mode {
             ViewMode::ThreeD => {
                 let speed = 0.005;
-                s.camera.yaw_rad += delta_x_px * speed;
-                s.camera.pitch_rad = clamp(s.camera.pitch_rad + delta_y_px * speed, -1.55, 1.55);
+                // Screen drag direction should feel like you're "pushing" the globe.
+                // Up => rotate northward, left => clockwise.
+                s.camera.yaw_rad -= delta_x_px * speed;
+                s.camera.pitch_rad = clamp(s.camera.pitch_rad - delta_y_px * speed, -1.55, 1.55);
             }
             ViewMode::TwoD => {
                 // In 2D, treat orbit as pan.
@@ -1903,6 +1976,32 @@ pub fn set_real_time_sun_enabled(enabled: bool) -> Result<(), JsValue> {
     with_state(|state| {
         state.borrow_mut().sun_follow_real_time = enabled;
     });
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_theme(theme: String) -> Result<(), JsValue> {
+    let theme = Theme::from_str(&theme);
+    let palette = palette_for(theme);
+
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.theme = theme;
+
+        // Base surface is intended to follow the chosen theme.
+        s.base_regions_style.color = palette.base_surface_color;
+
+        if let Some(ctx) = &mut s.wgpu {
+            wgpu::set_theme(
+                ctx,
+                palette.clear_color,
+                palette.globe_color,
+                palette.stars_alpha,
+            );
+        }
+    });
+
+    let _ = rebuild_overlays_and_upload();
     render_scene()
 }
 
@@ -4072,12 +4171,22 @@ async fn init_wgpu_inner() -> Result<(), JsValue> {
 
     with_state(|state| {
         let mut s = state.borrow_mut();
+        let palette = palette_for(s.theme);
         let pending = s.pending_cities.take();
         let pending_corridors = s.pending_corridors.take();
         let pending_base_regions = s.pending_base_regions.take();
         let pending_regions = s.pending_regions.take();
         let pending_terrain = s.pending_terrain.take();
         s.wgpu = Some(ctx);
+
+        if let Some(ctx) = &mut s.wgpu {
+            wgpu::set_theme(
+                ctx,
+                palette.clear_color,
+                palette.globe_color,
+                palette.stars_alpha,
+            );
+        }
 
         if let Some(points) = pending
             && let Some(ctx) = &mut s.wgpu
