@@ -947,12 +947,13 @@
             const data = await resp.json();
             const tiles = Number.isFinite(data.tiles_count) ? data.tiles_count : 0;
             const suffix = data.tiles_count_truncated ? "+" : "";
+            const datum = data.vertical_datum ? ` • ${String(data.vertical_datum)}` : "";
             if (data.status === "ready") {
-              setDemStatus(`Terrain (backend): ready (${tiles}${suffix} cached)`);
+              setDemStatus(`Terrain (backend): ready (${tiles}${suffix} cached${datum})`);
             } else if (data.status === "empty") {
-              setDemStatus("Terrain (backend): empty cache");
+              setDemStatus(`Terrain (backend): empty cache${datum}`);
             } else {
-              setDemStatus(`Terrain (backend): ${String(data.status || "unknown")}`);
+              setDemStatus(`Terrain (backend): ${String(data.status || "unknown")}${datum}`);
             }
           } catch (err) {
             setDemStatus("Terrain (backend): status error");
@@ -975,12 +976,13 @@
             const loading = !!status.loading;
             const zoom = status.zoom !== undefined ? ` z${status.zoom}` : "";
             const source = status.source ? ` @ ${status.source}` : "";
+            const datum = status.vertical_datum ? ` • ${String(status.vertical_datum)}` : "";
             if (!enabled) {
               setTerrainClientStatus("Terrain (client): disabled");
               return;
             }
             if (loading) {
-              setTerrainClientStatus(`Terrain (client): loading${zoom}${source}`);
+              setTerrainClientStatus(`Terrain (client): loading${zoom}${source}${datum}`);
               return;
             }
             if (status.last_error) {
@@ -988,7 +990,7 @@
               return;
             }
             if (status.tileset_loaded) {
-              setTerrainClientStatus(`Terrain (client): ready${zoom}${source}`);
+              setTerrainClientStatus(`Terrain (client): ready${zoom}${source}${datum}`);
               return;
             }
             setTerrainClientStatus("Terrain (client): idle");

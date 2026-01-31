@@ -30,6 +30,8 @@ struct TerrainConfig {
     cache_root: PathBuf,
     stac_url: String,
     collection: String,
+    vertical_datum: String,
+    vertical_units: String,
     tile_size: u32,
     zoom_min: u32,
     zoom_max: u32,
@@ -52,6 +54,8 @@ struct TerrainTileset {
     zoom_max: u32,
     data_type: String,
     tile_path_template: String,
+    vertical_datum: String,
+    vertical_units: String,
     min_lon: f64,
     max_lon: f64,
     min_lat: f64,
@@ -88,6 +92,11 @@ async fn main() {
         cache_root,
         stac_url,
         collection: env::var("TERRAIN_COLLECTION").unwrap_or_else(|_| "dem_cop_30".to_string()),
+        // Most global DEM products (including Copernicus DEM) are distributed as orthometric height
+        // relative to a geoid ("MSL-like"). Keep this explicit and configurable.
+        vertical_datum: env::var("TERRAIN_VERTICAL_DATUM")
+            .unwrap_or_else(|_| "msl-egm2008".to_string()),
+        vertical_units: env::var("TERRAIN_VERTICAL_UNITS").unwrap_or_else(|_| "m".to_string()),
         tile_size: env_var_u32("TERRAIN_TILE_SIZE", 256),
         zoom_min: env_var_u32("TERRAIN_ZOOM_MIN", 0),
         zoom_max: env_var_u32("TERRAIN_ZOOM_MAX", 8),
@@ -150,6 +159,8 @@ async fn get_tileset(State(state): State<AppState>) -> Response {
         zoom_max: cfg.zoom_max,
         data_type: "f32-le".to_string(),
         tile_path_template: "tiles/{z}/{x}/{y}.bin".to_string(),
+        vertical_datum: cfg.vertical_datum.clone(),
+        vertical_units: cfg.vertical_units.clone(),
         min_lon: cfg.min_lon,
         max_lon: cfg.max_lon,
         min_lat: cfg.min_lat,
@@ -189,6 +200,8 @@ async fn get_terrain_status(State(state): State<AppState>) -> Response {
         "tile_size": state.terrain.tile_size,
         "zoom_min": state.terrain.zoom_min,
         "zoom_max": state.terrain.zoom_max,
+        "vertical_datum": state.terrain.vertical_datum,
+        "vertical_units": state.terrain.vertical_units,
     });
 
     let mut headers = HeaderMap::new();

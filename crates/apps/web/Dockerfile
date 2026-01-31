@@ -31,4 +31,5 @@ RUN trunk build --release
 
 FROM nginx:alpine
 COPY --from=builder /app/crates/apps/web/dist /usr/share/nginx/html
-EXPOSE 80
+COPY crates/apps/web/nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 9103

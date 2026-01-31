@@ -5,7 +5,7 @@ services:
       context: .
       dockerfile: crates/apps/web/Dockerfile
     ports:
-      - "8082:80"
+      - "9103:9103"
     depends_on:
       - server
 
@@ -22,6 +22,8 @@ services:
       SURFACE_ROOT: "/data/terrain/surface"
       STAC_URL: "https://copernicus-dem-30m-stac.s3.amazonaws.com"
       TERRAIN_COLLECTION: "${TERRAIN_COLLECTION:-dem_cop_30}"
+      TERRAIN_VERTICAL_DATUM: "${TERRAIN_VERTICAL_DATUM:-msl-egm2008}"
+      TERRAIN_VERTICAL_UNITS: "${TERRAIN_VERTICAL_UNITS:-m}"
       TERRAIN_TILE_SIZE: "${TERRAIN_TILE_SIZE:-256}"
       TERRAIN_ZOOM_MIN: "${TERRAIN_ZOOM_MIN:-0}"
       TERRAIN_ZOOM_MAX: "${TERRAIN_ZOOM_MAX:-8}"

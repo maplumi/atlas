@@ -146,6 +146,10 @@ struct TerrainTileset {
     #[serde(rename = "data_type")]
     _data_type: String,
     tile_path_template: String,
+    #[serde(default)]
+    vertical_datum: Option<String>,
+    #[serde(default)]
+    vertical_units: Option<String>,
     min_lon: f64,
     max_lon: f64,
     min_lat: f64,
@@ -2880,7 +2884,16 @@ pub fn get_layer_style(id: &str) -> Result<JsValue, JsValue> {
 
 #[wasm_bindgen]
 pub fn get_terrain_client_status() -> JsValue {
-    let (enabled, loading, last_error, zoom, source, tileset_loaded) = with_state(|state| {
+    let (
+        enabled,
+        loading,
+        last_error,
+        zoom,
+        source,
+        tileset_loaded,
+        vertical_datum,
+        vertical_units,
+    ) = with_state(|state| {
         let s = state.borrow();
         (
             s.terrain_style.visible,
@@ -2889,6 +2902,12 @@ pub fn get_terrain_client_status() -> JsValue {
             s.terrain_zoom,
             s.terrain_source.clone(),
             s.terrain_tileset.is_some(),
+            s.terrain_tileset
+                .as_ref()
+                .and_then(|ts| ts.vertical_datum.clone()),
+            s.terrain_tileset
+                .as_ref()
+                .and_then(|ts| ts.vertical_units.clone()),
         )
     });
 
@@ -2919,6 +2938,20 @@ pub fn get_terrain_client_status() -> JsValue {
             &o,
             &JsValue::from_str("last_error"),
             &JsValue::from_str(&err),
+        );
+    }
+    if let Some(v) = vertical_datum {
+        let _ = js_sys::Reflect::set(
+            &o,
+            &JsValue::from_str("vertical_datum"),
+            &JsValue::from_str(&v),
+        );
+    }
+    if let Some(v) = vertical_units {
+        let _ = js_sys::Reflect::set(
+            &o,
+            &JsValue::from_str("vertical_units"),
+            &JsValue::from_str(&v),
         );
     }
     o.into()
