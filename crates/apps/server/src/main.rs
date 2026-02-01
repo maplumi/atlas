@@ -8,7 +8,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 use serde_json::json;
@@ -25,7 +25,8 @@ mod webhooks;
 mod ws_streaming;
 
 use data_sources::{
-    DataSource, DataSourceInfo, FilesystemSource, HttpSource, MemorySource, PmtilesSource,
+    DataSource, DataSourceInfo, DataSourceMetadata, FallbackSource, FilesystemSource, HttpSource,
+    MemorySource, PmtilesSource,
 };
 use webhooks::{WebhookConfig, WebhookRegistry, WebhookSchema, WebhookSource};
 use ws_streaming::DataSourceRegistry;
@@ -209,6 +210,11 @@ async fn main() {
         .route(
             "/api/sources/:source_id/has/:z/:x/:y",
             get(check_source_has_tile),
+        )
+        // Memory source tile management
+        .route(
+            "/api/sources/:source_id/tiles/:z/:x/:y",
+            put(put_memory_tile).delete(delete_memory_tile),
         )
         // Webhook management API
         .route(
@@ -442,7 +448,7 @@ async fn check_source_has_tile(
 struct CreateDataSourceRequest {
     /// Unique identifier for the source.
     id: String,
-    /// Type of data source: "filesystem", "http", "pmtiles", "memory".
+    /// Type of data source: "filesystem", "http", "pmtiles", "memory", "fallback".
     source_type: String,
     /// Path (for filesystem/pmtiles) or URL template (for http).
     path_or_url: Option<String>,
@@ -452,6 +458,16 @@ struct CreateDataSourceRequest {
     format: Option<String>,
     /// File extension for filesystem sources (e.g., "png", "bin").
     extension: Option<String>,
+    /// Attribution string for the source.
+    attribution: Option<String>,
+    /// Description of the source.
+    description: Option<String>,
+    /// Minimum zoom level.
+    min_zoom: Option<u8>,
+    /// Maximum zoom level.
+    max_zoom: Option<u8>,
+    /// For fallback source: list of existing source IDs to try in order.
+    fallback_sources: Option<Vec<String>>,
 }
 
 /// Create a new data source dynamically.
@@ -491,6 +507,22 @@ async fn create_data_source(
     });
 
     // Create the appropriate source type
+    let name = request.name.clone().unwrap_or_else(|| request.id.clone());
+
+    // Helper to build metadata with overrides
+    let build_metadata =
+        |source_name: String, default_format: streaming::TileFormat| DataSourceMetadata {
+            name: source_name,
+            description: request.description.clone(),
+            attribution: request.attribution.clone(),
+            min_zoom: request.min_zoom.unwrap_or(0),
+            max_zoom: request.max_zoom.unwrap_or(22),
+            bounds: None,
+            center: None,
+            format: default_format,
+            layers: vec![],
+        };
+
     let source: Arc<dyn DataSource + Send + Sync> = match request.source_type.as_str() {
         "filesystem" => {
             let path = match &request.path_or_url {
@@ -503,12 +535,10 @@ async fn create_data_source(
                         .into_response()
                 }
             };
-            Arc::new(FilesystemSource::new(
-                path,
-                request.name.clone().unwrap_or_else(|| request.id.clone()),
-                format,
-                extension,
-            ))
+            Arc::new(
+                FilesystemSource::new(&path, &name, format, &extension)
+                    .with_metadata(build_metadata(name.clone(), format)),
+            )
         }
         "http" => {
             let url_template = match &request.path_or_url {
@@ -521,11 +551,10 @@ async fn create_data_source(
                         .into_response()
                 }
             };
-            Arc::new(HttpSource::new(
-                url_template,
-                request.name.clone().unwrap_or_else(|| request.id.clone()),
-                format,
-            ))
+            Arc::new(
+                HttpSource::new(&url_template, &name, format)
+                    .with_metadata(build_metadata(name.clone(), format)),
+            )
         }
         "pmtiles" => {
             let path = match &request.path_or_url {
@@ -538,15 +567,38 @@ async fn create_data_source(
                         .into_response()
                 }
             };
-            Arc::new(PmtilesSource::new(
-                path,
-                request.name.clone().unwrap_or_else(|| request.id.clone()),
-            ))
+            Arc::new(
+                PmtilesSource::new(&path, &name)
+                    .with_metadata(build_metadata(name.clone(), streaming::TileFormat::Mvt)),
+            )
         }
-        "memory" => Arc::new(MemorySource::new(
-            request.name.clone().unwrap_or_else(|| request.id.clone()),
-            format,
-        )),
+        "memory" => Arc::new(MemorySource::new(&name, format)),
+        "fallback" => {
+            let source_ids = match &request.fallback_sources {
+                Some(ids) if !ids.is_empty() => ids,
+                _ => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "fallback_sources required for fallback source" })),
+                    )
+                        .into_response()
+                }
+            };
+            // Collect the referenced sources
+            let sources: Vec<Arc<dyn DataSource>> = source_ids
+                .iter()
+                .filter_map(|id| state.data_sources.get(id))
+                .map(|s| s as Arc<dyn DataSource>)
+                .collect();
+            if sources.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "No valid fallback sources found" })),
+                )
+                    .into_response();
+            }
+            Arc::new(FallbackSource::new(&name, sources))
+        }
         other => {
             return (
                 StatusCode::BAD_REQUEST,
@@ -572,6 +624,71 @@ async fn delete_data_source(
     match state.data_sources.unregister(&source_id) {
         Some(_) => Json(json!({ "id": source_id, "deleted": true })),
         None => Json(json!({ "error": "Source not found", "deleted": false })),
+    }
+}
+
+/// Write a tile to a memory data source.
+async fn put_memory_tile(
+    State(state): State<AppState>,
+    AxumPath((source_id, z, x, y)): AxumPath<(String, u8, u32, u32)>,
+    body: axum::body::Bytes,
+) -> impl IntoResponse {
+    let coord = streaming::TileCoord::new(z, x, y);
+
+    // Get the source and check if it's a MemorySource
+    let source = match state.data_sources.get(&source_id) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Source not found" })),
+            )
+        }
+    };
+
+    // Try to downcast to MemorySource
+    if let Some(memory_source) = source.as_any().downcast_ref::<MemorySource>() {
+        memory_source.set_tile(coord, body.to_vec()).await;
+        (
+            StatusCode::OK,
+            Json(json!({ "z": z, "x": x, "y": y, "written": true })),
+        )
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Source is not a memory source" })),
+        )
+    }
+}
+
+/// Delete a tile from a memory data source.
+async fn delete_memory_tile(
+    State(state): State<AppState>,
+    AxumPath((source_id, z, x, y)): AxumPath<(String, u8, u32, u32)>,
+) -> impl IntoResponse {
+    let coord = streaming::TileCoord::new(z, x, y);
+
+    let source = match state.data_sources.get(&source_id) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Source not found" })),
+            )
+        }
+    };
+
+    if let Some(memory_source) = source.as_any().downcast_ref::<MemorySource>() {
+        let removed = memory_source.remove_tile(coord).await.is_some();
+        (
+            StatusCode::OK,
+            Json(json!({ "z": z, "x": x, "y": y, "deleted": removed })),
+        )
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Source is not a memory source" })),
+        )
     }
 }
 

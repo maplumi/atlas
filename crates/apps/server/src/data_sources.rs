@@ -109,6 +109,9 @@ pub trait DataSource: Send + Sync {
         &self,
         coords: Vec<TileCoord>,
     ) -> BoxFuture<'_, Vec<Result<Option<Vec<u8>>, DataSourceError>>>;
+
+    /// Get self as Any for downcasting to concrete types.
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 /// Filesystem-based tile source (z/x/y.ext directory structure).
@@ -190,6 +193,10 @@ impl DataSource for FilesystemSource {
             }
             results
         })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -290,6 +297,10 @@ impl DataSource for HttpSource {
             results
         })
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 /// PMTiles data source (local file or remote URL).
@@ -332,14 +343,17 @@ impl DataSource for PmtilesSource {
 
     fn get_tile(
         &self,
-        _coord: TileCoord,
+        coord: TileCoord,
     ) -> BoxFuture<'_, Result<Option<Vec<u8>>, DataSourceError>> {
-        // Placeholder: full implementation would use HTTP range requests
-        // or local file reading with the pmtiles crate.
+        // Use path_or_url to give a more helpful error message
+        let source_path = self.path_or_url.clone();
         Box::pin(async move {
-            Err(DataSourceError::new(
-                "PMTiles source not fully implemented yet",
-            ))
+            // Placeholder: full implementation would use HTTP range requests
+            // or local file reading with the pmtiles crate.
+            Err(DataSourceError::new(format!(
+                "PMTiles source '{}' not fully implemented: cannot fetch tile {}/{}/{}",
+                source_path, coord.z, coord.x, coord.y
+            )))
         })
     }
 
@@ -358,6 +372,10 @@ impl DataSource for PmtilesSource {
             }
             results
         })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -421,6 +439,10 @@ impl DataSource for MemorySource {
             }
             results
         })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -493,5 +515,9 @@ impl DataSource for FallbackSource {
             }
             results
         })
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }

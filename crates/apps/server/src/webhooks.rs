@@ -237,7 +237,12 @@ impl WebhookRegistry {
             .ok_or(WebhookError::UnknownSource)?;
 
         // Parse and validate
-        let data = self.validate_and_parse(&source.schema, body)?;
+        let mut data = self.validate_and_parse(&source.schema, body)?;
+
+        // Apply transform if specified (simple JSONPath-like extraction)
+        if let Some(ref transform) = source.transform {
+            data = self.apply_transform(transform, data)?;
+        }
 
         // Broadcast to subscribers
         let update = DataUpdate {
@@ -251,6 +256,39 @@ impl WebhookRegistry {
 
         debug!("Processed webhook for source: {source_id}");
         Ok(())
+    }
+
+    /// Apply a simple JSONPath-like transform to extract data.
+    /// Supports paths like "data", "features[0]", "properties.name".
+    fn apply_transform(
+        &self,
+        path: &str,
+        mut value: serde_json::Value,
+    ) -> Result<serde_json::Value, WebhookError> {
+        for segment in path.split('.') {
+            // Check for array index: field[n]
+            if let Some(bracket_pos) = segment.find('[') {
+                let field = &segment[..bracket_pos];
+                let idx_str = segment[bracket_pos + 1..].trim_end_matches(']');
+
+                if !field.is_empty() {
+                    value = value.get(field).cloned().ok_or_else(|| {
+                        WebhookError::InvalidPayload(format!("Field '{}' not found", field))
+                    })?;
+                }
+
+                if let Ok(idx) = idx_str.parse::<usize>() {
+                    value = value.get(idx).cloned().ok_or_else(|| {
+                        WebhookError::InvalidPayload(format!("Index {} out of bounds", idx))
+                    })?;
+                }
+            } else if !segment.is_empty() {
+                value = value.get(segment).cloned().ok_or_else(|| {
+                    WebhookError::InvalidPayload(format!("Field '{}' not found", segment))
+                })?;
+            }
+        }
+        Ok(value)
     }
 
     fn validate_and_parse(
