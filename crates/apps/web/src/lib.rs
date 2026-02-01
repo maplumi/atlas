@@ -2196,7 +2196,10 @@ async fn fetch_geojson_chunk(url: &str) -> Result<formats::VectorChunk, JsValue>
 fn ensure_base_world_loaded() {
     let needs_load = with_state(|state| {
         let s = state.borrow();
-        s.base_world.is_none() && s.surface_positions.is_none() && !s.surface_loading
+        s.base_world.is_none()
+            && s.surface_positions.is_none()
+            && !s.surface_loading
+            && !s.base_world_loading
     });
     if !needs_load {
         return;
@@ -2242,6 +2245,73 @@ fn ensure_base_world_loaded() {
         let _ = rebuild_overlays_and_upload();
         let _ = render_scene();
     });
+}
+
+#[wasm_bindgen]
+pub fn begin_base_world_stream() {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        let mut world = scene::World::new();
+        scene::prefabs::spawn_wgs84_globe(&mut world);
+        s.base_world = Some(world);
+        s.surface_positions = None;
+        s.surface_tileset = None;
+        s.surface_zoom = None;
+        s.surface_source = None;
+        s.surface_loading = false;
+        s.surface_last_error = None;
+        s.base_world_loading = true;
+        s.base_world_error = None;
+        s.base_count_polys = 0;
+    });
+    let _ = rebuild_overlays_and_upload();
+    let _ = render_scene();
+}
+
+#[wasm_bindgen]
+pub fn append_base_world_geojson_chunk(geojson_text: String) -> Result<(), JsValue> {
+    let chunk = formats::VectorChunk::from_geojson_str(&geojson_text)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let chunk = unwrap_antimeridian_chunk(&chunk);
+
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        if s.base_world.is_none() {
+            // If the UI calls append without begin, create a base world.
+            let mut world = scene::World::new();
+            scene::prefabs::spawn_wgs84_globe(&mut world);
+            s.base_world = Some(world);
+        }
+        if let Some(world) = s.base_world.as_mut() {
+            formats::ingest_vector_chunk(world, &chunk, Some(VectorGeometryKind::Area));
+        }
+    });
+
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn finish_base_world_stream() {
+    let tri_count = with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.base_world_loading = false;
+
+        if let Some(w) = s.base_world.as_ref() {
+            let layer = VectorLayer::new(1);
+            let snap = layer.extract(w);
+            snap.area_triangles.len() / 3
+        } else {
+            0
+        }
+    });
+
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.base_count_polys = tri_count;
+    });
+
+    let _ = rebuild_overlays_and_upload();
+    let _ = render_scene();
 }
 
 fn unwrap_antimeridian_chunk(chunk: &formats::VectorChunk) -> formats::VectorChunk {

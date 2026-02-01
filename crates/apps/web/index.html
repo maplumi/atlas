@@ -801,6 +801,140 @@
         return t;
       }
 
+      async function gunzipIfNeeded(bytes) {
+        if (!bytes || bytes.length < 2) return bytes;
+        if (bytes[0] !== 0x1f || bytes[1] !== 0x8b) return bytes;
+
+        // Modern browsers: native gzip decompression.
+        if (typeof DecompressionStream !== "undefined") {
+          const ds = new DecompressionStream("gzip");
+          const stream = new Blob([bytes]).stream().pipeThrough(ds);
+          const ab = await new Response(stream).arrayBuffer();
+          return new Uint8Array(ab);
+        }
+
+        // Fallback: dynamically load pako.
+        const pako = await import("https://esm.sh/pako@2.1.0");
+        return pako.ungzip(bytes);
+      }
+
+      async function tryLoadPmtilesBaseSurface(wasm) {
+        // Feature flag (optional): set `window.ATLAS_USE_PMTILES_SURFACE = false` to disable.
+        if (window.ATLAS_USE_PMTILES_SURFACE === false) return false;
+
+        const url = "assets/world.pmtiles";
+        try {
+          // Load libs on demand.
+          const pm = await import("https://esm.sh/pmtiles@3.2.0");
+          const vt = await import("https://esm.sh/@mapbox/vector-tile@1.3.1");
+          const PbfMod = await import("https://esm.sh/pbf@3.2.1");
+          const Pbf = PbfMod.default;
+          const { PMTiles, FetchSource } = pm;
+          const { VectorTile } = vt;
+
+          // Build a PMTiles reader that uses HTTP range requests.
+          const p = new PMTiles(new FetchSource(url));
+
+          // Confirm archive is readable.
+          const header = await p.getHeader();
+          const maxZoomAvailable = Number.isFinite(header?.maxZoom) ? header.maxZoom : 0;
+
+          // Limit global refinement to avoid hammering the browser with requests.
+          // You can override via `window.ATLAS_PMTILES_MAX_ZOOM`.
+          const maxZoom = Math.max(0, Math.min(maxZoomAvailable, Number(window.ATLAS_PMTILES_MAX_ZOOM ?? 3)));
+          const layerId = String(window.ATLAS_PMTILES_LAYER_ID || "ne_10m_land");
+
+          if (!wasm?.begin_base_world_stream || !wasm?.append_base_world_geojson_chunk || !wasm?.finish_base_world_stream) {
+            console.warn("PMTiles base surface: missing wasm streaming APIs; falling back to world.json");
+            return false;
+          }
+
+          wasm.begin_base_world_stream();
+
+          const maxFeaturesPerTile = Number(window.ATLAS_PMTILES_MAX_FEATURES_PER_TILE ?? 5000);
+          const concurrency = Math.max(1, Math.min(8, Number(window.ATLAS_PMTILES_CONCURRENCY ?? 4)));
+
+          async function loadTile(z, x, y) {
+            const ab = await p.getZxy(z, x, y);
+            if (!ab) return null;
+            let bytes = new Uint8Array(ab);
+            bytes = await gunzipIfNeeded(bytes);
+            const tile = new VectorTile(new Pbf(bytes));
+            const layer = tile.layers?.[layerId];
+            if (!layer || !layer.length) return null;
+
+            const features = [];
+            const n = Math.min(layer.length, maxFeaturesPerTile);
+            for (let i = 0; i < n; i++) {
+              const f = layer.feature(i);
+              // 3 = polygon in MVT
+              if (f.type !== 3) continue;
+              const gj = f.toGeoJSON(x, y, z);
+              // Reduce payload: drop properties
+              features.push({ type: "Feature", properties: {}, geometry: gj.geometry });
+            }
+            if (!features.length) return null;
+            return { type: "FeatureCollection", features };
+          }
+
+          async function loadZoom(z) {
+            const n = 1 << z;
+            const tasks = [];
+            let loadedTiles = 0;
+            let pendingBatch = 0;
+
+            const schedule = async (z, x, y) => {
+              const fc = await loadTile(z, x, y);
+              if (fc) {
+                wasm.append_base_world_geojson_chunk(JSON.stringify(fc));
+                pendingBatch++;
+                // Periodically flush so the user sees progressive refinement.
+                if (pendingBatch >= 4) {
+                  pendingBatch = 0;
+                  wasm.finish_base_world_stream();
+                }
+              }
+              loadedTiles++;
+            };
+
+            // Simple concurrency-limited loop.
+            for (let y = 0; y < n; y++) {
+              for (let x = 0; x < n; x++) {
+                tasks.push({ z, x, y });
+              }
+            }
+
+            let idx = 0;
+            async function worker() {
+              while (idx < tasks.length) {
+                const t = tasks[idx++];
+                await schedule(t.z, t.x, t.y);
+              }
+            }
+            await Promise.all(Array.from({ length: concurrency }, () => worker()));
+            if (pendingBatch > 0) wasm.finish_base_world_stream();
+            return loadedTiles;
+          }
+
+          // Always load z0 immediately so the globe has land right away.
+          await loadZoom(0);
+          wasm.finish_base_world_stream();
+
+          // Progressive refinement.
+          for (let z = 1; z <= maxZoom; z++) {
+            await loadZoom(z);
+            wasm.finish_base_world_stream();
+          }
+
+          console.log(`PMTiles base surface loaded (z0..z${maxZoom}, layer=${layerId})`);
+          return true;
+        } catch (err) {
+          console.warn("PMTiles base surface load failed; falling back to world.json", err);
+          try { wasm.finish_base_world_stream?.(); } catch (_) {}
+          return false;
+        }
+      }
+
       function main(wasm) {
         // Apply theme early so both UI and renderer pick consistent defaults.
         const theme = applyTheme(getInitialTheme(), wasm);
@@ -814,8 +948,12 @@
         });
         wasm.init_canvas_2d();
         wasm.init_wgpu();
-        // preload base world layer
-        try { wasm.load_base_world?.(); } catch (err) { console.error("load_base_world failed", err); }
+        // Prefer PMTiles base surface (lightweight) with fallback to the legacy world.json.
+        tryLoadPmtilesBaseSurface(wasm).then((ok) => {
+          if (!ok) {
+            try { wasm.load_base_world?.(); } catch (err) { console.error("load_base_world failed", err); }
+          }
+        });
         detectBackendAvailability(wasm);
         startSurfaceStatusPolling(wasm);
         startTerrainClientStatusPolling(wasm);

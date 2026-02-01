@@ -1314,9 +1314,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     pub fn render_mesh(
         ctx: &WgpuContext,
         view_proj: [[f32; 4]; 4],
