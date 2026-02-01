@@ -25,6 +25,7 @@ mod imp {
         pub cities_pipeline: ::wgpu::RenderPipeline,
         pub corridors_pipeline: ::wgpu::RenderPipeline,
         pub regions_pipeline: ::wgpu::RenderPipeline,
+        pub base_regions_pipeline: ::wgpu::RenderPipeline,
         pub uniform_buffer: ::wgpu::Buffer,
         pub uniform_bind_group: ::wgpu::BindGroup,
         pub depth_view: ::wgpu::TextureView,
@@ -1078,17 +1079,95 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 unclipped_depth: false,
                 conservative: false,
             },
+            // Depth bias helps with z-fighting by pushing polygon depth slightly towards
+            // the camera. Combined with the lift mechanism, this ensures overlay polygons
+            // render correctly on top of the globe without requiring manual tilt adjustment.
+            // constant: shifts depth by a fixed amount (negative = towards camera)
+            // slope_scale: scales bias based on polygon slope (helps at grazing angles)
             depth_stencil: Some(::wgpu::DepthStencilState {
                 format: ::wgpu::TextureFormat::Depth24PlusStencil8,
                 depth_write_enabled: false,
                 depth_compare: ::wgpu::CompareFunction::LessEqual,
                 stencil: stencil_test_eq_1(),
-                bias: ::wgpu::DepthBiasState::default(),
+                bias: ::wgpu::DepthBiasState {
+                    constant: -2, // Push towards camera
+                    slope_scale: -1.0,
+                    clamp: 0.0,
+                },
             }),
             multisample: ::wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
         });
+
+        // Separate pipeline for base_regions with depth_compare: Always.
+        // This bypasses depth testing so the base surface always renders on top of
+        // the globe. Without this, large triangles that span curved areas of the
+        // globe intersect the globe surface geometrically and fail depth tests.
+        // We still use stencil testing to mask to the visible globe area.
+        let base_regions_pipeline =
+            device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+                label: Some("atlas-base-regions-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: ::wgpu::VertexState {
+                    module: &regions_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[::wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<OverlayVertex>() as ::wgpu::BufferAddress,
+                        step_mode: ::wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x4,
+                                offset: 16,
+                                shader_location: 2,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(::wgpu::FragmentState {
+                    module: &regions_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(::wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: ::wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: ::wgpu::PrimitiveState {
+                    topology: ::wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: ::wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: ::wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                // depth_compare: Always means we skip depth testing entirely.
+                // The base surface will always draw on top of the globe wherever
+                // the stencil mask (written by the globe pass) allows.
+                depth_stencil: Some(::wgpu::DepthStencilState {
+                    format: ::wgpu::TextureFormat::Depth24PlusStencil8,
+                    depth_write_enabled: false,
+                    depth_compare: ::wgpu::CompareFunction::Always,
+                    stencil: stencil_test_eq_1(),
+                    bias: ::wgpu::DepthBiasState::default(),
+                }),
+                multisample: ::wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
 
         let radii = [WGS84_A as f32, WGS84_B as f32, WGS84_A as f32];
         let (vertices, indices) = generate_ellipsoid_mesh(64, 128, radii);
@@ -1205,6 +1284,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             cities_pipeline,
             corridors_pipeline,
             regions_pipeline,
+            base_regions_pipeline,
             uniform_buffer,
             uniform_bind_group,
             depth_view,
@@ -1514,7 +1594,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 multiview_mask: None,
             });
 
-            rpass.set_pipeline(&ctx.regions_pipeline);
+            rpass.set_pipeline(&ctx.base_regions_pipeline);
             rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
             rpass.set_stencil_reference(1);
             rpass.set_vertex_buffer(0, ctx.base_regions_vertex_buffer.slice(..));

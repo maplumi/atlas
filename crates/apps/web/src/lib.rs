@@ -81,7 +81,7 @@ fn palette_for(theme: Theme) -> ThemePalette {
             globe_color: [0.10, 0.55, 0.85],
             stars_alpha: 1.0,
             canvas_2d_clear: "#020617",
-            base_surface_color: [0.20, 0.65, 0.35, 0.85],
+            base_surface_color: [0.20, 0.65, 0.35, 1.0],
         },
         Theme::DeepDark => ThemePalette {
             clear_color: ::wgpu::Color {
@@ -93,7 +93,7 @@ fn palette_for(theme: Theme) -> ThemePalette {
             globe_color: [0.07, 0.45, 0.75],
             stars_alpha: 1.1,
             canvas_2d_clear: "#000000",
-            base_surface_color: [0.16, 0.55, 0.30, 0.88],
+            base_surface_color: [0.16, 0.55, 0.30, 1.0],
         },
         Theme::Light => ThemePalette {
             clear_color: ::wgpu::Color {
@@ -105,7 +105,7 @@ fn palette_for(theme: Theme) -> ThemePalette {
             globe_color: [0.18, 0.55, 0.85],
             stars_alpha: 0.25,
             canvas_2d_clear: "#f8fafc",
-            base_surface_color: [0.12, 0.55, 0.25, 0.55],
+            base_surface_color: [0.12, 0.55, 0.25, 1.0],
         },
     }
 }
@@ -316,7 +316,7 @@ thread_local! {
         city_marker_size: 4.0,
         line_width_px: 2.5,
 
-        base_regions_style: LayerStyle { visible: true, color: [0.20, 0.65, 0.35, 0.85], lift: 0.0 },
+        base_regions_style: LayerStyle { visible: true, color: [0.20, 0.65, 0.35, 1.0], lift: 0.0 },
         cities_style: LayerStyle { visible: false, color: [1.0, 0.25, 0.25, 0.95], lift: 0.0 },
         corridors_style: LayerStyle { visible: false, color: [1.0, 0.85, 0.25, 0.90], lift: 0.0 },
         regions_style: LayerStyle { visible: false, color: [0.10, 0.90, 0.75, 0.30], lift: 0.0 },
@@ -595,6 +595,11 @@ async fn idb_delete_avc(id: &str) -> Result<(), JsValue> {
 
 fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
     v.max(lo).min(hi)
+}
+
+/// Returns wall-clock time in seconds (for idle detection, not tied to time_s).
+fn wall_clock_seconds() -> f64 {
+    js_sys::Date::now() / 1000.0
 }
 
 fn wrap_lon_deg(mut lon: f64) -> f64 {
@@ -1558,8 +1563,9 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
         {
             let mut lift_m = s.base_regions_style.lift * (WGS84_A as f32);
             if lift_m <= 0.0 {
-                // Keep base fills above the surface to avoid z-fighting.
-                lift_m = 500.0;
+                // Small lift combined with depth bias prevents z-fighting
+                // without causing visible "floating" at grazing angles.
+                lift_m = 100.0;
             }
             base_polys.extend(pos.iter().map(|&p| OverlayVertex {
                 position: p,
@@ -1574,8 +1580,8 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
         {
             let mut lift_m = s.regions_style.lift * (WGS84_A as f32);
             if lift_m <= 0.0 {
-                // Keep area fills slightly above the surface to avoid z-fighting.
-                lift_m = 50.0;
+                // Small lift combined with depth bias prevents z-fighting.
+                lift_m = 25.0;
             }
             polys.extend(pos.iter().map(|&p| OverlayVertex {
                 position: p,
@@ -1588,7 +1594,7 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
         {
             let mut lift_m = s.uploaded_regions_style.lift * (WGS84_A as f32);
             if lift_m <= 0.0 {
-                lift_m = 50.0;
+                lift_m = 25.0;
             }
             polys.extend(pos.iter().map(|&p| OverlayVertex {
                 position: p,
@@ -1767,16 +1773,16 @@ pub fn set_camera_yaw_deg(yaw_deg: f64) -> Result<(), JsValue> {
 pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
-        s.auto_rotate_last_user_time_s = s.time_s;
+        s.auto_rotate_last_user_time_s = wall_clock_seconds();
         match s.view_mode {
             ViewMode::ThreeD => {
                 // Scale orbit sensitivity to viewport size so drag feels consistent.
                 // Roughly: dragging across the shorter side ~= 180 degrees.
                 let min_dim = s.canvas_width.min(s.canvas_height).max(1.0);
                 let speed = std::f64::consts::PI / min_dim;
-                // Screen drag direction should feel like you're "pushing" the globe.
-                // Up => rotate northward, left => clockwise.
-                s.camera.yaw_rad -= delta_x_px * speed;
+                // Screen drag direction should feel like you're "grabbing" the globe surface.
+                // Drag left => globe rotates left (yaw increases).
+                s.camera.yaw_rad += delta_x_px * speed;
                 s.camera.pitch_rad = clamp(s.camera.pitch_rad - delta_y_px * speed, -1.55, 1.55);
 
                 // Keep yaw bounded to avoid precision loss over time.
@@ -1806,7 +1812,7 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
 pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
-        s.auto_rotate_last_user_time_s = s.time_s;
+        s.auto_rotate_last_user_time_s = wall_clock_seconds();
         match s.view_mode {
             ViewMode::ThreeD => {
                 let cam = s.camera;
@@ -1849,7 +1855,7 @@ pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
 pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
-        s.auto_rotate_last_user_time_s = s.time_s;
+        s.auto_rotate_last_user_time_s = wall_clock_seconds();
         match s.view_mode {
             ViewMode::ThreeD => {
                 let cam = s.camera;
@@ -3216,7 +3222,7 @@ pub fn set_auto_rotate_enabled(enabled: bool) {
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.auto_rotate_enabled = enabled;
-        s.auto_rotate_last_user_time_s = s.time_s;
+        s.auto_rotate_last_user_time_s = wall_clock_seconds();
     });
 }
 
@@ -4314,7 +4320,7 @@ pub fn advance_frame() -> Result<f64, JsValue> {
         }
 
         if s.view_mode == ViewMode::ThreeD && s.auto_rotate_enabled {
-            let idle = s.time_s - s.auto_rotate_last_user_time_s;
+            let idle = wall_clock_seconds() - s.auto_rotate_last_user_time_s;
             if idle >= s.auto_rotate_resume_delay_s {
                 let speed_rad = s.auto_rotate_speed_deg_per_s.to_radians();
                 s.camera.yaw_rad =

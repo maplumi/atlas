@@ -36,6 +36,9 @@ services:
       TERRAIN_MAX_COGS_PER_TILE: "${TERRAIN_MAX_COGS_PER_TILE:-16}"
     volumes:
       - terrain-data:/data/terrain
+      # Surface tiles directory - if empty, web client will fall back to PMTiles.
+      # To populate: place MVT tiles at data/terrain/surface/tiles/{z}/{x}/{y}.bin
+      # along with a tileset.json manifest.
       - ./data/terrain/surface:/data/terrain/surface:ro
 
 volumes:

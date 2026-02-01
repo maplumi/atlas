@@ -978,8 +978,9 @@
             wasm.append_base_world_geojson_chunk(JSON.stringify(fc));
             pendingFeatures = [];
             pendingTiles = 0;
-            // Expensive: triangulation + GPU upload. Throttle this hard.
-            wasm.finish_base_world_stream();
+            // NOTE: We no longer call finish_base_world_stream() here to avoid
+            // expensive triangulation + GPU upload on every batch. The final
+            // call happens once at the end of the entire PMTiles load.
           }
 
           function tryResolvePolygonLayer(tile) {
