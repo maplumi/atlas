@@ -74,6 +74,26 @@ pub struct WebhookSource {
     pub transform: Option<String>, // JSONPath or jq-like transform
 }
 
+/// Info about a webhook source for API responses.
+#[derive(Debug, Clone, Serialize)]
+pub struct WebhookSourceInfo {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub schema: WebhookSchema,
+}
+
+impl From<&WebhookSource> for WebhookSourceInfo {
+    fn from(source: &WebhookSource) -> Self {
+        Self {
+            id: source.id.clone(),
+            name: source.name.clone(),
+            description: source.description.clone(),
+            schema: source.schema.clone(),
+        }
+    }
+}
+
 /// Schema for validating incoming webhook data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -122,6 +142,23 @@ impl WebhookRegistry {
     /// Get a broadcast receiver for data updates.
     pub fn subscribe(&self) -> broadcast::Receiver<DataUpdate> {
         self.broadcaster.subscribe()
+    }
+
+    /// List all registered webhook sources.
+    pub fn list_sources(&self) -> Vec<WebhookSourceInfo> {
+        self.sources
+            .read()
+            .values()
+            .map(WebhookSourceInfo::from)
+            .collect()
+    }
+
+    /// Get info about a specific webhook source.
+    pub fn get_source_info(&self, source_id: &str) -> Option<WebhookSourceInfo> {
+        self.sources
+            .read()
+            .get(source_id)
+            .map(WebhookSourceInfo::from)
     }
 
     /// Check rate limit for a source.

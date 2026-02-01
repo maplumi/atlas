@@ -61,12 +61,45 @@ impl DataSourceRegistry {
         self.sources.write().insert(name.to_string(), source);
     }
 
+    pub fn unregister(&self, name: &str) -> Option<Arc<dyn DataSource + Send + Sync>> {
+        self.sources.write().remove(name)
+    }
+
     pub fn get(&self, name: &str) -> Option<Arc<dyn DataSource + Send + Sync>> {
         self.sources.read().get(name).cloned()
     }
 
     pub fn list(&self) -> Vec<String> {
         self.sources.read().keys().cloned().collect()
+    }
+
+    /// List all sources with their metadata.
+    pub fn list_with_metadata(&self) -> Vec<crate::data_sources::DataSourceInfo> {
+        self.sources
+            .read()
+            .iter()
+            .map(|(id, source)| crate::data_sources::DataSourceInfo {
+                id: id.clone(),
+                metadata: source.metadata().clone(),
+            })
+            .collect()
+    }
+
+    /// Get info about a specific source.
+    pub fn get_info(&self, name: &str) -> Option<crate::data_sources::DataSourceInfo> {
+        self.sources
+            .read()
+            .get(name)
+            .map(|source| crate::data_sources::DataSourceInfo {
+                id: name.to_string(),
+                metadata: source.metadata().clone(),
+            })
+    }
+
+    /// Check if a source has a specific tile.
+    pub async fn has_tile(&self, source_name: &str, coord: TileCoord) -> Option<bool> {
+        let source = self.get(source_name)?;
+        source.has_tile(coord).await.ok()
     }
 }
 

@@ -57,7 +57,7 @@ impl DataSourceError {
 }
 
 /// Metadata about a data source.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct DataSourceMetadata {
     pub name: String,
     pub description: Option<String>,
@@ -68,6 +68,13 @@ pub struct DataSourceMetadata {
     pub center: Option<(f64, f64, u8)>,       // lon, lat, zoom
     pub format: TileFormat,
     pub layers: Vec<String>,
+}
+
+/// Info about a data source for API responses.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DataSourceInfo {
+    pub id: String,
+    pub metadata: DataSourceMetadata,
 }
 
 /// Type alias for a boxed future that can be sent between threads.

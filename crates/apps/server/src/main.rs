@@ -24,7 +24,9 @@ mod data_sources;
 mod webhooks;
 mod ws_streaming;
 
-use data_sources::FilesystemSource;
+use data_sources::{
+    DataSource, DataSourceInfo, FilesystemSource, HttpSource, MemorySource, PmtilesSource,
+};
 use webhooks::{WebhookConfig, WebhookRegistry, WebhookSchema, WebhookSource};
 use ws_streaming::DataSourceRegistry;
 
@@ -187,8 +189,40 @@ async fn main() {
         .route("/terrain/tiles/:z/:x/:y.bin", get(get_tile))
         .route("/surface/tileset.json", get(get_surface_tileset))
         .route("/surface/tiles/:z/:x/:y.bin", get(get_surface_tile))
+        // Data source management API
+        .route(
+            "/api/sources",
+            get(list_data_sources).post(create_data_source),
+        )
+        .route(
+            "/api/sources/:source_id",
+            get(get_data_source_info).delete(delete_data_source),
+        )
+        .route(
+            "/api/sources/:source_id/tiles/:z/:x/:y",
+            get(get_source_tile),
+        )
+        .route(
+            "/api/sources/:source_id/tiles/batch",
+            post(get_source_tiles_batch),
+        )
+        .route(
+            "/api/sources/:source_id/has/:z/:x/:y",
+            get(check_source_has_tile),
+        )
+        // Webhook management API
+        .route(
+            "/api/webhooks",
+            get(list_webhook_sources).post(create_webhook_source),
+        )
+        .route(
+            "/api/webhooks/:source_id",
+            get(get_webhook_source_info).delete(delete_webhook_source),
+        )
         // WebSocket tile streaming
         .route("/ws/tiles", get(ws_tiles_handler))
+        // WebSocket for real-time webhook data
+        .route("/ws/realtime", get(ws_realtime_handler))
         // Webhook ingestion
         .route("/webhook/:source_id", post(webhook_handler))
         .layer(cors)
@@ -230,6 +264,475 @@ async fn webhook_handler(
     {
         Ok(()) => (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response(),
         Err(e) => e.into_response(),
+    }
+}
+
+// ============================================================================
+// Data Source API Handlers
+// ============================================================================
+
+/// List all available data sources.
+async fn list_data_sources(State(state): State<AppState>) -> impl IntoResponse {
+    let sources: Vec<DataSourceInfo> = state
+        .data_sources
+        .list_with_metadata()
+        .into_iter()
+        .collect();
+    Json(json!({ "sources": sources }))
+}
+
+/// Get info about a specific data source.
+async fn get_data_source_info(
+    State(state): State<AppState>,
+    AxumPath(source_id): AxumPath<String>,
+) -> impl IntoResponse {
+    match state.data_sources.get_info(&source_id) {
+        Some(info) => Json(json!(info)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Source not found" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Get a single tile from a data source.
+async fn get_source_tile(
+    State(state): State<AppState>,
+    AxumPath((source_id, z, x, y)): AxumPath<(String, u8, u32, u32)>,
+) -> impl IntoResponse {
+    let source = match state.data_sources.get(&source_id) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Source not found" })),
+            )
+                .into_response()
+        }
+    };
+
+    let coord = streaming::TileCoord::new(z, x, y);
+    match source.get_tile(coord).await {
+        Ok(Some(data)) => {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "Content-Type",
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            (StatusCode::OK, headers, Body::from(data)).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Tile not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
+/// Batch request for tiles from a data source.
+#[derive(serde::Deserialize)]
+struct BatchTileRequest {
+    tiles: Vec<TileCoordRequest>,
+}
+
+#[derive(serde::Deserialize)]
+struct TileCoordRequest {
+    z: u8,
+    x: u32,
+    y: u32,
+}
+
+#[derive(serde::Serialize)]
+struct BatchTileResponse {
+    tiles: Vec<TileResult>,
+}
+
+#[derive(serde::Serialize)]
+struct TileResult {
+    z: u8,
+    x: u32,
+    y: u32,
+    found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data_base64: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+/// Get multiple tiles from a data source in one request.
+async fn get_source_tiles_batch(
+    State(state): State<AppState>,
+    AxumPath(source_id): AxumPath<String>,
+    Json(request): Json<BatchTileRequest>,
+) -> impl IntoResponse {
+    let source = match state.data_sources.get(&source_id) {
+        Some(s) => s,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "error": "Source not found" })),
+            )
+                .into_response()
+        }
+    };
+
+    let coords: Vec<streaming::TileCoord> = request
+        .tiles
+        .iter()
+        .map(|t| streaming::TileCoord::new(t.z, t.x, t.y))
+        .collect();
+
+    let results = source.get_tiles(coords.clone()).await;
+
+    let tiles: Vec<TileResult> = coords
+        .iter()
+        .zip(results.into_iter())
+        .map(|(coord, result)| match result {
+            Ok(Some(data)) => TileResult {
+                z: coord.z,
+                x: coord.x,
+                y: coord.y,
+                found: true,
+                data_base64: Some(base64_encode(&data)),
+                error: None,
+            },
+            Ok(None) => TileResult {
+                z: coord.z,
+                x: coord.x,
+                y: coord.y,
+                found: false,
+                data_base64: None,
+                error: None,
+            },
+            Err(e) => TileResult {
+                z: coord.z,
+                x: coord.x,
+                y: coord.y,
+                found: false,
+                data_base64: None,
+                error: Some(e.to_string()),
+            },
+        })
+        .collect();
+
+    Json(BatchTileResponse { tiles }).into_response()
+}
+
+/// Check if a data source has a specific tile.
+async fn check_source_has_tile(
+    State(state): State<AppState>,
+    AxumPath((source_id, z, x, y)): AxumPath<(String, u8, u32, u32)>,
+) -> impl IntoResponse {
+    let coord = streaming::TileCoord::new(z, x, y);
+    match state.data_sources.has_tile(&source_id, coord).await {
+        Some(true) => Json(json!({ "has_tile": true })),
+        Some(false) => Json(json!({ "has_tile": false })),
+        None => Json(json!({ "error": "Source not found", "has_tile": false })),
+    }
+}
+
+/// Request to create a new data source.
+#[derive(serde::Deserialize)]
+struct CreateDataSourceRequest {
+    /// Unique identifier for the source.
+    id: String,
+    /// Type of data source: "filesystem", "http", "pmtiles", "memory".
+    source_type: String,
+    /// Path (for filesystem/pmtiles) or URL template (for http).
+    path_or_url: Option<String>,
+    /// Display name for the source.
+    name: Option<String>,
+    /// Tile format: "mvt", "png", "jpg", "webp", "quantized_mesh".
+    format: Option<String>,
+    /// File extension for filesystem sources (e.g., "png", "bin").
+    extension: Option<String>,
+}
+
+/// Create a new data source dynamically.
+async fn create_data_source(
+    State(state): State<AppState>,
+    Json(request): Json<CreateDataSourceRequest>,
+) -> impl IntoResponse {
+    use streaming::TileFormat;
+
+    // Parse tile format
+    let format = match request.format.as_deref() {
+        Some("mvt") | None => TileFormat::Mvt,
+        Some("png") => TileFormat::Png,
+        Some("jpg") | Some("jpeg") => TileFormat::Jpeg,
+        Some("webp") => TileFormat::Webp,
+        Some("quantized_mesh") | Some("terrain") => TileFormat::QuantizedMesh,
+        Some(other) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Unknown tile format: {}", other) })),
+            )
+                .into_response()
+        }
+    };
+
+    let extension = request.extension.clone().unwrap_or_else(|| match format {
+        streaming::TileFormat::Png => "png".to_string(),
+        streaming::TileFormat::Jpeg => "jpg".to_string(),
+        streaming::TileFormat::Webp => "webp".to_string(),
+        streaming::TileFormat::Mvt => "mvt".to_string(),
+        streaming::TileFormat::QuantizedMesh => "bin".to_string(),
+        streaming::TileFormat::GeoJson => "geojson".to_string(),
+        streaming::TileFormat::HeightmapF32 | streaming::TileFormat::HeightmapI16 => {
+            "bin".to_string()
+        }
+        streaming::TileFormat::Other => "bin".to_string(),
+    });
+
+    // Create the appropriate source type
+    let source: Arc<dyn DataSource + Send + Sync> = match request.source_type.as_str() {
+        "filesystem" => {
+            let path = match &request.path_or_url {
+                Some(p) => p.clone(),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "path_or_url required for filesystem source" })),
+                    )
+                        .into_response()
+                }
+            };
+            Arc::new(FilesystemSource::new(
+                path,
+                request.name.clone().unwrap_or_else(|| request.id.clone()),
+                format,
+                extension,
+            ))
+        }
+        "http" => {
+            let url_template = match &request.path_or_url {
+                Some(u) => u.clone(),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "path_or_url required for http source" })),
+                    )
+                        .into_response()
+                }
+            };
+            Arc::new(HttpSource::new(
+                url_template,
+                request.name.clone().unwrap_or_else(|| request.id.clone()),
+                format,
+            ))
+        }
+        "pmtiles" => {
+            let path = match &request.path_or_url {
+                Some(p) => p.clone(),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({ "error": "path_or_url required for pmtiles source" })),
+                    )
+                        .into_response()
+                }
+            };
+            Arc::new(PmtilesSource::new(
+                path,
+                request.name.clone().unwrap_or_else(|| request.id.clone()),
+            ))
+        }
+        "memory" => Arc::new(MemorySource::new(
+            request.name.clone().unwrap_or_else(|| request.id.clone()),
+            format,
+        )),
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Unknown source type: {}", other) })),
+            )
+                .into_response()
+        }
+    };
+
+    state.data_sources.register(&request.id, source);
+    (
+        StatusCode::CREATED,
+        Json(json!({ "id": request.id, "created": true })),
+    )
+        .into_response()
+}
+
+/// Delete a data source.
+async fn delete_data_source(
+    State(state): State<AppState>,
+    AxumPath(source_id): AxumPath<String>,
+) -> impl IntoResponse {
+    match state.data_sources.unregister(&source_id) {
+        Some(_) => Json(json!({ "id": source_id, "deleted": true })),
+        None => Json(json!({ "error": "Source not found", "deleted": false })),
+    }
+}
+
+/// Simple base64 encoding for tile data.
+fn base64_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
+
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+
+        result.push(ALPHABET[(b0 >> 2) as usize] as char);
+        result.push(ALPHABET[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+
+        if chunk.len() > 1 {
+            result.push(ALPHABET[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            result.push('=');
+        }
+
+        if chunk.len() > 2 {
+            result.push(ALPHABET[(b2 & 0x3f) as usize] as char);
+        } else {
+            result.push('=');
+        }
+    }
+
+    result
+}
+
+// ============================================================================
+// Webhook API Handlers
+// ============================================================================
+
+/// List all registered webhook sources.
+async fn list_webhook_sources(State(state): State<AppState>) -> impl IntoResponse {
+    let sources = state.webhooks.list_sources();
+    Json(json!({ "sources": sources }))
+}
+
+/// Get info about a specific webhook source.
+async fn get_webhook_source_info(
+    State(state): State<AppState>,
+    AxumPath(source_id): AxumPath<String>,
+) -> impl IntoResponse {
+    match state.webhooks.get_source_info(&source_id) {
+        Some(info) => Json(json!(info)).into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "Webhook source not found" })),
+        )
+            .into_response(),
+    }
+}
+
+/// Request to create a new webhook source.
+#[derive(serde::Deserialize)]
+struct CreateWebhookSourceRequest {
+    /// Unique identifier for the source.
+    id: String,
+    /// Display name.
+    name: String,
+    /// Description of the webhook source.
+    description: Option<String>,
+    /// Schema definition for data validation.
+    schema: Option<WebhookSchema>,
+    /// Optional JSONPath/jq-like transform expression.
+    transform: Option<String>,
+}
+
+/// Create a new webhook source.
+async fn create_webhook_source(
+    State(state): State<AppState>,
+    Json(request): Json<CreateWebhookSourceRequest>,
+) -> impl IntoResponse {
+    let source = WebhookSource {
+        id: request.id.clone(),
+        name: request.name,
+        description: request.description,
+        schema: request.schema.unwrap_or(WebhookSchema::Raw),
+        transform: request.transform,
+    };
+    state.webhooks.register_source(source);
+    (
+        StatusCode::CREATED,
+        Json(json!({ "id": request.id, "created": true })),
+    )
+}
+
+/// Delete a webhook source.
+async fn delete_webhook_source(
+    State(state): State<AppState>,
+    AxumPath(source_id): AxumPath<String>,
+) -> impl IntoResponse {
+    state.webhooks.unregister_source(&source_id);
+    Json(json!({ "id": source_id, "deleted": true }))
+}
+
+/// WebSocket handler for real-time webhook data streaming.
+async fn ws_realtime_handler(
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_realtime_ws(socket, state.webhooks.clone()))
+}
+
+/// Handle real-time WebSocket connection - streams webhook data to clients.
+async fn handle_realtime_ws(socket: axum::extract::ws::WebSocket, webhooks: Arc<WebhookRegistry>) {
+    use futures_util::{SinkExt, StreamExt};
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let mut subscriber = webhooks.subscribe();
+
+    // Send hello message
+    let hello = json!({
+        "type": "hello",
+        "message": "Connected to real-time webhook stream"
+    });
+    if ws_tx
+        .send(axum::extract::ws::Message::Text(hello.to_string()))
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    loop {
+        tokio::select! {
+            // Forward webhook data to client
+            Ok(update) = subscriber.recv() => {
+                let msg = json!({
+                    "type": "data",
+                    "source_id": update.source_id,
+                    "timestamp": update.timestamp.duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0),
+                    "data": update.data
+                });
+                if ws_tx
+                    .send(axum::extract::ws::Message::Text(msg.to_string()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            // Handle client messages (ping/pong, close)
+            msg = ws_rx.next() => {
+                match msg {
+                    Some(Ok(axum::extract::ws::Message::Close(_))) | None => break,
+                    Some(Ok(axum::extract::ws::Message::Ping(data))) => {
+                        if ws_tx.send(axum::extract::ws::Message::Pong(data)).await.is_err() {
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 }
 
