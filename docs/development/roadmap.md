@@ -106,3 +106,20 @@ Status legend:
 ## Validation
 - [x] `cargo fmt`, `cargo clippy`, `cargo test` (workspace)
 - [x] `trunk serve` works for the web viewer
+
+## 11a) Server (tile streaming + webhooks)
+- [x] WebSocket tile streaming protocol (`crates/streaming/src/protocol.rs`)
+- [x] View-driven tile prioritization with backpressure (`crates/apps/server/src/ws_streaming.rs`)
+- [x] Data source abstraction layer (`crates/apps/server/src/data_sources.rs`)
+- [x] Webhook ingestion for real-time data (`crates/apps/server/src/webhooks.rs`)
+- [ ] PMTiles server-side reading with HTTP range requests
+- [ ] Tile caching layer with LRU eviction
+- [ ] Metrics and observability for streaming sessions
+
+## 11b) AI/Agentic Capabilities (future)
+- [ ] Intent parser for natural language → structured query
+- [ ] Data gatherer abstraction for multi-source queries
+- [ ] Analyzer integration with compute graph
+- [ ] Synthesizer for narrative + layer generation
+- [ ] Cost/rate limiting for LLM API calls
+- See: [docs/technical/architecture/agentic-capabilities.md](../technical/architecture/agentic-capabilities.md)

@@ -3,14 +3,16 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use axum::body::Body;
+use axum::body::{Body, Bytes};
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use axum::Router;
+use axum::routing::{get, post};
+use axum::{Json, Router};
 use serde::Serialize;
 use serde_json::json;
+use streaming::StreamingConfig;
 use tempfile::TempDir;
 use tokio::process::Command;
 use tower_http::cors::{Any, CorsLayer};
@@ -18,11 +20,22 @@ use tower_http::trace::TraceLayer;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
+mod data_sources;
+mod webhooks;
+mod ws_streaming;
+
+use data_sources::FilesystemSource;
+use webhooks::{WebhookConfig, WebhookRegistry, WebhookSchema, WebhookSource};
+use ws_streaming::DataSourceRegistry;
+
 #[derive(Clone)]
 struct AppState {
     terrain: Arc<TerrainConfig>,
     surface_root: PathBuf,
     http: reqwest::Client,
+    data_sources: Arc<DataSourceRegistry>,
+    webhooks: Arc<WebhookRegistry>,
+    streaming_config: StreamingConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -111,10 +124,48 @@ async fn main() {
         max_cogs_per_tile: env_var_usize("TERRAIN_MAX_COGS_PER_TILE", 16),
     };
 
+    // Initialize data source registry
+    let data_sources = Arc::new(DataSourceRegistry::new());
+
+    // Register terrain tiles as a data source
+    let terrain_source = FilesystemSource::new(
+        terrain.cache_root.join("tiles"),
+        "terrain",
+        streaming::TileFormat::HeightmapF32,
+        "bin",
+    );
+    data_sources.register("terrain", Arc::new(terrain_source));
+
+    // Register surface tiles if available
+    let surface_source = FilesystemSource::new(
+        surface_root.clone(),
+        "surface",
+        streaming::TileFormat::Mvt,
+        "bin",
+    );
+    data_sources.register("surface", Arc::new(surface_source));
+
+    // Initialize webhook registry
+    let webhooks = Arc::new(WebhookRegistry::new(WebhookConfig::default()));
+
+    // Register default webhook sources
+    webhooks.register_source(WebhookSource {
+        id: "realtime".to_string(),
+        name: "Real-time GeoJSON".to_string(),
+        description: Some("Accept GeoJSON features for real-time display".to_string()),
+        schema: WebhookSchema::GeoJson,
+        transform: None,
+    });
+
+    let streaming_config = StreamingConfig::default();
+
     let state = AppState {
         terrain: Arc::new(terrain),
         surface_root,
         http: reqwest::Client::new(),
+        data_sources: data_sources.clone(),
+        webhooks: webhooks.clone(),
+        streaming_config: streaming_config.clone(),
     };
 
     if let Err(err) = tokio::fs::create_dir_all(&state.terrain.cache_root).await {
@@ -136,14 +187,50 @@ async fn main() {
         .route("/terrain/tiles/:z/:x/:y.bin", get(get_tile))
         .route("/surface/tileset.json", get(get_surface_tileset))
         .route("/surface/tiles/:z/:x/:y.bin", get(get_surface_tile))
+        // WebSocket tile streaming
+        .route("/ws/tiles", get(ws_tiles_handler))
+        // Webhook ingestion
+        .route("/webhook/:source_id", post(webhook_handler))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());
 
     info!("terrain server listening on http://{addr}");
+    info!("WebSocket tile streaming available at ws://{addr}/ws/tiles");
     axum::serve(tokio::net::TcpListener::bind(addr).await.unwrap(), app)
         .await
         .unwrap();
+}
+
+/// WebSocket upgrade handler for tile streaming.
+async fn ws_tiles_handler(
+    State(state): State<AppState>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| {
+        ws_streaming::handle_ws_connection(
+            socket,
+            state.data_sources.clone(),
+            state.streaming_config.clone(),
+        )
+    })
+}
+
+/// Webhook ingestion handler.
+async fn webhook_handler(
+    State(state): State<AppState>,
+    AxumPath(source_id): AxumPath<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    match state
+        .webhooks
+        .process_webhook(&source_id, &headers, &body)
+        .await
+    {
+        Ok(()) => (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 async fn healthz() -> Response {

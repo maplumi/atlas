@@ -9,15 +9,24 @@ name = "server"
 path = "src/main.rs"
 
 [dependencies]
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
+axum-extra = { version = "0.9", features = ["typed-header"] }
 bytes = "1"
+dashmap = "6"
 futures-util = "0.3"
 http = "1"
+parking_lot = "0.12"
+pmtiles = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "sync", "process"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "sync", "process", "time"] }
+tokio-tungstenite = "0.24"
 tower-http = { version = "0.5", features = ["cors", "trace"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1", features = ["v4"] }
+
+# Workspace crates for shared protocol types
+streaming = { path = "../../streaming" }

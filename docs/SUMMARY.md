@@ -41,6 +41,7 @@
     - [Determinism and Replay](technical/architecture/determinism-and-replay.md)
     - [Security and Sandboxing](technical/architecture/security-and-sandboxing.md)
     - [XR and VR](technical/architecture/xr-and-vr.md)
+    - [Agentic Capabilities](technical/architecture/agentic-capabilities.md)
   - [Maths](technical/maths/README.md)
     - [Spatiotemporal Foundations](technical/maths/spatiotemporal-foundations.md)
     - [Geodesy and CRS](technical/maths/geodesy-and-crs.md)
