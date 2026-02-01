@@ -505,6 +505,22 @@
             <div id="cursor-text" style="font-size:12px; color:var(--muted); margin-top:6px;">Cursor: —</div>
             <div id="pick-text" style="font-size:12px; color:var(--muted); margin-top:2px;">Pick: —</div>
           </div>
+
+          <div class="section">
+            <h3>Surface</h3>
+            <label class="checkbox">
+              <input id="surface-use-pmtiles" type="checkbox" checked />
+              <span>Use lightweight PMTiles base surface</span>
+            </label>
+            <label for="surface-pmtiles-max-zoom" style="margin-top:8px;">PMTiles refinement max zoom</label>
+            <div class="row">
+              <input id="surface-pmtiles-max-zoom" type="range" min="0" max="5" step="1" value="3" />
+              <span id="surface-pmtiles-max-zoom-value" class="value">3</span>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.35; margin-top:8px;">
+              Loads z0 immediately, then refines up to the max zoom. Higher zoom = more detail + more requests.
+            </div>
+          </div>
         </div>
 
         <div id="tab-layers" class="tab-page hidden">
@@ -935,10 +951,80 @@
         }
       }
 
+      function getPmtilesSurfacePrefs() {
+        let enabled = true;
+        let maxZoom = 3;
+        try {
+          const v = localStorage.getItem("atlas-surface-pmtiles-enabled");
+          if (v === "false") enabled = false;
+          if (v === "true") enabled = true;
+        } catch (_) {}
+        try {
+          const z = Number(localStorage.getItem("atlas-surface-pmtiles-max-zoom"));
+          if (Number.isFinite(z)) maxZoom = Math.max(0, Math.min(5, Math.floor(z)));
+        } catch (_) {}
+        return { enabled, maxZoom };
+      }
+
+      function setPmtilesSurfacePrefs(enabled, maxZoom) {
+        try { localStorage.setItem("atlas-surface-pmtiles-enabled", enabled ? "true" : "false"); } catch (_) {}
+        try { localStorage.setItem("atlas-surface-pmtiles-max-zoom", String(maxZoom)); } catch (_) {}
+      }
+
+      function applyPmtilesSurfacePrefsToGlobals(prefs) {
+        window.ATLAS_USE_PMTILES_SURFACE = !!prefs.enabled;
+        window.ATLAS_PMTILES_MAX_ZOOM = prefs.maxZoom;
+      }
+
+      async function reloadBaseSurface(wasm) {
+        // Prefer backend surface tiles if available (existing behavior), otherwise base-world fallback.
+        // Here we only decide the fallback base-world source.
+        const prefs = getPmtilesSurfacePrefs();
+        applyPmtilesSurfacePrefsToGlobals(prefs);
+        if (prefs.enabled) {
+          const ok = await tryLoadPmtilesBaseSurface(wasm);
+          if (ok) return;
+        }
+        try { wasm.load_base_world?.(); } catch (err) { console.error("load_base_world failed", err); }
+      }
+
+      function wireSurfacePrefs(wasm) {
+        const cb = document.getElementById("surface-use-pmtiles");
+        const slider = document.getElementById("surface-pmtiles-max-zoom");
+        const value = document.getElementById("surface-pmtiles-max-zoom-value");
+        if (!cb || !slider || !value) return;
+
+        const prefs = getPmtilesSurfacePrefs();
+        cb.checked = !!prefs.enabled;
+        slider.value = String(prefs.maxZoom);
+        value.textContent = String(prefs.maxZoom);
+
+        const apply = async () => {
+          const enabled = !!cb.checked;
+          const maxZoom = Math.max(0, Math.min(5, Math.floor(Number(slider.value) || 0)));
+          slider.value = String(maxZoom);
+          value.textContent = String(maxZoom);
+          setPmtilesSurfacePrefs(enabled, maxZoom);
+          await reloadBaseSurface(wasm);
+        };
+
+        cb.addEventListener("change", () => {
+          apply().catch((e) => console.warn("surface apply failed", e));
+        });
+        slider.addEventListener("input", () => {
+          const maxZoom = Math.max(0, Math.min(5, Math.floor(Number(slider.value) || 0)));
+          value.textContent = String(maxZoom);
+        });
+        slider.addEventListener("change", () => {
+          apply().catch((e) => console.warn("surface apply failed", e));
+        });
+      }
+
       function main(wasm) {
         // Apply theme early so both UI and renderer pick consistent defaults.
         const theme = applyTheme(getInitialTheme(), wasm);
         wireUi(wasm);
+        wireSurfacePrefs(wasm);
         resizeCanvas(wasm);
         window.addEventListener("resize", () => {
           resizeCanvas(wasm);
@@ -948,12 +1034,10 @@
         });
         wasm.init_canvas_2d();
         wasm.init_wgpu();
-        // Prefer PMTiles base surface (lightweight) with fallback to the legacy world.json.
-        tryLoadPmtilesBaseSurface(wasm).then((ok) => {
-          if (!ok) {
-            try { wasm.load_base_world?.(); } catch (err) { console.error("load_base_world failed", err); }
-          }
-        });
+        // Apply persisted surface prefs and load base surface.
+        const prefs = getPmtilesSurfacePrefs();
+        applyPmtilesSurfacePrefsToGlobals(prefs);
+        reloadBaseSurface(wasm);
         detectBackendAvailability(wasm);
         startSurfaceStatusPolling(wasm);
         startTerrainClientStatusPolling(wasm);

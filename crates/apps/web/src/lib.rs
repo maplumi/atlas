@@ -247,6 +247,7 @@ struct ViewerState {
 
     base_world_loading: bool,
     base_world_error: Option<String>,
+    base_world_source: Option<String>,
 
     surface_tileset: Option<SurfaceTileset>,
     surface_positions: Option<Vec<[f32; 3]>>,
@@ -338,6 +339,7 @@ thread_local! {
 
         base_world_loading: false,
         base_world_error: None,
+        base_world_source: None,
 
         surface_tileset: None,
         surface_positions: None,
@@ -2209,6 +2211,7 @@ fn ensure_base_world_loaded() {
         let mut s = state.borrow_mut();
         s.base_world_loading = true;
         s.base_world_error = None;
+        s.base_world_source = Some("world.json".to_string());
     });
 
     spawn_local(async move {
@@ -2262,6 +2265,7 @@ pub fn begin_base_world_stream() {
         s.surface_last_error = None;
         s.base_world_loading = true;
         s.base_world_error = None;
+        s.base_world_source = Some("world.pmtiles".to_string());
         s.base_count_polys = 0;
     });
     let _ = rebuild_overlays_and_upload();
@@ -3038,7 +3042,9 @@ pub fn get_surface_status() -> JsValue {
         let source = if s.surface_positions.is_some() {
             s.surface_source.clone()
         } else if s.base_world.is_some() {
-            Some("world.json".to_string())
+            s.base_world_source
+                .clone()
+                .or_else(|| Some("world.json".to_string()))
         } else {
             None
         };
