@@ -13,7 +13,6 @@ use std::time::{Duration, Instant};
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::RwLock;
-use serde_json;
 use streaming::{ClientMessage, ServerMessage, StreamingConfig, TileCoord, ViewId, ViewState};
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
@@ -128,7 +127,7 @@ pub async fn handle_ws_connection(
     };
 
     if let Err(e) = ws_tx
-        .send(Message::Text(serde_json::to_string(&hello).unwrap().into()))
+        .send(Message::Text(serde_json::to_string(&hello).unwrap()))
         .await
     {
         error!("Failed to send hello: {e}");
@@ -150,7 +149,7 @@ pub async fn handle_ws_connection(
                     continue;
                 }
             };
-            if let Err(e) = ws_tx.send(Message::Text(text.into())).await {
+            if let Err(e) = ws_tx.send(Message::Text(text)).await {
                 warn!("Failed to send message: {e}");
                 break;
             }
@@ -426,7 +425,7 @@ async fn handle_explicit_tile_request(
 
 /// Compute the visible tile range for a given view and zoom.
 fn visible_tile_range(view: &ViewState, z: u8) -> (u32, u32, u32, u32) {
-    let tiles_per_side = 1u32 << z;
+    let _tiles_per_side = 1u32 << z;
     let radius = view_radius_deg(view);
 
     let lon_min = view.lon - radius;

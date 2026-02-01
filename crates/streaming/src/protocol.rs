@@ -137,7 +137,7 @@ impl ViewState {
         let dist = (dlon * dlon + dlat * dlat).sqrt();
 
         // Priority: closer tiles and appropriate zoom levels get lower (better) priority.
-        let zoom_diff = (coord.z as i32 - self.estimated_zoom() as i32).abs() as u32;
+        let zoom_diff = (coord.z as i32 - self.estimated_zoom() as i32).unsigned_abs();
         let dist_score = (dist * 1000.0) as u32;
 
         zoom_diff * 10000 + dist_score
