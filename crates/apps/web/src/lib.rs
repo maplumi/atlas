@@ -193,7 +193,8 @@ impl Default for CameraState {
         Self {
             // Default view: center Africa (roughly central longitude/latitude).
             // In this viewer, yaw ~ longitude and pitch ~ latitude for the point facing the camera.
-            yaw_rad: 20f64.to_radians(),
+            // Yaw ~160° places Africa (lon ~20°E) in front of the camera.
+            yaw_rad: 160f64.to_radians(),
             pitch_rad: 5f64.to_radians(),
             distance: 3.0 * WGS84_A,
             target: [0.0, 0.0, 0.0],

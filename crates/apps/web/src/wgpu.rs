@@ -443,7 +443,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 compare: ::wgpu::CompareFunction::Always,
                 fail_op: ::wgpu::StencilOperation::Keep,
                 depth_fail_op: ::wgpu::StencilOperation::Keep,
-                pass_op: ::wgpu::StencilOperation::Replace,
+                pass_op: ::wgpu::StencilOperation::Keep,
             },
             read_mask: 0xff,
             write_mask: 0xff,
@@ -521,12 +521,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 let i2 = i0 + stride;
                 let i3 = i2 + 1;
 
+                // CCW winding when viewed from outside the sphere.
                 indices.push(i0 as u16);
-                indices.push(i2 as u16);
-                indices.push(i1 as u16);
                 indices.push(i1 as u16);
                 indices.push(i2 as u16);
+                indices.push(i1 as u16);
                 indices.push(i3 as u16);
+                indices.push(i2 as u16);
             }
         }
 
@@ -817,10 +818,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 topology: ::wgpu::PrimitiveTopology::TriangleList,
                 strip_index_format: None,
                 front_face: ::wgpu::FrontFace::Ccw,
-                // Disable culling for now. If winding ends up opposite what we expect
-                // (common when generating sphere indices), culling will make the globe
-                // completely disappear and you'll only see the clear color.
-                cull_mode: None,
+                // Cull back faces so overlays don't show through the far side of the globe.
+                cull_mode: Some(::wgpu::Face::Back),
                 polygon_mode: ::wgpu::PolygonMode::Fill,
                 unclipped_depth: false,
                 conservative: false,
