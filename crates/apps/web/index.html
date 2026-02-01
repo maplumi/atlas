@@ -838,6 +838,24 @@
         // Feature flag (optional): set `window.ATLAS_USE_PMTILES_SURFACE = false` to disable.
         if (window.ATLAS_USE_PMTILES_SURFACE === false) return false;
 
+        // Debugging must survive reloads; window globals do not.
+        // Enable via either:
+        //  - URL: http://localhost:9103/?pmtiles_debug=1
+        //  - DevTools: localStorage.setItem('atlas-pmtiles-debug','true')
+        const debug = (() => {
+          try {
+            if (window.ATLAS_PMTILES_DEBUG === true) return true;
+          } catch (_) {}
+          try {
+            const q = new URLSearchParams(location.search);
+            if (q.get("pmtiles_debug") === "1" || q.get("pmtiles_debug") === "true") return true;
+          } catch (_) {}
+          try {
+            return localStorage.getItem("atlas-pmtiles-debug") === "true";
+          } catch (_) {}
+          return false;
+        })();
+
         const url = "assets/world.pmtiles";
         try {
           // Load libs on demand.
@@ -855,10 +873,43 @@
           const header = await p.getHeader();
           const maxZoomAvailable = Number.isFinite(header?.maxZoom) ? header.maxZoom : 0;
 
+          // Read metadata for easier layer discovery.
+          let metadata = null;
+          try {
+            metadata = await p.getMetadata();
+          } catch (_) {
+            metadata = null;
+          }
+
+          if (debug) {
+            console.log("PMTiles header", header);
+            console.log("PMTiles metadata keys", metadata ? Object.keys(metadata) : null);
+            console.log(
+              "PMTiles vector_layers",
+              metadata?.vector_layers ? metadata.vector_layers.map((vl) => vl?.id).filter(Boolean) : null,
+            );
+          }
+
           // Limit global refinement to avoid hammering the browser with requests.
           // You can override via `window.ATLAS_PMTILES_MAX_ZOOM`.
-          const maxZoom = Math.max(0, Math.min(maxZoomAvailable, Number(window.ATLAS_PMTILES_MAX_ZOOM ?? 3)));
-          const layerId = String(window.ATLAS_PMTILES_LAYER_ID || "ne_10m_land");
+          // Default: scan up to the archive's max zoom (this asset is small: max z=5).
+          const maxZoom = Math.max(0, Math.min(maxZoomAvailable, Number(window.ATLAS_PMTILES_MAX_ZOOM ?? maxZoomAvailable)));
+
+          // Requested layer name (optional). If wrong, we auto-detect a polygon layer.
+          const requestedLayerId = String(window.ATLAS_PMTILES_LAYER_ID || "ne_10m_land");
+          let resolvedLayerId = requestedLayerId;
+          let resolvedLayerLocked = false;
+
+          // If metadata says the requested layer doesn't exist, pick the first vector layer.
+          try {
+            const metaLayers = metadata?.vector_layers ? metadata.vector_layers.map((vl) => vl?.id).filter(Boolean) : [];
+            if (metaLayers.length && !metaLayers.includes(resolvedLayerId)) {
+              resolvedLayerId = metaLayers[0];
+              resolvedLayerLocked = true;
+            }
+          } catch (_) {
+            // ignore
+          }
 
           if (!wasm?.begin_base_world_stream || !wasm?.append_base_world_geojson_chunk || !wasm?.finish_base_world_stream) {
             console.warn("PMTiles base surface: missing wasm streaming APIs; falling back to world.json");
@@ -867,17 +918,143 @@
 
           wasm.begin_base_world_stream();
 
-          const maxFeaturesPerTile = Number(window.ATLAS_PMTILES_MAX_FEATURES_PER_TILE ?? 5000);
-          const concurrency = Math.max(1, Math.min(8, Number(window.ATLAS_PMTILES_CONCURRENCY ?? 4)));
+          const maxFeaturesPerTile = Number(window.ATLAS_PMTILES_MAX_FEATURES_PER_TILE ?? 2000);
+          const concurrency = Math.max(
+            1,
+            Math.min(8, Number(window.ATLAS_PMTILES_CONCURRENCY ?? Math.min(6, navigator?.hardwareConcurrency ?? 4))),
+          );
+          const batchMaxTiles = Math.max(1, Math.min(128, Number(window.ATLAS_PMTILES_BATCH_MAX_TILES ?? 24)));
+          const batchMaxFeatures = Math.max(100, Math.min(200000, Number(window.ATLAS_PMTILES_BATCH_MAX_FEATURES ?? 20000)));
+          const flushIntervalMs = Math.max(100, Math.min(5000, Number(window.ATLAS_PMTILES_FLUSH_INTERVAL_MS ?? 500)));
+          const yieldBudgetMs = Math.max(4, Math.min(25, Number(window.ATLAS_PMTILES_YIELD_BUDGET_MS ?? 10)));
+          const userIdleMs = Math.max(50, Math.min(2000, Number(window.ATLAS_PMTILES_USER_IDLE_MS ?? 250)));
+
+          const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+          const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+          const nowMs = () => (performance?.now ? performance.now() : Date.now());
+          const lastInputMs = () => {
+            try {
+              const v = Number(window.__atlasLastInputMs);
+              return Number.isFinite(v) ? v : -Infinity;
+            } catch (_) {
+              return -Infinity;
+            }
+          };
+          const isUserInteracting = () => nowMs() - lastInputMs() < userIdleMs;
+          async function waitForUserIdle() {
+            // Back off aggressively while the user is manipulating the globe.
+            while (isUserInteracting()) {
+              await sleep(50);
+            }
+          }
+
+          let appendedTilesWithFeatures = 0;
+          let appendedPolygonFeatures = 0;
+          let tilesMissingData = 0;
+          let tilesEmptyBytes = 0;
+          let tilesParsedButNoLayer = 0;
+          let tilesWithLayerButNoPolys = 0;
+
+          // Batch many tiles into a single GeoJSON chunk to reduce JSON parsing and wasm calls.
+          let pendingFeatures = [];
+          let pendingTiles = 0;
+          let lastFlushMs = 0;
+
+          function flushPendingFeatures(force) {
+            if (!pendingFeatures.length) return;
+            const now = performance.now();
+            if (!force && now - lastFlushMs < flushIntervalMs) return;
+            lastFlushMs = now;
+
+            // Avoid doing heavy wasm work while the user is interacting.
+            // Note: this is sync, so we only gate on a cheap check here.
+            if (!force) {
+              try {
+                if (isUserInteracting()) return;
+              } catch (_) {}
+            }
+
+            const fc = { type: "FeatureCollection", features: pendingFeatures };
+            wasm.append_base_world_geojson_chunk(JSON.stringify(fc));
+            pendingFeatures = [];
+            pendingTiles = 0;
+            // Expensive: triangulation + GPU upload. Throttle this hard.
+            wasm.finish_base_world_stream();
+          }
+
+          function tryResolvePolygonLayer(tile) {
+            if (resolvedLayerLocked) return;
+            const layers = tile?.layers || {};
+            for (const key of Object.keys(layers)) {
+              const layer = layers[key];
+              if (!layer || !layer.length) continue;
+              const n = Math.min(layer.length, 100);
+              for (let i = 0; i < n; i++) {
+                try {
+                  const f = layer.feature(i);
+                  if (f && f.type === 3) {
+                    resolvedLayerId = key;
+                    resolvedLayerLocked = true;
+                    return;
+                  }
+                } catch (_) {
+                  // ignore
+                }
+              }
+            }
+          }
 
           async function loadTile(z, x, y) {
-            const ab = await p.getZxy(z, x, y);
-            if (!ab) return null;
-            let bytes = new Uint8Array(ab);
+            const resp = await p.getZxy(z, x, y);
+            // pmtiles returns `undefined` when the tile doesn't exist.
+            if (!resp || !resp.data) {
+              tilesMissingData++;
+              if (debug && z <= 1 && x === 0 && y === 0) {
+                console.log(`PMTiles debug: getZxy(${z},${x},${y}) returned null`);
+              }
+              return null;
+            }
+            // Normalize to Uint8Array.
+            let bytes = resp.data instanceof Uint8Array ? resp.data : new Uint8Array(resp.data);
+
+            if (debug && z === 0 && x === 0 && y === 0) {
+              let ctor = "unknown";
+              try { ctor = resp?.data?.constructor?.name ?? ctor; } catch (_) {}
+              console.log("PMTiles debug: z0 getZxy type", {
+                ctor,
+                byteLength: resp?.data?.byteLength,
+                length: resp?.data?.length,
+              });
+
+              const b0 = bytes[0];
+              const b1 = bytes[1];
+              const b2 = bytes[2];
+              const b3 = bytes[3];
+              console.log("PMTiles debug: z0 raw bytes", { len: bytes.length, b0, b1, b2, b3 });
+            }
+
+            if (bytes.length === 0) {
+              tilesEmptyBytes++;
+              return null;
+            }
+
             bytes = await gunzipIfNeeded(bytes);
             const tile = new VectorTile(new Pbf(bytes));
-            const layer = tile.layers?.[layerId];
-            if (!layer || !layer.length) return null;
+
+            if (debug && z === 0 && x === 0 && y === 0) {
+              console.log("PMTiles debug: z0 tile layer keys", tile?.layers ? Object.keys(tile.layers) : null);
+            }
+
+            // If the requested layer doesn't exist, auto-detect a polygon layer from the first usable tile.
+            if (!tile.layers?.[resolvedLayerId]) {
+              tryResolvePolygonLayer(tile);
+            }
+
+            const layer = tile.layers?.[resolvedLayerId];
+            if (!layer || !layer.length) {
+              tilesParsedButNoLayer++;
+              return null;
+            }
 
             const features = [];
             const n = Math.min(layer.length, maxFeaturesPerTile);
@@ -889,60 +1066,118 @@
               // Reduce payload: drop properties
               features.push({ type: "Feature", properties: {}, geometry: gj.geometry });
             }
-            if (!features.length) return null;
+            if (!features.length) {
+              tilesWithLayerButNoPolys++;
+              return null;
+            }
             return { type: "FeatureCollection", features };
           }
 
           async function loadZoom(z) {
             const n = 1 << z;
-            const tasks = [];
+            const tileCount = n * n;
             let loadedTiles = 0;
-            let pendingBatch = 0;
+            let idx = 0;
 
             const schedule = async (z, x, y) => {
               const fc = await loadTile(z, x, y);
               if (fc) {
-                wasm.append_base_world_geojson_chunk(JSON.stringify(fc));
-                pendingBatch++;
-                // Periodically flush so the user sees progressive refinement.
-                if (pendingBatch >= 4) {
-                  pendingBatch = 0;
-                  wasm.finish_base_world_stream();
+                // Merge tile features into a batched FeatureCollection.
+                pendingFeatures.push(...fc.features);
+                pendingTiles++;
+                appendedTilesWithFeatures++;
+                appendedPolygonFeatures += fc.features.length;
+
+                if (pendingTiles >= batchMaxTiles || pendingFeatures.length >= batchMaxFeatures) {
+                  flushPendingFeatures(false);
                 }
               }
               loadedTiles++;
             };
 
-            // Simple concurrency-limited loop.
-            for (let y = 0; y < n; y++) {
-              for (let x = 0; x < n; x++) {
-                tasks.push({ z, x, y });
+            async function worker(workerId) {
+              let lastYield = performance.now();
+              while (true) {
+                const i = idx++;
+                if (i >= tileCount) break;
+
+                // If the user is interacting, pause tile IO/decoding.
+                if (isUserInteracting()) {
+                  flushPendingFeatures(false);
+                  await waitForUserIdle();
+                }
+
+                const x = i % n;
+                const y = (i / n) | 0;
+                await schedule(z, x, y);
+                // Keep the main thread responsive.
+                const now = performance.now();
+                if (now - lastYield > yieldBudgetMs) {
+                  lastYield = now;
+                  flushPendingFeatures(false);
+                  await nextFrame();
+                }
               }
             }
 
-            let idx = 0;
-            async function worker() {
-              while (idx < tasks.length) {
-                const t = tasks[idx++];
-                await schedule(t.z, t.x, t.y);
-              }
-            }
-            await Promise.all(Array.from({ length: concurrency }, () => worker()));
-            if (pendingBatch > 0) wasm.finish_base_world_stream();
+            await Promise.all(Array.from({ length: concurrency }, (_, i) => worker(i)));
+            // Zoom boundary: flush whatever we have so refinement becomes visible.
+            flushPendingFeatures(true);
             return loadedTiles;
           }
 
-          // Always load z0 immediately so the globe has land right away.
-          await loadZoom(0);
-          wasm.finish_base_world_stream();
-
-          // Progressive refinement.
-          for (let z = 1; z <= maxZoom; z++) {
+          // Progressive refinement. Some archives omit meaningful data at low zooms.
+          // If the user configured a low max zoom, auto-extend up to the archive max zoom
+          // before falling back.
+          let maxZoomUsed = maxZoom;
+          for (let z = 0; z <= maxZoomUsed; z++) {
             await loadZoom(z);
-            wasm.finish_base_world_stream();
+            // Yield between zoom levels to keep orbit/pan snappy.
+            await nextFrame();
           }
 
-          console.log(`PMTiles base surface loaded (z0..z${maxZoom}, layer=${layerId})`);
+          if (appendedPolygonFeatures === 0 && maxZoomUsed < maxZoomAvailable) {
+            if (debug) {
+              console.log(
+                `PMTiles debug: no polygons at z0..z${maxZoomUsed}; extending scan to z${maxZoomAvailable}`,
+              );
+            }
+            for (let z = maxZoomUsed + 1; z <= maxZoomAvailable; z++) {
+              maxZoomUsed = z;
+              await loadZoom(z);
+              await nextFrame();
+            }
+          }
+
+          // Final flush.
+          await waitForUserIdle();
+          flushPendingFeatures(true);
+
+          if (appendedPolygonFeatures === 0) {
+            console.warn(
+              `PMTiles base surface: no polygons decoded (requested layer=${requestedLayerId}, resolved=${resolvedLayerId}); falling back to world.json` +
+                ` (tilesMissingData=${tilesMissingData}, tilesEmptyBytes=${tilesEmptyBytes}, tilesParsedButNoLayer=${tilesParsedButNoLayer}, tilesWithLayerButNoPolys=${tilesWithLayerButNoPolys}, maxZoom=${maxZoomUsed})`,
+            );
+            return false;
+          }
+
+          // Verify the WASM side actually produced triangles (earcut can fail on invalid rings).
+          try {
+            const st = wasm.get_surface_status?.();
+            const basePolys = Number(st?.base_polygons ?? 0);
+            if (!Number.isFinite(basePolys) || basePolys <= 0) {
+              console.warn(
+                `PMTiles base surface: decoded polygons but produced 0 triangles (requested layer=${requestedLayerId}, resolved=${resolvedLayerId}); falling back to world.json`,
+              );
+              return false;
+            }
+          } catch (e) {
+            // If status is unavailable, don't block.
+          }
+
+          console.log(
+            `PMTiles base surface loaded (z0..z${maxZoomUsed}, layer=${resolvedLayerId}, requested=${requestedLayerId}, polygons=${appendedPolygonFeatures}, tiles_with_features=${appendedTilesWithFeatures})`,
+          );
           return true;
         } catch (err) {
           console.warn("PMTiles base surface load failed; falling back to world.json", err);
@@ -953,7 +1188,9 @@
 
       function getPmtilesSurfacePrefs() {
         let enabled = true;
-        let maxZoom = 3;
+        // Default to z5 because the bundled world.pmtiles only goes to z5 and some archives
+        // omit meaningful data at very low zooms.
+        let maxZoom = 5;
         try {
           const v = localStorage.getItem("atlas-surface-pmtiles-enabled");
           if (v === "false") enabled = false;
@@ -1110,9 +1347,14 @@
 
       function startAnimation(wasm) {
         function loop() {
+          // If the tab is hidden, avoid burning CPU/GPU.
+          // We still keep the RAF alive so we resume immediately when visible.
+          if (document.hidden) {
+            window.requestAnimationFrame(loop);
+            return;
+          }
           try {
             wasm.advance_frame();
-            if (window.__atlasUpdateCompass) window.__atlasUpdateCompass();
           } catch (e) {
             console.error("advance_frame failed", e);
             return;
@@ -1139,23 +1381,36 @@
       }
 
       function setStatus(text) {
-        document.getElementById("status-text").textContent = text;
+        const el = document.getElementById("status-text");
+        if (!el) return;
+        if (el.textContent === text) return;
+        el.textContent = text;
       }
 
       function setDemStatus(text) {
-        document.getElementById("dem-status-text").textContent = text;
+        const el = document.getElementById("dem-status-text");
+        if (!el) return;
+        if (el.textContent === text) return;
+        el.textContent = text;
       }
 
       function setSurfaceStatus(text) {
-        document.getElementById("surface-status-text").textContent = text;
+        const el = document.getElementById("surface-status-text");
+        if (!el) return;
+        if (el.textContent === text) return;
+        el.textContent = text;
       }
 
       function setTerrainClientStatus(text) {
-        document.getElementById("terrain-client-status-text").textContent = text;
+        const el = document.getElementById("terrain-client-status-text");
+        if (!el) return;
+        if (el.textContent === text) return;
+        el.textContent = text;
       }
 
       function startTerrainStatusPolling(baseUrl) {
         async function poll() {
+          if (document.hidden) return;
           if (!baseUrl) {
             setDemStatus("Terrain (backend): offline");
             return;
@@ -1188,6 +1443,7 @@
 
       function startTerrainClientStatusPolling(wasm) {
         function poll() {
+          if (document.hidden) return;
           try {
             if (!wasm.get_terrain_client_status) {
               setTerrainClientStatus("Terrain (client): unavailable");
@@ -1227,6 +1483,7 @@
 
       function startSurfaceStatusPolling(wasm) {
         function poll() {
+          if (document.hidden) return;
           try {
             if (!wasm.get_surface_status) {
               setSurfaceStatus("Surface: unavailable");
@@ -1292,6 +1549,13 @@
         const lineWidthValue = document.getElementById("line-width-value");
         const canvas2d = document.getElementById("atlas-canvas-2d");
         const canvas3d = document.getElementById("atlas-canvas-3d");
+
+        // Global input timestamp used by background loaders to pause work.
+        const markUserInput = () => {
+          try {
+            window.__atlasLastInputMs = performance?.now ? performance.now() : Date.now();
+          } catch (_) {}
+        };
 
         if (themeSelect) {
           themeSelect.value = normalizeTheme(document.documentElement.dataset.theme || "dark");
@@ -1722,7 +1986,7 @@
           compassNeedle.style.transform = `translate(-50%, -100%) rotate(${rot}deg)`;
         }
 
-        // Expose to the animation loop.
+        // Expose for optional callers.
         window.__atlasUpdateCompass = updateCompass;
 
         mapCompass?.addEventListener("click", () => {
@@ -1767,6 +2031,7 @@
         }
 
         function onPointerDown(e) {
+          markUserInput();
           const canvas = activeCanvas();
           canvas.setPointerCapture(e.pointerId);
 
@@ -1802,6 +2067,8 @@
         }
 
         function onPointerMove(e) {
+          // Mark input continuously while dragging/pinching so loaders back off.
+          if (dragging || pinching) markUserInput();
           if (e.pointerType === "touch") {
             activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: "touch" });
             const pts = getTouchPair();
@@ -1822,16 +2089,24 @@
             }
           }
 
+          // Cursor hover picking can be surprisingly expensive; throttle to one RAF.
           if (!dragging) {
-            try {
-              const info = wasm.cursor_move(e.offsetX, e.offsetY);
-              if (info && info.hit) {
-                cursorText.textContent = `Cursor: lon ${info.lon.toFixed(4)}°, lat ${info.lat.toFixed(4)}°`;
-              } else {
-                cursorText.textContent = "Cursor: —";
-              }
-            } catch (err) {
-              // ignore
+            if (!window.__atlasCursorRaf) {
+              const ox = e.offsetX;
+              const oy = e.offsetY;
+              window.__atlasCursorRaf = window.requestAnimationFrame(() => {
+                window.__atlasCursorRaf = 0;
+                try {
+                  const info = wasm.cursor_move(ox, oy);
+                  if (info && info.hit) {
+                    cursorText.textContent = `Cursor: lon ${info.lon.toFixed(4)}°, lat ${info.lat.toFixed(4)}°`;
+                  } else {
+                    cursorText.textContent = "Cursor: —";
+                  }
+                } catch (err) {
+                  // ignore
+                }
+              });
             }
           }
           if (!dragging) return;
@@ -1903,11 +2178,21 @@
 
         function onWheel(e) {
           e.preventDefault();
-          try {
-            wasm.camera_zoom(e.deltaY);
-            updateCompass();
-          } catch (err) {
-            console.error("camera_zoom failed", err);
+          markUserInput();
+          // Wheel events can fire at very high rates; coalesce into one RAF.
+          window.__atlasWheelDy = (window.__atlasWheelDy || 0) + e.deltaY;
+          if (!window.__atlasWheelRaf) {
+            window.__atlasWheelRaf = window.requestAnimationFrame(() => {
+              window.__atlasWheelRaf = 0;
+              const dy = window.__atlasWheelDy || 0;
+              window.__atlasWheelDy = 0;
+              try {
+                wasm.camera_zoom(dy);
+                updateCompass();
+              } catch (err) {
+                console.error("camera_zoom failed", err);
+              }
+            });
           }
         }
 

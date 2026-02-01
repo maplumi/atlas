@@ -255,6 +255,7 @@ struct ViewerState {
     surface_source: Option<String>,
     surface_loading: bool,
     surface_last_error: Option<String>,
+    surface_next_retry_ms: f64,
 
     terrain_tileset: Option<TerrainTileset>,
     terrain_vertices: Option<Vec<OverlayVertex>>,
@@ -347,6 +348,7 @@ thread_local! {
         surface_source: None,
         surface_loading: false,
         surface_last_error: None,
+        surface_next_retry_ms: 0.0,
 
         terrain_tileset: None,
         terrain_vertices: None,
@@ -1955,7 +1957,26 @@ pub fn set_dataset(dataset: &str) -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn load_base_world() {
-    ensure_surface_loaded();
+    // Force the bundled base-world fallback (assets/world.json).
+    // This is used when PMTiles decoding fails, and we must override any partially-created
+    // `base_world` from streaming mode (which would otherwise block `ensure_base_world_loaded()`).
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.surface_tileset = None;
+        s.surface_positions = None;
+        s.surface_zoom = None;
+        s.surface_source = None;
+        s.surface_loading = false;
+        s.surface_last_error = None;
+
+        s.base_world = None;
+        s.base_world_loading = false;
+        s.base_world_error = None;
+        s.base_world_source = Some("world.json".to_string());
+        s.base_count_polys = 0;
+    });
+
+    ensure_base_world_loaded();
 }
 
 #[wasm_bindgen]
@@ -2737,10 +2758,12 @@ fn ensure_surface_loaded() {
 
     let source = backend.clone();
     let tileset_url = surface_tileset_url(&backend);
+    let now = now_ms();
 
     let should_load = with_state(|state| {
         let s = state.borrow();
         !s.surface_loading
+            && now >= s.surface_next_retry_ms
             && (s.surface_tileset.is_none()
                 || s.surface_tileset
                     .as_ref()
@@ -2763,13 +2786,28 @@ fn ensure_surface_loaded() {
         let tileset = match fetch_surface_tileset(&tileset_url).await {
             Ok(ts) => ts,
             Err(err) => {
+                let err_str = err
+                    .as_string()
+                    .unwrap_or_else(|| "surface tileset error".to_string());
+                // If the server doesn't have pre-tessellated surface tiles configured,
+                // treat that as a long-lived condition (avoid spamming 404s).
+                let backoff_ms = if err_str.contains("HTTP 404") {
+                    24.0 * 60.0 * 60_000.0
+                } else {
+                    30_000.0
+                };
+
                 with_state(|state| {
                     let mut s = state.borrow_mut();
                     s.surface_loading = false;
-                    s.surface_last_error = Some(
-                        err.as_string()
-                            .unwrap_or_else(|| "surface tileset error".to_string()),
-                    );
+                    // Only surface this as an error if we *don't* already have a usable base world.
+                    // Missing server-side surface tiles are expected in most deployments.
+                    if s.base_world.is_none() {
+                        s.surface_last_error = Some(err_str);
+                    } else {
+                        s.surface_last_error = None;
+                    }
+                    s.surface_next_retry_ms = now_ms() + backoff_ms;
                 });
                 ensure_base_world_loaded();
                 return;
@@ -2804,6 +2842,7 @@ fn ensure_surface_loaded() {
                 let mut s = state.borrow_mut();
                 s.surface_loading = false;
                 s.surface_last_error = Some("no surface tiles".to_string());
+                s.surface_next_retry_ms = now_ms() + 60_000.0;
             });
             ensure_base_world_loaded();
             return;
@@ -2817,6 +2856,7 @@ fn ensure_surface_loaded() {
             s.surface_zoom = Some(zoom);
             s.surface_source = Some(source);
             s.surface_loading = false;
+            s.surface_next_retry_ms = 0.0;
             s.base_world = None;
             s.base_count_polys = tri_count;
         });
@@ -3033,27 +3073,37 @@ pub fn get_terrain_client_status() -> JsValue {
 
 #[wasm_bindgen]
 pub fn get_surface_status() -> JsValue {
-    let (loaded, loading, tileset_loaded, zoom, source, error) = with_state(|state| {
-        let s = state.borrow();
-        let loaded = s.surface_positions.is_some() || s.base_world.is_some();
-        let loading = s.surface_loading || s.base_world_loading;
-        let tileset_loaded = s.surface_tileset.is_some();
-        let zoom = s.surface_zoom;
-        let source = if s.surface_positions.is_some() {
-            s.surface_source.clone()
-        } else if s.base_world.is_some() {
-            s.base_world_source
+    let (loaded, loading, tileset_loaded, zoom, source, error, base_polygons) =
+        with_state(|state| {
+            let s = state.borrow();
+            let loaded = s.surface_positions.is_some() || s.base_world.is_some();
+            let loading = s.surface_loading || s.base_world_loading;
+            let tileset_loaded = s.surface_tileset.is_some();
+            let zoom = s.surface_zoom;
+            let source = if s.surface_positions.is_some() {
+                s.surface_source.clone()
+            } else if s.base_world.is_some() {
+                s.base_world_source
+                    .clone()
+                    .or_else(|| Some("world.json".to_string()))
+            } else {
+                None
+            };
+            let error = s
+                .surface_last_error
                 .clone()
-                .or_else(|| Some("world.json".to_string()))
-        } else {
-            None
-        };
-        let error = s
-            .surface_last_error
-            .clone()
-            .or_else(|| s.base_world_error.clone());
-        (loaded, loading, tileset_loaded, zoom, source, error)
-    });
+                .or_else(|| s.base_world_error.clone());
+            let base_polygons = s.base_count_polys;
+            (
+                loaded,
+                loading,
+                tileset_loaded,
+                zoom,
+                source,
+                error,
+                base_polygons,
+            )
+        });
 
     let o = js_sys::Object::new();
     let _ = js_sys::Reflect::set(
@@ -3080,6 +3130,11 @@ pub fn get_surface_status() -> JsValue {
     if let Some(err) = error {
         let _ = js_sys::Reflect::set(&o, &JsValue::from_str("error"), &JsValue::from_str(&err));
     }
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("base_polygons"),
+        &JsValue::from_f64(base_polygons as f64),
+    );
     o.into()
 }
 
@@ -4238,6 +4293,12 @@ fn join_url(base: &str, path: &str) -> String {
     }
 }
 
+fn now_ms() -> f64 {
+    // `js_sys::Date::now()` is always available in wasm-bindgen without
+    // additional web-sys feature flags, and it's sufficient for retry backoff.
+    js_sys::Date::now()
+}
+
 /// Advances the deterministic engine time by one fixed-timestep frame.
 ///
 /// This is intentionally not wall-clock driven so it can be replayed.
@@ -4369,6 +4430,19 @@ async fn fetch_surface_tileset(url: &str) -> Result<SurfaceTileset, JsValue> {
         .send()
         .await
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    if !resp.ok() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_else(|_| "".to_string());
+        let body = body.trim();
+        let msg = if body.is_empty() {
+            format!("HTTP {status}")
+        } else {
+            format!("HTTP {status}: {body}")
+        };
+        return Err(JsValue::from_str(&msg));
+    }
+
     let text = resp
         .text()
         .await
