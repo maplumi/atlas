@@ -1288,19 +1288,37 @@
             document.getElementById("side-panel")?.classList.remove("compact-open");
           }
         });
-        const backendOk = await detectBackendAvailability(wasm);
-
-        // If the backend is offline, start loading the base-world fallback immediately
-        // so we have something to draw as soon as the renderer initializes.
-        if (!backendOk) {
-          await reloadBaseSurface(wasm);
-        }
+        // Do not block startup on backend health checks: when the backend is offline,
+        // connection attempts can take a long time to fail. We want the renderer to
+        // initialize immediately so the globe (and any bundled fallback) can draw.
+        const backendOkPromise = detectBackendAvailability(wasm);
 
         wasm.init_canvas_2d();
         wasm.init_wgpu();
         startSurfaceStatusPolling(wasm);
         startTerrainClientStatusPolling(wasm);
         startAnimation(wasm);
+
+        // If the backend is offline, kick the base surface loader (PMTiles/world.json).
+        backendOkPromise
+          .then((ok) => {
+            if (!ok) {
+              // UI hint: world.json can take a moment to fetch/parse.
+              setSurfaceStatus("Surface: loading base world (offline)…");
+              return reloadBaseSurface(wasm);
+            }
+          })
+          .catch((e) => console.warn("backend detection failed", e));
+      }
+
+      async function fetchWithTimeout(url, options, timeoutMs) {
+        const controller = new AbortController();
+        const id = window.setTimeout(() => controller.abort(), timeoutMs);
+        try {
+          return await fetch(url, { ...(options || {}), signal: controller.signal });
+        } finally {
+          window.clearTimeout(id);
+        }
       }
 
       function getTerrainPreference() {
@@ -1323,6 +1341,17 @@
       }
 
       async function detectBackendAvailability(wasm) {
+        // If the browser already knows we're offline, don't waste time probing.
+        try {
+          if (typeof navigator !== "undefined" && navigator && navigator.onLine === false) {
+            window.__atlasBackendUrl = "";
+            window.__atlasStacUrl = "https://copernicus-dem-30m-stac.s3.amazonaws.com";
+            setStatus("Backend: offline (using defaults)");
+            setDemStatus("Terrain (backend): offline");
+            return false;
+          }
+        } catch (_) {}
+
         const override = window.ATLAS_BACKEND_URL || "";
         const host = window.location.hostname || "localhost";
         const scheme = window.location.protocol === "https:" ? "https" : "http";
@@ -1336,7 +1365,8 @@
 
         for (const base of candidates) {
           try {
-            const resp = await fetch(`${base}/healthz`, { method: "GET" });
+            // Keep this tight: if the backend is down, we want to proceed quickly.
+            const resp = await fetchWithTimeout(`${base}/healthz`, { method: "GET" }, 900);
             if (resp.ok) {
               window.__atlasBackendUrl = base;
               window.__atlasStacUrl = `${base}/stac`;
@@ -1516,7 +1546,16 @@
             const zoom = status.zoom !== undefined ? ` z${status.zoom}` : "";
             const source = status.source ? ` @ ${status.source}` : "";
             if (status.loading) {
-              setSurfaceStatus(`Surface: loading${zoom}${source}`);
+              const src = String(status.source || "");
+              const isWorldJson = src.includes("world.json");
+              const isPmtiles = src.includes(".pmtiles");
+              if (isWorldJson) {
+                setSurfaceStatus("Surface: loading base world (world.json)…");
+              } else if (isPmtiles) {
+                setSurfaceStatus(`Surface: loading base world (PMTiles)…${zoom}${source}`);
+              } else {
+                setSurfaceStatus(`Surface: loading${zoom}${source}`);
+              }
               return;
             }
             if (status.error) {
