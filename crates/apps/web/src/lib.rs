@@ -1835,7 +1835,7 @@ pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
                 let pan_scale = cam.distance * 0.002;
                 let delta = vec3_add(
                     vec3_mul(right, delta_x_px * pan_scale),
-                    vec3_mul(real_up, -delta_y_px * pan_scale),
+                    vec3_mul(real_up, delta_y_px * pan_scale),
                 );
                 s.camera.target = vec3_add(s.camera.target, delta);
             }
