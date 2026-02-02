@@ -303,6 +303,11 @@ struct ViewerState {
     time_end_s: f64,
     camera: CameraState,
     camera_2d: Camera2DState,
+
+    // Pointer drag state shared by 2D + 3D camera interactions.
+    drag_last_x_px: f64,
+    drag_last_y_px: f64,
+    arcball_last_unit: Option<[f64; 3]>,
 }
 
 thread_local! {
@@ -395,6 +400,10 @@ thread_local! {
         time_end_s: 10.0,
         camera: CameraState::default(),
         camera_2d: Camera2DState::default(),
+
+        drag_last_x_px: 0.0,
+        drag_last_y_px: 0.0,
+        arcball_last_unit: None,
     });
 }
 
@@ -778,6 +787,67 @@ fn vec3_normalize(a: [f64; 3]) -> [f64; 3] {
     } else {
         vec3_mul(a, 1.0 / n)
     }
+}
+
+fn quat_from_unit_vectors(a: [f64; 3], b: [f64; 3]) -> [f64; 4] {
+    // Returns a unit quaternion rotating `a` to `b`.
+    let a = vec3_normalize(a);
+    let b = vec3_normalize(b);
+    let dot = clamp(vec3_dot(a, b), -1.0, 1.0);
+
+    // If vectors are nearly opposite, pick an arbitrary orthogonal axis.
+    if dot < -0.999999 {
+        let mut axis = vec3_cross([1.0, 0.0, 0.0], a);
+        if vec3_dot(axis, axis) < 1e-12 {
+            axis = vec3_cross([0.0, 1.0, 0.0], a);
+        }
+        axis = vec3_normalize(axis);
+        return [axis[0], axis[1], axis[2], 0.0];
+    }
+
+    let axis = vec3_cross(a, b);
+    let w = 1.0 + dot;
+    let mut q = [axis[0], axis[1], axis[2], w];
+    let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
+    if n > 0.0 {
+        q[0] /= n;
+        q[1] /= n;
+        q[2] /= n;
+        q[3] /= n;
+    }
+    q
+}
+
+fn quat_conjugate(q: [f64; 4]) -> [f64; 4] {
+    [-q[0], -q[1], -q[2], q[3]]
+}
+
+fn quat_rotate_vec3(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
+    // Assumes q is unit.
+    let qv = [q[0], q[1], q[2]];
+    let t = vec3_mul(vec3_cross(qv, v), 2.0);
+    vec3_add(v, vec3_add(vec3_mul(t, q[3]), vec3_cross(qv, t)))
+}
+
+fn trackball_unit_from_screen(x_px: f64, y_px: f64, w: f64, h: f64) -> [f64; 3] {
+    // Virtual trackball mapping (unit sphere in screen space).
+    let min_dim = w.min(h).max(1.0);
+    let nx = (2.0 * x_px - w) / min_dim;
+    let ny = (h - 2.0 * y_px) / min_dim;
+    let r2 = nx * nx + ny * ny;
+    let (x, y, z) = if r2 <= 1.0 {
+        (nx, ny, (1.0 - r2).sqrt())
+    } else {
+        let inv_r = 1.0 / r2.sqrt();
+        (nx * inv_r, ny * inv_r, 0.0)
+    };
+    vec3_normalize([x, y, z])
+}
+
+fn arcball_unit_from_screen(canvas_w: f64, canvas_h: f64, x_px: f64, y_px: f64) -> [f64; 3] {
+    // Use a classic virtual trackball mapping for consistent, smooth drag everywhere.
+    // (Using ray-hit->lon/lat introduces distortion near the poles and can feel unsynced.)
+    trackball_unit_from_screen(x_px, y_px, canvas_w, canvas_h)
 }
 
 fn mat4_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
@@ -1813,6 +1883,91 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
     render_scene()
 }
 
+/// Begin a pointer drag.
+///
+/// In 3D, this initializes arcball state to enable consistent grab-to-rotate.
+/// In 2D, this sets the reference position for pan deltas.
+#[wasm_bindgen]
+pub fn camera_drag_begin(x_px: f64, y_px: f64) -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.auto_rotate_last_user_time_s = wall_clock_seconds();
+        s.drag_last_x_px = x_px;
+        s.drag_last_y_px = y_px;
+        match s.view_mode {
+            ViewMode::ThreeD => {
+                s.camera.target = [0.0, 0.0, 0.0];
+                s.arcball_last_unit = Some(arcball_unit_from_screen(
+                    s.canvas_width,
+                    s.canvas_height,
+                    x_px,
+                    y_px,
+                ));
+            }
+            ViewMode::TwoD => {
+                s.arcball_last_unit = None;
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Update a pointer drag.
+///
+/// In 3D, performs an arcball rotation around the globe center.
+/// In 2D, pans the mercator view.
+#[wasm_bindgen]
+pub fn camera_drag_move(x_px: f64, y_px: f64) -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.auto_rotate_last_user_time_s = wall_clock_seconds();
+        match s.view_mode {
+            ViewMode::ThreeD => {
+                s.camera.target = [0.0, 0.0, 0.0];
+                let next_u = arcball_unit_from_screen(s.canvas_width, s.canvas_height, x_px, y_px);
+                if let Some(prev_u) = s.arcball_last_unit {
+                    let q = quat_from_unit_vectors(prev_u, next_u);
+                    let q_inv = quat_conjugate(q);
+
+                    let dir_cam = [
+                        s.camera.pitch_rad.cos() * s.camera.yaw_rad.cos(),
+                        s.camera.pitch_rad.sin(),
+                        -s.camera.pitch_rad.cos() * s.camera.yaw_rad.sin(),
+                    ];
+                    let dir_cam = vec3_normalize(dir_cam);
+                    let dir2 = quat_rotate_vec3(q_inv, dir_cam);
+                    let pitch = clamp(dir2[1], -1.0, 1.0).asin();
+                    let yaw = (-dir2[2]).atan2(dir2[0]);
+
+                    s.camera.pitch_rad = clamp(pitch, -1.55, 1.55);
+                    s.camera.yaw_rad = (yaw + std::f64::consts::PI)
+                        .rem_euclid(2.0 * std::f64::consts::PI)
+                        - std::f64::consts::PI;
+                }
+                s.arcball_last_unit = Some(next_u);
+            }
+            ViewMode::TwoD => {
+                let dx = x_px - s.drag_last_x_px;
+                let dy = y_px - s.drag_last_y_px;
+                s.drag_last_x_px = x_px;
+                s.drag_last_y_px = y_px;
+                s.camera_2d = pan_camera_2d(s.camera_2d, dx, dy, s.canvas_width, s.canvas_height);
+            }
+        }
+    });
+    render_scene()
+}
+
+/// End a pointer drag (clears arcball state).
+#[wasm_bindgen]
+pub fn camera_drag_end() -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.arcball_last_unit = None;
+    });
+    Ok(())
+}
+
 /// Pan the camera target.
 ///
 /// Intended usage: call with pointer delta in pixels.
@@ -2232,6 +2387,118 @@ fn count_chunk_features(chunk: &formats::VectorChunk) -> (usize, usize, usize) {
         }
     }
     (points, lines, polys)
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct UploadCoordFixCounts {
+    swapped: usize,
+    web_mercator: usize,
+    wrapped_lon: usize,
+    skipped: usize,
+}
+
+fn maybe_wrap_lon_deg(lon_deg: f64) -> Option<f64> {
+    if !lon_deg.is_finite() {
+        return None;
+    }
+    if lon_deg.abs() > 180.0 && lon_deg.abs() <= 360.0 {
+        Some((lon_deg + 180.0).rem_euclid(360.0) - 180.0)
+    } else {
+        None
+    }
+}
+
+fn web_mercator_m_to_lon_lat_deg(x_m: f64, y_m: f64) -> Option<(f64, f64)> {
+    if !x_m.is_finite() || !y_m.is_finite() {
+        return None;
+    }
+    // WebMercator uses WGS84_A as radius.
+    let r = WGS84_A;
+    let lon = (x_m / r).to_degrees();
+    let lat = (2.0 * (y_m / r).exp().atan() - std::f64::consts::FRAC_PI_2).to_degrees();
+    if lon.is_finite() && lat.is_finite() {
+        Some((lon, lat))
+    } else {
+        None
+    }
+}
+
+fn normalize_geo_point_in_place(p: &mut formats::GeoPoint, counts: &mut UploadCoordFixCounts) {
+    let mut lon = p.lon_deg;
+    let mut lat = p.lat_deg;
+
+    if !lon.is_finite() || !lat.is_finite() {
+        counts.skipped += 1;
+        return;
+    }
+
+    // 1) Fix common lat/lon swap: lat must be within [-90, 90].
+    if lat.abs() > 90.0 && lon.abs() <= 90.0 && lat.abs() <= 180.0 {
+        (lon, lat) = (lat, lon);
+        counts.swapped += 1;
+    }
+
+    // 2) Fix WebMercator meters if values look like meters.
+    // Heuristic: magnitude in the thousands+ and within WebMercator's max extent.
+    let max_abs = lon.abs().max(lat.abs());
+    let merc_max = 20037508.342789244_f64;
+    if max_abs > 1000.0
+        && lon.abs() <= merc_max * 1.1
+        && lat.abs() <= merc_max * 1.1
+        && let Some((lon_deg, lat_deg)) = web_mercator_m_to_lon_lat_deg(lon, lat)
+    {
+        lon = lon_deg;
+        lat = lat_deg;
+        counts.web_mercator += 1;
+    }
+
+    // 3) Wrap lon to [-180, 180] for 0..360 style data.
+    if let Some(w) = maybe_wrap_lon_deg(lon) {
+        lon = w;
+        counts.wrapped_lon += 1;
+    }
+
+    p.lon_deg = lon;
+    p.lat_deg = lat;
+}
+
+fn normalize_geometry_in_place(
+    geom: &mut formats::VectorGeometry,
+    counts: &mut UploadCoordFixCounts,
+) {
+    use formats::VectorGeometry::*;
+    match geom {
+        Point(p) => normalize_geo_point_in_place(p, counts),
+        MultiPoint(ps) | LineString(ps) => {
+            for p in ps {
+                normalize_geo_point_in_place(p, counts);
+            }
+        }
+        MultiLineString(lines) | Polygon(lines) => {
+            for line in lines {
+                for p in line {
+                    normalize_geo_point_in_place(p, counts);
+                }
+            }
+        }
+        MultiPolygon(polys) => {
+            for poly in polys {
+                for ring in poly {
+                    for p in ring {
+                        normalize_geo_point_in_place(p, counts);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn normalize_chunk_coords_in_place(chunk: &mut formats::VectorChunk) -> UploadCoordFixCounts {
+    let mut counts = UploadCoordFixCounts::default();
+    for f in &mut chunk.features {
+        normalize_geometry_in_place(&mut f.geometry, &mut counts);
+    }
+    counts
 }
 
 async fn fetch_geojson_chunk(url: &str) -> Result<formats::VectorChunk, JsValue> {
@@ -3430,8 +3697,11 @@ pub async fn catalog_load(id: String) -> Result<JsValue, JsValue> {
             .map_err(|e| JsValue::from_str(&e.to_string()))?,
     };
 
-    let chunk = formats::VectorChunk::from_avc_bytes(&bytes)
+    let mut chunk = formats::VectorChunk::from_avc_bytes(&bytes)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    // Best-effort normalization for older uploads.
+    let _ = normalize_chunk_coords_in_place(&mut chunk);
 
     // Count primitives for UI + bounds for camera fit.
     let mut count_points = 0usize;
@@ -3960,8 +4230,12 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
 
     web_sys::console::error_1(&JsValue::from_str("upload: parsing GeoJSON"));
 
-    let chunk = formats::VectorChunk::from_geojson_str(&geojson_text)
+    let mut chunk = formats::VectorChunk::from_geojson_str(&geojson_text)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    // Best-effort normalization for common coordinate issues.
+    // (Some real-world data uses [lat, lon] order or WebMercator meters.)
+    let fix_counts = normalize_chunk_coords_in_place(&mut chunk);
 
     web_sys::console::error_1(&JsValue::from_str("upload: parsed GeoJSON"));
 
@@ -4183,17 +4457,17 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
     let _ = js_sys::Reflect::set(
         &summary,
         &JsValue::from_str("skipped_coords"),
-        &JsValue::from_f64(0.0),
+        &JsValue::from_f64(fix_counts.skipped as f64),
     );
     let _ = js_sys::Reflect::set(
         &summary,
         &JsValue::from_str("fixed_swapped"),
-        &JsValue::from_f64(0.0),
+        &JsValue::from_f64(fix_counts.swapped as f64),
     );
     let _ = js_sys::Reflect::set(
         &summary,
         &JsValue::from_str("fixed_web_mercator"),
-        &JsValue::from_f64(0.0),
+        &JsValue::from_f64(fix_counts.web_mercator as f64),
     );
     let _ = js_sys::Reflect::set(
         &summary,

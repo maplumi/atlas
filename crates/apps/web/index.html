@@ -2067,6 +2067,16 @@
         let pinching = false;
         let pinchLastDist = 0;
 
+        function canvasXYFromClient(canvas, clientX, clientY) {
+          const rect = canvas.getBoundingClientRect();
+          const w = rect.width || 1;
+          const h = rect.height || 1;
+          // Map to canvas pixel coordinates (matches wasm canvas sizing).
+          const x = (clientX - rect.left) * (canvas.width / w);
+          const y = (clientY - rect.top) * (canvas.height / h);
+          return { x, y };
+        }
+
         function getTouchPair() {
           const pts = [];
           for (const [id, p] of activePointers) {
@@ -2115,6 +2125,14 @@
           } else {
             dragMode = "orbit";
           }
+
+          // Arcball-style grab-to-rotate (and 2D pan) initialization.
+          try {
+            const { x, y } = canvasXYFromClient(canvas, e.clientX, e.clientY);
+            wasm.camera_drag_begin(x, y);
+          } catch (err) {
+            // ignore
+          }
         }
 
         function onPointerMove(e) {
@@ -2143,8 +2161,8 @@
           // Cursor hover picking can be surprisingly expensive; throttle to one RAF.
           if (!dragging) {
             if (!window.__atlasCursorRaf) {
-              const ox = e.offsetX;
-              const oy = e.offsetY;
+              const canvas = activeCanvas();
+              const { x: ox, y: oy } = canvasXYFromClient(canvas, e.clientX, e.clientY);
               window.__atlasCursorRaf = window.requestAnimationFrame(() => {
                 window.__atlasCursorRaf = 0;
                 try {
@@ -2161,27 +2179,21 @@
             }
           }
           if (!dragging) return;
-          const dx = e.clientX - lastX;
-          const dy = e.clientY - lastY;
-          lastX = e.clientX;
-          lastY = e.clientY;
-
-          pendingDx += dx;
-          pendingDy += dy;
+          // Coalesce moves into one RAF.
+          {
+            const canvas = activeCanvas();
+            const { x, y } = canvasXYFromClient(canvas, e.clientX, e.clientY);
+            pendingDx = x;
+            pendingDy = y;
+          }
 
           if (!dragRaf) {
             dragRaf = window.requestAnimationFrame(() => {
               dragRaf = 0;
               const px = pendingDx;
               const py = pendingDy;
-              pendingDx = 0;
-              pendingDy = 0;
               try {
-                if (dragMode === "pan") {
-                  wasm.camera_pan(px, py);
-                } else {
-                  wasm.camera_orbit(px, py);
-                }
+                wasm.camera_drag_move(px, py);
                 updateCompass();
               } catch (err) {
                 console.error("camera input failed", err);
@@ -2194,6 +2206,12 @@
           dragging = false;
           pinching = false;
           activePointers.clear();
+
+          try {
+            wasm.camera_drag_end();
+          } catch (err) {
+            // ignore
+          }
         }
         function onPointerUp(e) {
           if (e.pointerType === "touch") {
@@ -2213,7 +2231,9 @@
           const dist2 = dx * dx + dy * dy;
           if (downButton === 0 && dist2 < 16) {
             try {
-              const picked = wasm.cursor_click(e.offsetX, e.offsetY);
+              const canvas = activeCanvas();
+              const { x, y } = canvasXYFromClient(canvas, e.clientX, e.clientY);
+              const picked = wasm.cursor_click(x, y);
               if (picked && picked.picked) {
                 const kind = picked.kind ? String(picked.kind) : "feature";
                 pickText.textContent = `Pick (${kind}): lon ${picked.lon.toFixed(4)}°, lat ${picked.lat.toFixed(4)}°`;
