@@ -17,10 +17,13 @@ mod imp {
         pub _canvas: web_sys::HtmlCanvasElement,
         pub clear_color: ::wgpu::Color,
         pub globe_color: [f32; 3],
+        pub globe_alpha: f32,
+        pub globe_transparent: bool,
         pub stars_alpha: f32,
         pub stars_pipeline: ::wgpu::RenderPipeline,
         pub stars_count: u32,
-        pub pipeline: ::wgpu::RenderPipeline,
+        pub globe_pipeline_solid: ::wgpu::RenderPipeline,
+        pub globe_pipeline_transparent: ::wgpu::RenderPipeline,
         pub graticule_pipeline: ::wgpu::RenderPipeline,
         pub cities_pipeline: ::wgpu::RenderPipeline,
         pub corridors_pipeline: ::wgpu::RenderPipeline,
@@ -52,7 +55,8 @@ struct Globals {
     light_dir: vec3<f32>,
     _pad0: f32,
     viewport: vec2<f32>,
-    _pad1: vec2<f32>,
+    globe_alpha: f32,
+    _pad1: f32,
     globe_color: vec3<f32>,
     stars_alpha: f32,
 };
@@ -82,7 +86,7 @@ fn fs_main(fs_in: VsOut) -> @location(0) vec4<f32> {
     // Simple globe-ish color ramp.
     let base = globals.globe_color;
     let shade = 0.25 + 0.75 * ndotl;
-    return vec4<f32>(base * shade, 1.0);
+    return vec4<f32>(base * shade, globals.globe_alpha);
 }
 "#;
 
@@ -92,7 +96,8 @@ struct Globals {
     light_dir: vec3<f32>,
     _pad0: f32,
     viewport: vec2<f32>,
-    _pad1: vec2<f32>,
+    globe_alpha: f32,
+    _pad1: f32,
     globe_color: vec3<f32>,
     stars_alpha: f32,
 };
@@ -118,7 +123,8 @@ struct Globals {
     light_dir: vec3<f32>,
     _pad0: f32,
     viewport: vec2<f32>,
-    _pad1: vec2<f32>,
+    globe_alpha: f32,
+    _pad1: f32,
     globe_color: vec3<f32>,
     stars_alpha: f32,
 };
@@ -183,7 +189,8 @@ struct Globals {
     light_dir: vec3<f32>,
     _pad0: f32,
     viewport: vec2<f32>,
-    _pad1: vec2<f32>,
+    globe_alpha: f32,
+    _pad1: f32,
     globe_color: vec3<f32>,
     stars_alpha: f32,
 };
@@ -239,7 +246,8 @@ struct Globals {
     light_dir: vec3<f32>,
     _pad0: f32,
     viewport: vec2<f32>,
-    _pad1: vec2<f32>,
+    globe_alpha: f32,
+    _pad1: f32,
     globe_color: vec3<f32>,
     stars_alpha: f32,
 };
@@ -306,7 +314,8 @@ struct Globals {
     light_dir: vec3<f32>,
     _pad0: f32,
     viewport: vec2<f32>,
-    _pad1: vec2<f32>,
+    globe_alpha: f32,
+    _pad1: f32,
     globe_color: vec3<f32>,
     stars_alpha: f32,
 };
@@ -394,7 +403,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         light_dir: [f32; 3],
         _pad0: f32,
         viewport: [f32; 2],
-        _pad1: [f32; 2],
+        globe_alpha: f32,
+        _pad1: f32,
         globe_color: [f32; 3],
         stars_alpha: f32,
     }
@@ -408,6 +418,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         ctx.clear_color = clear_color;
         ctx.globe_color = globe_color;
         ctx.stars_alpha = stars_alpha;
+    }
+
+    pub fn set_globe_transparent(ctx: &mut WgpuContext, transparent: bool) {
+        ctx.globe_transparent = transparent;
+        ctx.globe_alpha = if transparent { 0.40 } else { 1.0 };
     }
 
     fn create_depth_view(
@@ -780,61 +795,120 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             cache: None,
         });
 
-        let pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
-            label: Some("atlas-globe-pipeline"),
-            layout: Some(&pipeline_layout),
-            vertex: ::wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[::wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<Vertex>() as ::wgpu::BufferAddress,
-                    step_mode: ::wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32x3,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32x3,
-                            offset: 12,
-                            shader_location: 1,
-                        },
-                    ],
-                }],
-            },
-            fragment: Some(::wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(::wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(::wgpu::BlendState::REPLACE),
-                    write_mask: ::wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: ::wgpu::PrimitiveState {
-                topology: ::wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: ::wgpu::FrontFace::Ccw,
-                // Cull back faces so overlays don't show through the far side of the globe.
-                cull_mode: Some(::wgpu::Face::Back),
-                polygon_mode: ::wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(::wgpu::DepthStencilState {
-                format: ::wgpu::TextureFormat::Depth24PlusStencil8,
-                depth_write_enabled: true,
-                depth_compare: ::wgpu::CompareFunction::Less,
-                stencil: stencil_write_1(),
-                bias: ::wgpu::DepthBiasState::default(),
-            }),
-            multisample: ::wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let globe_pipeline_solid =
+            device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+                label: Some("atlas-globe-pipeline-solid"),
+                layout: Some(&pipeline_layout),
+                vertex: ::wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[::wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as ::wgpu::BufferAddress,
+                        step_mode: ::wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x3,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(::wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(::wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(::wgpu::BlendState::REPLACE),
+                        write_mask: ::wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: ::wgpu::PrimitiveState {
+                    topology: ::wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: ::wgpu::FrontFace::Ccw,
+                    // Cull back faces so overlays don't show through the far side of the globe.
+                    cull_mode: Some(::wgpu::Face::Back),
+                    polygon_mode: ::wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(::wgpu::DepthStencilState {
+                    format: ::wgpu::TextureFormat::Depth24PlusStencil8,
+                    depth_write_enabled: true,
+                    depth_compare: ::wgpu::CompareFunction::Less,
+                    stencil: stencil_write_1(),
+                    bias: ::wgpu::DepthBiasState::default(),
+                }),
+                multisample: ::wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        // Transparent globe: alpha blend over the already-rendered background, but still
+        // write depth+stencil so overlays can be depth-tested and masked correctly.
+        let globe_pipeline_transparent =
+            device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+                label: Some("atlas-globe-pipeline-transparent"),
+                layout: Some(&pipeline_layout),
+                vertex: ::wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[::wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<Vertex>() as ::wgpu::BufferAddress,
+                        step_mode: ::wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x3,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(::wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(::wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: ::wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: ::wgpu::PrimitiveState {
+                    topology: ::wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: ::wgpu::FrontFace::Ccw,
+                    cull_mode: Some(::wgpu::Face::Back),
+                    polygon_mode: ::wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(::wgpu::DepthStencilState {
+                    format: ::wgpu::TextureFormat::Depth24PlusStencil8,
+                    depth_write_enabled: true,
+                    depth_compare: ::wgpu::CompareFunction::Less,
+                    stencil: stencil_write_1(),
+                    bias: ::wgpu::DepthBiasState::default(),
+                }),
+                multisample: ::wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
 
         let graticule_pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
             label: Some("atlas-graticule-pipeline"),
@@ -1255,7 +1329,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             light_dir: [0.4, 0.7, 0.2],
             _pad0: 0.0,
             viewport: [1.0, 1.0],
-            _pad1: [0.0, 0.0],
+            globe_alpha: 1.0,
+            _pad1: 0.0,
             globe_color: [0.10, 0.55, 0.85],
             stars_alpha: 1.0,
         };
@@ -1275,10 +1350,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 a: 1.0,
             },
             globe_color: [0.10, 0.55, 0.85],
+            globe_alpha: 1.0,
+            globe_transparent: false,
             stars_alpha: 1.0,
             stars_pipeline,
             stars_count: 1200,
-            pipeline,
+            globe_pipeline_solid,
+            globe_pipeline_transparent,
             graticule_pipeline,
             cities_pipeline,
             corridors_pipeline,
@@ -1417,7 +1495,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             light_dir,
             _pad0: 0.0,
             viewport: [ctx.config.width as f32, ctx.config.height as f32],
-            _pad1: [0.0, 0.0],
+            globe_alpha: ctx.globe_alpha,
+            _pad1: 0.0,
             globe_color: ctx.globe_color,
             stars_alpha: ctx.stars_alpha,
         };
@@ -1483,7 +1562,12 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 multiview_mask: None,
             });
 
-            rpass.set_pipeline(&ctx.pipeline);
+            let globe_pipeline = if ctx.globe_transparent {
+                &ctx.globe_pipeline_transparent
+            } else {
+                &ctx.globe_pipeline_solid
+            };
+            rpass.set_pipeline(globe_pipeline);
             rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
             // Globe writes stencil=1 anywhere it draws.
             rpass.set_stencil_reference(1);
@@ -1777,6 +1861,8 @@ mod imp {
     ) {
     }
 
+    pub fn set_globe_transparent(_ctx: &mut WgpuContext, _transparent: bool) {}
+
     #[allow(clippy::too_many_arguments)]
     pub fn render_mesh(
         _ctx: &WgpuContext,
@@ -1798,5 +1884,5 @@ mod imp {
 pub use imp::{
     CityVertex, CorridorVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh,
     resize_wgpu, set_base_regions_points, set_cities_points, set_corridors_points,
-    set_regions_points, set_terrain_points, set_theme,
+    set_globe_transparent, set_regions_points, set_terrain_points, set_theme,
 };

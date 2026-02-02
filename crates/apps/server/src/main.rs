@@ -939,11 +939,23 @@ async fn get_tile(
         .join(format!("{y}.bin"));
 
     if tokio::fs::metadata(&cache_path).await.is_ok() {
-        return serve_file(&cache_path, "application/octet-stream").await;
+        return serve_file(
+            &cache_path,
+            "application/octet-stream",
+            Some("public, max-age=31536000, immutable"),
+        )
+        .await;
     }
 
     match build_tile(&state, z, x, y, &cache_path).await {
-        Ok(()) => serve_file(&cache_path, "application/octet-stream").await,
+        Ok(()) => {
+            serve_file(
+                &cache_path,
+                "application/octet-stream",
+                Some("public, max-age=31536000, immutable"),
+            )
+            .await
+        }
         Err(err) => {
             warn!("tile build failed: z={z} x={x} y={y} -> {err}");
             (StatusCode::NOT_FOUND, "tile unavailable").into_response()
@@ -956,7 +968,7 @@ async fn get_surface_tileset(State(state): State<AppState>) -> Response {
     if tokio::fs::metadata(&path).await.is_err() {
         return (StatusCode::NOT_FOUND, "surface tileset missing").into_response();
     }
-    serve_file(&path, "application/json").await
+    serve_file(&path, "application/json", Some("public, max-age=300")).await
 }
 
 async fn get_surface_tile(
@@ -976,7 +988,12 @@ async fn get_surface_tile(
     if tokio::fs::metadata(&path).await.is_err() {
         return (StatusCode::NOT_FOUND, "surface tile missing").into_response();
     }
-    serve_file(&path, "application/octet-stream").await
+    serve_file(
+        &path,
+        "application/octet-stream",
+        Some("public, max-age=31536000, immutable"),
+    )
+    .await
 }
 
 fn parse_tile_y(raw: &str) -> Option<u32> {
@@ -984,7 +1001,11 @@ fn parse_tile_y(raw: &str) -> Option<u32> {
     trimmed.parse::<u32>().ok()
 }
 
-async fn serve_file(path: &Path, content_type: &str) -> Response {
+async fn serve_file(
+    path: &Path,
+    content_type: &str,
+    cache_control: Option<&'static str>,
+) -> Response {
     match tokio::fs::read(path).await {
         Ok(data) => {
             let mut headers = HeaderMap::new();
@@ -993,6 +1014,11 @@ async fn serve_file(path: &Path, content_type: &str) -> Response {
                 HeaderValue::from_str(content_type)
                     .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream")),
             );
+            if let Some(cc) = cache_control {
+                if let Ok(v) = HeaderValue::from_str(cc) {
+                    headers.insert(http::header::CACHE_CONTROL, v);
+                }
+            }
             (StatusCode::OK, headers, Body::from(data)).into_response()
         }
         Err(err) => {

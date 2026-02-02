@@ -215,6 +215,9 @@ struct ViewerState {
     show_graticule: bool,
     sun_follow_real_time: bool,
 
+    // Globe appearance.
+    globe_transparent: bool,
+
     // Point marker size in screen pixels.
     city_marker_size: f32,
 
@@ -314,6 +317,7 @@ thread_local! {
         wgpu: None,
         show_graticule: false,
         sun_follow_real_time: true,
+        globe_transparent: false,
         city_marker_size: 4.0,
         line_width_px: 2.5,
 
@@ -2053,6 +2057,30 @@ pub fn set_theme(theme: String) -> Result<(), JsValue> {
     render_scene()
 }
 
+#[wasm_bindgen]
+pub fn get_globe_settings() -> JsValue {
+    let transparent = with_state(|state| state.borrow().globe_transparent);
+    let o = js_sys::Object::new();
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("transparent"),
+        &JsValue::from_bool(transparent),
+    );
+    o.into()
+}
+
+#[wasm_bindgen]
+pub fn set_globe_transparent(transparent: bool) -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.globe_transparent = transparent;
+        if let Some(ctx) = &mut s.wgpu {
+            wgpu::set_globe_transparent(ctx, transparent);
+        }
+    });
+    render_scene()
+}
+
 fn layer_style_mut<'a>(s: &'a mut ViewerState, id: &str) -> Option<&'a mut LayerStyle> {
     match id {
         "world_base" => Some(&mut s.base_regions_style),
@@ -2267,6 +2295,11 @@ fn ensure_base_world_loaded() {
 
         with_state(|state| {
             let mut s = state.borrow_mut();
+            // Avoid races: if another base-world source started loading after we began
+            // fetching world.json (e.g., PMTiles streaming), do not overwrite it.
+            if s.base_world_source.as_deref() != Some("world.json") {
+                return;
+            }
             s.base_world = Some(world);
             s.base_count_polys = polys;
             s.base_world_loading = false;
@@ -4363,6 +4396,7 @@ async fn init_wgpu_inner() -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
         let palette = palette_for(s.theme);
+        let globe_transparent = s.globe_transparent;
         let pending = s.pending_cities.take();
         let pending_corridors = s.pending_corridors.take();
         let pending_base_regions = s.pending_base_regions.take();
@@ -4377,6 +4411,7 @@ async fn init_wgpu_inner() -> Result<(), JsValue> {
                 palette.globe_color,
                 palette.stars_alpha,
             );
+            wgpu::set_globe_transparent(ctx, globe_transparent);
         }
 
         if let Some(points) = pending

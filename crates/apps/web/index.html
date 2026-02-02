@@ -509,7 +509,7 @@
           <div class="section">
             <h3>Surface</h3>
             <label class="checkbox">
-              <input id="surface-use-pmtiles" type="checkbox" checked />
+              <input id="surface-use-pmtiles" type="checkbox" />
               <span>Use lightweight PMTiles base surface</span>
             </label>
             <label for="surface-pmtiles-max-zoom" style="margin-top:8px;">PMTiles refinement max zoom</label>
@@ -696,6 +696,10 @@
               <option value="deep-dark">Deep Dark</option>
               <option value="light">Light</option>
             </select>
+            <label class="checkbox" style="margin-top:10px;">
+              <input id="toggle-globe-transparent" type="checkbox" />
+              <span>Transparent globe</span>
+            </label>
             <div class="muted" style="font-size:12px; line-height:1.35; margin-top:8px;">
               Affects UI and globe colors (base surface + ocean/space).
             </div>
@@ -1154,6 +1158,14 @@
           await waitForUserIdle();
           flushPendingFeatures(true);
 
+          // Finalize once so Rust triangulates and uploads.
+          // (Without this, `base_polygons` stays 0 and we incorrectly fall back.)
+          try {
+            wasm.finish_base_world_stream?.();
+          } catch (e) {
+            console.warn("finish_base_world_stream failed", e);
+          }
+
           if (appendedPolygonFeatures === 0) {
             console.warn(
               `PMTiles base surface: no polygons decoded (requested layer=${requestedLayerId}, resolved=${resolvedLayerId}); falling back to world.json` +
@@ -1188,7 +1200,8 @@
       }
 
       function getPmtilesSurfacePrefs() {
-        let enabled = true;
+        // Prefer stable world.json fallback by default.
+        let enabled = false;
         // Default to z5 because the bundled world.pmtiles only goes to z5 and some archives
         // omit meaningful data at very low zooms.
         let maxZoom = 5;
@@ -1215,8 +1228,13 @@
       }
 
       async function reloadBaseSurface(wasm) {
-        // Prefer backend surface tiles if available (existing behavior), otherwise base-world fallback.
-        // Here we only decide the fallback base-world source.
+        // Deterministic policy:
+        // - If backend is online, prefer server surface tiles (wasm will load them).
+        // - If backend is offline, fall back to a bundled base-world (world.json by default).
+        try {
+          if (window.__atlasBackendUrl) return;
+        } catch (_) {}
+
         const prefs = getPmtilesSurfacePrefs();
         applyPmtilesSurfacePrefsToGlobals(prefs);
         if (prefs.enabled) {
@@ -1258,7 +1276,7 @@
         });
       }
 
-      function main(wasm) {
+      async function main(wasm) {
         // Apply theme early so both UI and renderer pick consistent defaults.
         const theme = applyTheme(getInitialTheme(), wasm);
         wireUi(wasm);
@@ -1270,13 +1288,16 @@
             document.getElementById("side-panel")?.classList.remove("compact-open");
           }
         });
+        const backendOk = await detectBackendAvailability(wasm);
+
+        // If the backend is offline, start loading the base-world fallback immediately
+        // so we have something to draw as soon as the renderer initializes.
+        if (!backendOk) {
+          await reloadBaseSurface(wasm);
+        }
+
         wasm.init_canvas_2d();
         wasm.init_wgpu();
-        // Apply persisted surface prefs and load base surface.
-        const prefs = getPmtilesSurfacePrefs();
-        applyPmtilesSurfacePrefsToGlobals(prefs);
-        reloadBaseSurface(wasm);
-        detectBackendAvailability(wasm);
         startSurfaceStatusPolling(wasm);
         startTerrainClientStatusPolling(wasm);
         startAnimation(wasm);
@@ -1333,7 +1354,7 @@
                 const cb = document.getElementById("layer-terrain");
                 if (cb) cb.checked = true;
               }
-              return;
+              return true;
             }
           } catch (err) {
             // ignore and try next
@@ -1344,6 +1365,7 @@
         window.__atlasStacUrl = "https://copernicus-dem-30m-stac.s3.amazonaws.com";
         setStatus("Backend: offline (using defaults)");
         setDemStatus("Terrain (backend): offline");
+        return false;
       }
 
       function startAnimation(wasm) {
@@ -1541,6 +1563,7 @@
         const toggleGraticule = document.getElementById("toggle-graticule");
         const toggleRealSun = document.getElementById("toggle-real-sun");
         const toggleAutoRotate = document.getElementById("toggle-auto-rotate");
+        const toggleGlobeTransparent = document.getElementById("toggle-globe-transparent");
         const autoRotateSpeed = document.getElementById("auto-rotate-speed");
         const autoRotateSpeedValue = document.getElementById("auto-rotate-speed-value");
         const themeSelect = document.getElementById("theme-select");
@@ -1562,6 +1585,33 @@
           themeSelect.value = normalizeTheme(document.documentElement.dataset.theme || "dark");
           themeSelect.addEventListener("change", (e) => {
             applyTheme(e.target.value, wasm);
+          });
+        }
+
+        if (toggleGlobeTransparent) {
+          // Prefer persisted UI state; fall back to wasm default.
+          let initial = null;
+          try {
+            const saved = localStorage.getItem("atlas-globe-transparent");
+            if (saved === "true" || saved === "false") initial = (saved === "true");
+          } catch (_) {}
+
+          if (initial === null) {
+            try {
+              const s = wasm.get_globe_settings?.();
+              initial = !!s?.transparent;
+            } catch (_) {
+              initial = false;
+            }
+          }
+
+          toggleGlobeTransparent.checked = !!initial;
+          try { wasm.set_globe_transparent?.(!!initial); } catch (_) {}
+
+          toggleGlobeTransparent.addEventListener("change", (e) => {
+            const v = !!e.target.checked;
+            try { localStorage.setItem("atlas-globe-transparent", v ? "true" : "false"); } catch (_) {}
+            try { wasm.set_globe_transparent(v); } catch (err) { console.error(err); }
           });
         }
 
@@ -2549,7 +2599,7 @@
       function bootstrap() {
         const alreadyLoaded = window.wasmBindings;
         if (alreadyLoaded) {
-          main(alreadyLoaded);
+          main(alreadyLoaded).catch((e) => console.error("main failed", e));
           return;
         }
 
@@ -2558,7 +2608,7 @@
             console.error("Trunk started but wasmBindings missing");
             return;
           }
-          main(window.wasmBindings);
+          main(window.wasmBindings).catch((e) => console.error("main failed", e));
         });
       }
 
