@@ -1781,6 +1781,9 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
         s.auto_rotate_last_user_time_s = wall_clock_seconds();
         match s.view_mode {
             ViewMode::ThreeD => {
+                // Keep the globe fixed at the center of rotation.
+                // (Panning/translation is not desired in this viewer.)
+                s.camera.target = [0.0, 0.0, 0.0];
                 // Scale orbit sensitivity to viewport size so drag feels consistent.
                 // Roughly: dragging across the shorter side ~= 180 degrees.
                 let min_dim = s.canvas_width.min(s.canvas_height).max(1.0);
@@ -1820,24 +1823,16 @@ pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
         s.auto_rotate_last_user_time_s = wall_clock_seconds();
         match s.view_mode {
             ViewMode::ThreeD => {
-                let cam = s.camera;
+                // In 3D, "pan" behaves like orbit so the globe never translates off-center.
+                s.camera.target = [0.0, 0.0, 0.0];
 
-                let dir = [
-                    cam.pitch_rad.cos() * cam.yaw_rad.cos(),
-                    cam.pitch_rad.sin(),
-                    -cam.pitch_rad.cos() * cam.yaw_rad.sin(),
-                ];
-                let forward = vec3_normalize(vec3_mul(dir, -1.0));
-                let up = [0.0, 1.0, 0.0];
-                let right = vec3_normalize(vec3_cross(forward, up));
-                let real_up = vec3_cross(right, forward);
-
-                let pan_scale = cam.distance * 0.002;
-                let delta = vec3_add(
-                    vec3_mul(right, delta_x_px * pan_scale),
-                    vec3_mul(real_up, delta_y_px * pan_scale),
-                );
-                s.camera.target = vec3_add(s.camera.target, delta);
+                let min_dim = s.canvas_width.min(s.canvas_height).max(1.0);
+                let speed = std::f64::consts::PI / min_dim;
+                s.camera.yaw_rad += delta_x_px * speed;
+                s.camera.pitch_rad = clamp(s.camera.pitch_rad - delta_y_px * speed, -1.55, 1.55);
+                s.camera.yaw_rad = (s.camera.yaw_rad + std::f64::consts::PI)
+                    .rem_euclid(2.0 * std::f64::consts::PI)
+                    - std::f64::consts::PI;
             }
             ViewMode::TwoD => {
                 s.camera_2d = pan_camera_2d(
