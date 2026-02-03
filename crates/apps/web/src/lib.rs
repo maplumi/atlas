@@ -684,7 +684,7 @@ fn wrap_lon_deg(mut lon: f64) -> f64 {
 const MERCATOR_MAX_LAT_DEG: f64 = 85.05112878;
 
 fn is_mercator_lat_valid(lat_deg: f64) -> bool {
-    lat_deg.is_finite() && lat_deg >= -MERCATOR_MAX_LAT_DEG && lat_deg <= MERCATOR_MAX_LAT_DEG
+    lat_deg.is_finite() && (-MERCATOR_MAX_LAT_DEG..=MERCATOR_MAX_LAT_DEG).contains(&lat_deg)
 }
 
 fn mercator_x_m(lon_deg: f64) -> f64 {
@@ -740,8 +740,16 @@ fn clip_polygon_lat_band(mut poly: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
         out
     }
 
-    poly = clip_against(poly, |lat| lat <= MERCATOR_MAX_LAT_DEG, MERCATOR_MAX_LAT_DEG);
-    poly = clip_against(poly, |lat| lat >= -MERCATOR_MAX_LAT_DEG, -MERCATOR_MAX_LAT_DEG);
+    poly = clip_against(
+        poly,
+        |lat| lat <= MERCATOR_MAX_LAT_DEG,
+        MERCATOR_MAX_LAT_DEG,
+    );
+    poly = clip_against(
+        poly,
+        |lat| lat >= -MERCATOR_MAX_LAT_DEG,
+        -MERCATOR_MAX_LAT_DEG,
+    );
     poly
 }
 
@@ -1341,427 +1349,433 @@ struct Render2DStats {
 
 fn render_scene_2d() -> Result<(), JsValue> {
     // First pass: render and collect stats (immutable borrow).
-    let stats_opt: Option<Render2DStats> = STATE.try_with(|state_ref| {
-        let state = state_ref.borrow();
-        let Some(ctx) = state.ctx_2d.as_ref() else {
-            return None;
-        };
+    let stats_opt: Option<Render2DStats> = STATE
+        .try_with(|state_ref| {
+            let state = state_ref.borrow();
+            let ctx = state.ctx_2d.as_ref()?;
 
-        let t0 = now_ms();
+            let t0 = now_ms();
 
-        let w = state.canvas_width.max(1.0);
-        let h = state.canvas_height.max(1.0);
+            let w = state.canvas_width.max(1.0);
+            let h = state.canvas_height.max(1.0);
 
-        // Clear.
-        let clear = palette_for(state.theme).canvas_2d_clear;
-        ctx_set_fill_style(ctx, clear);
-        ctx.fill_rect(0.0, 0.0, w, h);
+            // Clear.
+            let clear = palette_for(state.theme).canvas_2d_clear;
+            ctx_set_fill_style(ctx, clear);
+            ctx.fill_rect(0.0, 0.0, w, h);
 
-        // Optional graticule (Web Mercator).
-        if state.show_graticule {
+            // Optional graticule (Web Mercator).
+            if state.show_graticule {
+                let projector = MercatorProjector::new(state.camera_2d, w, h);
+                // Minor lines.
+                ctx_set_stroke_style(ctx, "rgba(148,163,184,0.20)");
+                ctx.set_line_width(0.75);
+                for lon in (-180..=180).step_by(10) {
+                    let (x0, y0) = projector.project_lon_lat(lon as f64, -85.0, w, h);
+                    let (x1, y1) = projector.project_lon_lat(lon as f64, 85.0, w, h);
+                    ctx.begin_path();
+                    ctx.move_to(x0, y0);
+                    ctx.line_to(x1, y1);
+                    ctx.stroke();
+                }
+                for lat in (-80..=80).step_by(10) {
+                    let (x0, y0) = projector.project_lon_lat(-180.0, lat as f64, w, h);
+                    let (x1, y1) = projector.project_lon_lat(180.0, lat as f64, w, h);
+                    ctx.begin_path();
+                    ctx.move_to(x0, y0);
+                    ctx.line_to(x1, y1);
+                    ctx.stroke();
+                }
+
+                // Major lines.
+                ctx_set_stroke_style(ctx, "rgba(148,163,184,0.55)");
+                ctx.set_line_width(1.25);
+                for lon in (-180..=180).step_by(30) {
+                    let (x0, y0) = projector.project_lon_lat(lon as f64, -85.0, w, h);
+                    let (x1, y1) = projector.project_lon_lat(lon as f64, 85.0, w, h);
+                    ctx.begin_path();
+                    ctx.move_to(x0, y0);
+                    ctx.line_to(x1, y1);
+                    ctx.stroke();
+                }
+                for lat in (-60..=60).step_by(30) {
+                    let (x0, y0) = projector.project_lon_lat(-180.0, lat as f64, w, h);
+                    let (x1, y1) = projector.project_lon_lat(180.0, lat as f64, w, h);
+                    ctx.begin_path();
+                    ctx.move_to(x0, y0);
+                    ctx.line_to(x1, y1);
+                    ctx.stroke();
+                }
+            }
+
             let projector = MercatorProjector::new(state.camera_2d, w, h);
-            // Minor lines.
-            ctx_set_stroke_style(ctx, "rgba(148,163,184,0.20)");
-            ctx.set_line_width(0.75);
-            for lon in (-180..=180).step_by(10) {
-                let (x0, y0) = projector.project_lon_lat(lon as f64, -85.0, w, h);
-                let (x1, y1) = projector.project_lon_lat(lon as f64, 85.0, w, h);
+
+            let mut poly_tris: u32 = 0;
+            let mut line_segs: u32 = 0;
+            let mut points: u32 = 0;
+
+            let tp0 = now_ms();
+
+            // Polygons first (fills).
+            let draw_poly_tris = |pos: &[[f32; 3]], color: [f32; 4]| {
+                // Chunking avoids extremely large paths causing browser rasterization artifacts.
+                const TRI_CHUNK: usize = 10_000;
+                let ww = projector.world_width_m;
+                let cx = projector.center_x;
+                let cy = projector.center_y;
+                let s = projector.scale_px_per_m;
+
+                ctx_set_fill_style(ctx, &rgba_css(color));
                 ctx.begin_path();
-                ctx.move_to(x0, y0);
-                ctx.line_to(x1, y1);
-                ctx.stroke();
-            }
-            for lat in (-80..=80).step_by(10) {
-                let (x0, y0) = projector.project_lon_lat(-180.0, lat as f64, w, h);
-                let (x1, y1) = projector.project_lon_lat(180.0, lat as f64, w, h);
+
+                for (i, tri) in pos.chunks_exact(3).take(2_000_000).enumerate() {
+                    if i > 0 && (i % TRI_CHUNK) == 0 {
+                        ctx.fill();
+                        ctx.begin_path();
+                    }
+
+                    let a = tri[0];
+                    let b = tri[1];
+                    let c = tri[2];
+
+                    let (lon_a, lat_a) = world_to_lon_lat_fast_deg(a);
+                    let (lon_b, lat_b) = world_to_lon_lat_fast_deg(b);
+                    let (lon_c, lat_c) = world_to_lon_lat_fast_deg(c);
+
+                    let ax_m = mercator_x_m(lon_a);
+                    let ay_m = mercator_y_m(lat_a);
+                    let bx_m = mercator_x_m(lon_b);
+                    let by_m = mercator_y_m(lat_b);
+                    let cx_m = mercator_x_m(lon_c);
+                    let cy_m = mercator_y_m(lat_c);
+
+                    // Unwrap mercator X per-triangle to avoid seam-spanning triangles.
+                    let ax_adj = {
+                        let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
+                        cx + dx0
+                    };
+                    let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+                    let cx_adj = ax_adj + ((cx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+
+                    let ax = w * 0.5 + (ax_adj - cx) * s;
+                    let bx = w * 0.5 + (bx_adj - cx) * s;
+                    let cxp = w * 0.5 + (cx_adj - cx) * s;
+                    let ay = h * 0.5 - (ay_m - cy) * s;
+                    let by = h * 0.5 - (by_m - cy) * s;
+                    let cyy = h * 0.5 - (cy_m - cy) * s;
+
+                    ctx.move_to(ax, ay);
+                    ctx.line_to(bx, by);
+                    ctx.line_to(cxp, cyy);
+                    ctx.close_path();
+                }
+                ctx.fill();
+            };
+
+            let draw_poly_tris_mercator = |pos: &[[f32; 2]], color: [f32; 4]| {
+                const TRI_CHUNK: usize = 10_000;
+                let ww = projector.world_width_m;
+                let cx = projector.center_x;
+                let cy = projector.center_y;
+                let s = projector.scale_px_per_m;
+
+                ctx_set_fill_style(ctx, &rgba_css(color));
                 ctx.begin_path();
-                ctx.move_to(x0, y0);
-                ctx.line_to(x1, y1);
-                ctx.stroke();
+                for (i, tri) in pos.chunks_exact(3).take(2_000_000).enumerate() {
+                    if i > 0 && (i % TRI_CHUNK) == 0 {
+                        ctx.fill();
+                        ctx.begin_path();
+                    }
+
+                    let a = tri[0];
+                    let b = tri[1];
+                    let c = tri[2];
+
+                    let ax_m = a[0] as f64;
+                    let ay_m = a[1] as f64;
+                    let bx_m = b[0] as f64;
+                    let by_m = b[1] as f64;
+                    let cx_m = c[0] as f64;
+                    let cy_m = c[1] as f64;
+
+                    // Unwrap mercator X per-triangle to avoid seam-spanning triangles.
+                    let ax_adj = {
+                        let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
+                        cx + dx0
+                    };
+                    let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+                    let cx_adj = ax_adj + ((cx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+
+                    let ax = w * 0.5 + (ax_adj - cx) * s;
+                    let bx = w * 0.5 + (bx_adj - cx) * s;
+                    let cxp = w * 0.5 + (cx_adj - cx) * s;
+                    let ay = h * 0.5 - (ay_m - cy) * s;
+                    let by = h * 0.5 - (by_m - cy) * s;
+                    let cyy = h * 0.5 - (cy_m - cy) * s;
+
+                    ctx.move_to(ax, ay);
+                    ctx.line_to(bx, by);
+                    ctx.line_to(cxp, cyy);
+                    ctx.close_path();
+                }
+                ctx.fill();
+            };
+
+            if state.base_regions_style.visible {
+                if let Some(pos) = state.base_regions_mercator.as_deref() {
+                    poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                    draw_poly_tris_mercator(pos, state.base_regions_style.color);
+                } else if let Some(pos) = state.base_regions_positions.as_deref() {
+                    poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                    draw_poly_tris(pos, state.base_regions_style.color);
+                }
+            }
+            if state.regions_style.visible {
+                if let Some(pos) = state.regions_mercator.as_deref() {
+                    poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                    draw_poly_tris_mercator(pos, state.regions_style.color);
+                } else if let Some(pos) = state.regions_positions.as_deref() {
+                    poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                    draw_poly_tris(pos, state.regions_style.color);
+                }
+            }
+            if state.uploaded_regions_style.visible {
+                if let Some(pos) = state.uploaded_regions_mercator.as_deref() {
+                    poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                    draw_poly_tris_mercator(pos, state.uploaded_regions_style.color);
+                } else if let Some(pos) = state.uploaded_regions_positions.as_deref() {
+                    poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                    draw_poly_tris(pos, state.uploaded_regions_style.color);
+                }
+            }
+            if state.selection_style.visible {
+                if let Some(pos) = state.selection_poly_mercator.as_deref() {
+                    poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                    draw_poly_tris_mercator(pos, state.selection_style.color);
+                } else if let Some(pos) = state.selection_poly_positions.as_deref() {
+                    poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                    draw_poly_tris(pos, state.selection_style.color);
+                }
             }
 
-            // Major lines.
-            ctx_set_stroke_style(ctx, "rgba(148,163,184,0.55)");
-            ctx.set_line_width(1.25);
-            for lon in (-180..=180).step_by(30) {
-                let (x0, y0) = projector.project_lon_lat(lon as f64, -85.0, w, h);
-                let (x1, y1) = projector.project_lon_lat(lon as f64, 85.0, w, h);
+            let tp1 = now_ms();
+
+            // Lines.
+            let tl0 = now_ms();
+            let draw_lines = |pos: &[[f32; 3]], color: [f32; 4], width_px: f64| {
+                const SEG_CHUNK: usize = 25_000;
+                let ww = projector.world_width_m;
+                let cx = projector.center_x;
+                let cy = projector.center_y;
+                let s = projector.scale_px_per_m;
+
+                ctx_set_stroke_style(ctx, &rgba_css(color));
+                ctx.set_line_width(width_px.max(1.0));
+                ctx.set_line_cap("round");
                 ctx.begin_path();
-                ctx.move_to(x0, y0);
-                ctx.line_to(x1, y1);
+
+                for (i, seg) in pos.chunks_exact(2).take(1_500_000).enumerate() {
+                    if i > 0 && (i % SEG_CHUNK) == 0 {
+                        ctx.stroke();
+                        ctx.begin_path();
+                    }
+
+                    let a = seg[0];
+                    let b = seg[1];
+                    let (lon_a, lat_a) = world_to_lon_lat_fast_deg(a);
+                    let (lon_b, lat_b) = world_to_lon_lat_fast_deg(b);
+
+                    let ax_m = mercator_x_m(lon_a);
+                    let ay_m = mercator_y_m(lat_a);
+                    let bx_m = mercator_x_m(lon_b);
+                    let by_m = mercator_y_m(lat_b);
+
+                    // Unwrap mercator X per-segment.
+                    let ax_adj = {
+                        let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
+                        cx + dx0
+                    };
+                    let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+
+                    let ax = w * 0.5 + (ax_adj - cx) * s;
+                    let bx = w * 0.5 + (bx_adj - cx) * s;
+                    let ay = h * 0.5 - (ay_m - cy) * s;
+                    let by = h * 0.5 - (by_m - cy) * s;
+
+                    ctx.move_to(ax, ay);
+                    ctx.line_to(bx, by);
+                }
                 ctx.stroke();
-            }
-            for lat in (-60..=60).step_by(30) {
-                let (x0, y0) = projector.project_lon_lat(-180.0, lat as f64, w, h);
-                let (x1, y1) = projector.project_lon_lat(180.0, lat as f64, w, h);
+            };
+
+            let draw_lines_mercator = |pos: &[[f32; 2]], color: [f32; 4], width_px: f64| {
+                const SEG_CHUNK: usize = 25_000;
+                let ww = projector.world_width_m;
+                let cx = projector.center_x;
+                let cy = projector.center_y;
+                let s = projector.scale_px_per_m;
+
+                ctx_set_stroke_style(ctx, &rgba_css(color));
+                ctx.set_line_width(width_px.max(1.0));
+                ctx.set_line_cap("round");
                 ctx.begin_path();
-                ctx.move_to(x0, y0);
-                ctx.line_to(x1, y1);
+
+                for (i, seg) in pos.chunks_exact(2).take(1_500_000).enumerate() {
+                    if i > 0 && (i % SEG_CHUNK) == 0 {
+                        ctx.stroke();
+                        ctx.begin_path();
+                    }
+
+                    let a = seg[0];
+                    let b = seg[1];
+                    let ax_m = a[0] as f64;
+                    let ay_m = a[1] as f64;
+                    let bx_m = b[0] as f64;
+                    let by_m = b[1] as f64;
+
+                    // Unwrap mercator X per-segment.
+                    let ax_adj = {
+                        let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
+                        cx + dx0
+                    };
+                    let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+
+                    let ax = w * 0.5 + (ax_adj - cx) * s;
+                    let bx = w * 0.5 + (bx_adj - cx) * s;
+                    let ay = h * 0.5 - (ay_m - cy) * s;
+                    let by = h * 0.5 - (by_m - cy) * s;
+
+                    ctx.move_to(ax, ay);
+                    ctx.line_to(bx, by);
+                }
                 ctx.stroke();
-            }
-        }
+            };
 
-        let projector = MercatorProjector::new(state.camera_2d, w, h);
-
-        let mut poly_tris: u32 = 0;
-        let mut line_segs: u32 = 0;
-        let mut points: u32 = 0;
-
-        let tp0 = now_ms();
-
-        // Polygons first (fills).
-        let draw_poly_tris = |pos: &[[f32; 3]], color: [f32; 4]| {
-            // Chunking avoids extremely large paths causing browser rasterization artifacts.
-            const TRI_CHUNK: usize = 10_000;
-            let ww = projector.world_width_m;
-            let cx = projector.center_x;
-            let cy = projector.center_y;
-            let s = projector.scale_px_per_m;
-
-            ctx_set_fill_style(ctx, &rgba_css(color));
-            ctx.begin_path();
-
-            for (i, tri) in pos.chunks_exact(3).take(2_000_000).enumerate() {
-                if i > 0 && (i % TRI_CHUNK) == 0 {
-                    ctx.fill();
-                    ctx.begin_path();
+            if state.corridors_style.visible {
+                if let Some(pos) = state.corridors_mercator.as_deref() {
+                    line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                    draw_lines_mercator(
+                        pos,
+                        state.corridors_style.color,
+                        state.line_width_px as f64,
+                    );
+                } else if let Some(pos) = state.corridors_positions.as_deref() {
+                    line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                    draw_lines(pos, state.corridors_style.color, state.line_width_px as f64);
                 }
-
-                let a = tri[0];
-                let b = tri[1];
-                let c = tri[2];
-
-                let (lon_a, lat_a) = world_to_lon_lat_fast_deg(a);
-                let (lon_b, lat_b) = world_to_lon_lat_fast_deg(b);
-                let (lon_c, lat_c) = world_to_lon_lat_fast_deg(c);
-
-                let ax_m = mercator_x_m(lon_a);
-                let ay_m = mercator_y_m(lat_a);
-                let bx_m = mercator_x_m(lon_b);
-                let by_m = mercator_y_m(lat_b);
-                let cx_m = mercator_x_m(lon_c);
-                let cy_m = mercator_y_m(lat_c);
-
-                // Unwrap mercator X per-triangle to avoid seam-spanning triangles.
-                let ax_adj = {
-                    let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
-                    cx + dx0
-                };
-                let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
-                let cx_adj = ax_adj + ((cx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
-
-                let ax = w * 0.5 + (ax_adj - cx) * s;
-                let bx = w * 0.5 + (bx_adj - cx) * s;
-                let cxp = w * 0.5 + (cx_adj - cx) * s;
-                let ay = h * 0.5 - (ay_m - cy) * s;
-                let by = h * 0.5 - (by_m - cy) * s;
-                let cyy = h * 0.5 - (cy_m - cy) * s;
-
-                ctx.move_to(ax, ay);
-                ctx.line_to(bx, by);
-                ctx.line_to(cxp, cyy);
-                ctx.close_path();
             }
-            ctx.fill();
-        };
-
-        let draw_poly_tris_mercator = |pos: &[[f32; 2]], color: [f32; 4]| {
-            const TRI_CHUNK: usize = 10_000;
-            let ww = projector.world_width_m;
-            let cx = projector.center_x;
-            let cy = projector.center_y;
-            let s = projector.scale_px_per_m;
-
-            ctx_set_fill_style(ctx, &rgba_css(color));
-            ctx.begin_path();
-            for (i, tri) in pos.chunks_exact(3).take(2_000_000).enumerate() {
-                if i > 0 && (i % TRI_CHUNK) == 0 {
-                    ctx.fill();
-                    ctx.begin_path();
+            if state.uploaded_corridors_style.visible {
+                if let Some(pos) = state.uploaded_corridors_mercator.as_deref() {
+                    line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                    draw_lines_mercator(
+                        pos,
+                        state.uploaded_corridors_style.color,
+                        state.line_width_px as f64,
+                    );
+                } else if let Some(pos) = state.uploaded_corridors_positions.as_deref() {
+                    line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                    draw_lines(
+                        pos,
+                        state.uploaded_corridors_style.color,
+                        state.line_width_px as f64,
+                    );
                 }
-
-                let a = tri[0];
-                let b = tri[1];
-                let c = tri[2];
-
-                let ax_m = a[0] as f64;
-                let ay_m = a[1] as f64;
-                let bx_m = b[0] as f64;
-                let by_m = b[1] as f64;
-                let cx_m = c[0] as f64;
-                let cy_m = c[1] as f64;
-
-                // Unwrap mercator X per-triangle to avoid seam-spanning triangles.
-                let ax_adj = {
-                    let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
-                    cx + dx0
-                };
-                let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
-                let cx_adj = ax_adj + ((cx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
-
-                let ax = w * 0.5 + (ax_adj - cx) * s;
-                let bx = w * 0.5 + (bx_adj - cx) * s;
-                let cxp = w * 0.5 + (cx_adj - cx) * s;
-                let ay = h * 0.5 - (ay_m - cy) * s;
-                let by = h * 0.5 - (by_m - cy) * s;
-                let cyy = h * 0.5 - (cy_m - cy) * s;
-
-                ctx.move_to(ax, ay);
-                ctx.line_to(bx, by);
-                ctx.line_to(cxp, cyy);
-                ctx.close_path();
             }
-            ctx.fill();
-        };
-
-        if state.base_regions_style.visible {
-            if let Some(pos) = state.base_regions_mercator.as_deref() {
-                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
-                draw_poly_tris_mercator(pos, state.base_regions_style.color);
-            } else if let Some(pos) = state.base_regions_positions.as_deref() {
-                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
-                draw_poly_tris(pos, state.base_regions_style.color);
-            }
-        }
-        if state.regions_style.visible {
-            if let Some(pos) = state.regions_mercator.as_deref() {
-                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
-                draw_poly_tris_mercator(pos, state.regions_style.color);
-            } else if let Some(pos) = state.regions_positions.as_deref() {
-                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
-                draw_poly_tris(pos, state.regions_style.color);
-            }
-        }
-        if state.uploaded_regions_style.visible {
-            if let Some(pos) = state.uploaded_regions_mercator.as_deref() {
-                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
-                draw_poly_tris_mercator(pos, state.uploaded_regions_style.color);
-            } else if let Some(pos) = state.uploaded_regions_positions.as_deref() {
-                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
-                draw_poly_tris(pos, state.uploaded_regions_style.color);
-            }
-        }
-        if state.selection_style.visible {
-            if let Some(pos) = state.selection_poly_mercator.as_deref() {
-                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
-                draw_poly_tris_mercator(pos, state.selection_style.color);
-            } else if let Some(pos) = state.selection_poly_positions.as_deref() {
-                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
-                draw_poly_tris(pos, state.selection_style.color);
-            }
-        }
-
-        let tp1 = now_ms();
-
-        // Lines.
-        let tl0 = now_ms();
-        let draw_lines = |pos: &[[f32; 3]], color: [f32; 4], width_px: f64| {
-            const SEG_CHUNK: usize = 25_000;
-            let ww = projector.world_width_m;
-            let cx = projector.center_x;
-            let cy = projector.center_y;
-            let s = projector.scale_px_per_m;
-
-            ctx_set_stroke_style(ctx, &rgba_css(color));
-            ctx.set_line_width(width_px.max(1.0));
-            ctx.set_line_cap("round");
-            ctx.begin_path();
-
-            for (i, seg) in pos.chunks_exact(2).take(1_500_000).enumerate() {
-                if i > 0 && (i % SEG_CHUNK) == 0 {
-                    ctx.stroke();
-                    ctx.begin_path();
+            if state.selection_style.visible {
+                if let Some(pos) = state.selection_line_mercator.as_deref() {
+                    line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                    draw_lines_mercator(
+                        pos,
+                        state.selection_style.color,
+                        (state.line_width_px * 1.6) as f64,
+                    );
+                } else if let Some(pos) = state.selection_line_positions.as_deref() {
+                    line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                    draw_lines(
+                        pos,
+                        state.selection_style.color,
+                        (state.line_width_px * 1.6) as f64,
+                    );
                 }
-
-                let a = seg[0];
-                let b = seg[1];
-                let (lon_a, lat_a) = world_to_lon_lat_fast_deg(a);
-                let (lon_b, lat_b) = world_to_lon_lat_fast_deg(b);
-
-                let ax_m = mercator_x_m(lon_a);
-                let ay_m = mercator_y_m(lat_a);
-                let bx_m = mercator_x_m(lon_b);
-                let by_m = mercator_y_m(lat_b);
-
-                // Unwrap mercator X per-segment.
-                let ax_adj = {
-                    let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
-                    cx + dx0
-                };
-                let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
-
-                let ax = w * 0.5 + (ax_adj - cx) * s;
-                let bx = w * 0.5 + (bx_adj - cx) * s;
-                let ay = h * 0.5 - (ay_m - cy) * s;
-                let by = h * 0.5 - (by_m - cy) * s;
-
-                ctx.move_to(ax, ay);
-                ctx.line_to(bx, by);
             }
-            ctx.stroke();
-        };
 
-        let draw_lines_mercator = |pos: &[[f32; 2]], color: [f32; 4], width_px: f64| {
-            const SEG_CHUNK: usize = 25_000;
-            let ww = projector.world_width_m;
-            let cx = projector.center_x;
-            let cy = projector.center_y;
-            let s = projector.scale_px_per_m;
+            let tl1 = now_ms();
 
-            ctx_set_stroke_style(ctx, &rgba_css(color));
-            ctx.set_line_width(width_px.max(1.0));
-            ctx.set_line_cap("round");
-            ctx.begin_path();
-
-            for (i, seg) in pos.chunks_exact(2).take(1_500_000).enumerate() {
-                if i > 0 && (i % SEG_CHUNK) == 0 {
-                    ctx.stroke();
-                    ctx.begin_path();
+            // Points.
+            let tpt0 = now_ms();
+            let draw_points = |centers: &[[f32; 3]], color: [f32; 4], radius_px: f64| {
+                ctx_set_fill_style(ctx, &rgba_css(color));
+                ctx.begin_path();
+                for &c in centers.iter().take(2_000_000) {
+                    let (lon, lat) = world_to_lon_lat_fast_deg(c);
+                    let (x, y) = projector.project_lon_lat(lon, lat, w, h);
+                    let _ = ctx.arc(x, y, radius_px, 0.0, std::f64::consts::TAU);
                 }
+                ctx.fill();
+            };
 
-                let a = seg[0];
-                let b = seg[1];
-                let ax_m = a[0] as f64;
-                let ay_m = a[1] as f64;
-                let bx_m = b[0] as f64;
-                let by_m = b[1] as f64;
+            let draw_points_mercator = |centers: &[[f32; 2]], color: [f32; 4], radius_px: f64| {
+                ctx_set_fill_style(ctx, &rgba_css(color));
+                ctx.begin_path();
+                for &c in centers.iter().take(2_000_000) {
+                    let (x, y) = projector.project_mercator_m(c[0] as f64, c[1] as f64, w, h);
+                    let _ = ctx.arc(x, y, radius_px, 0.0, std::f64::consts::TAU);
+                }
+                ctx.fill();
+            };
 
-                // Unwrap mercator X per-segment.
-                let ax_adj = {
-                    let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
-                    cx + dx0
-                };
-                let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
-
-                let ax = w * 0.5 + (ax_adj - cx) * s;
-                let bx = w * 0.5 + (bx_adj - cx) * s;
-                let ay = h * 0.5 - (ay_m - cy) * s;
-                let by = h * 0.5 - (by_m - cy) * s;
-
-                ctx.move_to(ax, ay);
-                ctx.line_to(bx, by);
+            let r = (state.city_marker_size as f64).clamp(1.0, 32.0);
+            if state.cities_style.visible {
+                if let Some(centers) = state.cities_mercator.as_deref() {
+                    points = points.saturating_add(centers.len().min(2_000_000) as u32);
+                    draw_points_mercator(centers, state.cities_style.color, r);
+                } else if let Some(centers) = state.cities_centers.as_deref() {
+                    points = points.saturating_add(centers.len().min(2_000_000) as u32);
+                    draw_points(centers, state.cities_style.color, r);
+                }
             }
-            ctx.stroke();
-        };
-
-        if state.corridors_style.visible {
-            if let Some(pos) = state.corridors_mercator.as_deref() {
-                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
-                draw_lines_mercator(pos, state.corridors_style.color, state.line_width_px as f64);
-            } else if let Some(pos) = state.corridors_positions.as_deref() {
-                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
-                draw_lines(pos, state.corridors_style.color, state.line_width_px as f64);
+            if state.uploaded_points_style.visible {
+                if let Some(centers) = state.uploaded_mercator.as_deref() {
+                    points = points.saturating_add(centers.len().min(2_000_000) as u32);
+                    draw_points_mercator(centers, state.uploaded_points_style.color, r);
+                } else if let Some(centers) = state.uploaded_centers.as_deref() {
+                    points = points.saturating_add(centers.len().min(2_000_000) as u32);
+                    draw_points(centers, state.uploaded_points_style.color, r);
+                }
             }
-        }
-        if state.uploaded_corridors_style.visible {
-            if let Some(pos) = state.uploaded_corridors_mercator.as_deref() {
-                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
-                draw_lines_mercator(
-                    pos,
-                    state.uploaded_corridors_style.color,
-                    state.line_width_px as f64,
-                );
-            } else if let Some(pos) = state.uploaded_corridors_positions.as_deref() {
-                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
-                draw_lines(
-                    pos,
-                    state.uploaded_corridors_style.color,
-                    state.line_width_px as f64,
-                );
+            for layer in state.feed_layers.values() {
+                if layer.style.visible && !layer.centers_mercator.is_empty() {
+                    points =
+                        points.saturating_add(layer.centers_mercator.len().min(2_000_000) as u32);
+                    draw_points_mercator(&layer.centers_mercator, layer.style.color, r);
+                }
             }
-        }
-        if state.selection_style.visible {
-            if let Some(pos) = state.selection_line_mercator.as_deref() {
-                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
-                draw_lines_mercator(
-                    pos,
+            if state.selection_style.visible
+                && let Some(c) = state.selection_center
+            {
+                points = points.saturating_add(1);
+                draw_points(
+                    std::slice::from_ref(&c),
                     state.selection_style.color,
-                    (state.line_width_px * 1.6) as f64,
-                );
-            } else if let Some(pos) = state.selection_line_positions.as_deref() {
-                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
-                draw_lines(
-                    pos,
-                    state.selection_style.color,
-                    (state.line_width_px * 1.6) as f64,
+                    r * 1.35,
                 );
             }
-        }
 
-        let tl1 = now_ms();
+            let tpt1 = now_ms();
 
-        // Points.
-        let tpt0 = now_ms();
-        let draw_points = |centers: &[[f32; 3]], color: [f32; 4], radius_px: f64| {
-            ctx_set_fill_style(ctx, &rgba_css(color));
-            ctx.begin_path();
-            for &c in centers.iter().take(2_000_000) {
-                let (lon, lat) = world_to_lon_lat_fast_deg(c);
-                let (x, y) = projector.project_lon_lat(lon, lat, w, h);
-                let _ = ctx.arc(x, y, radius_px, 0.0, std::f64::consts::TAU);
-            }
-            ctx.fill();
-        };
-
-        let draw_points_mercator = |centers: &[[f32; 2]], color: [f32; 4], radius_px: f64| {
-            ctx_set_fill_style(ctx, &rgba_css(color));
-            ctx.begin_path();
-            for &c in centers.iter().take(2_000_000) {
-                let (x, y) = projector.project_mercator_m(c[0] as f64, c[1] as f64, w, h);
-                let _ = ctx.arc(x, y, radius_px, 0.0, std::f64::consts::TAU);
-            }
-            ctx.fill();
-        };
-
-        let r = (state.city_marker_size as f64).clamp(1.0, 32.0);
-        if state.cities_style.visible {
-            if let Some(centers) = state.cities_mercator.as_deref() {
-                points = points.saturating_add(centers.len().min(2_000_000) as u32);
-                draw_points_mercator(centers, state.cities_style.color, r);
-            } else if let Some(centers) = state.cities_centers.as_deref() {
-                points = points.saturating_add(centers.len().min(2_000_000) as u32);
-                draw_points(centers, state.cities_style.color, r);
-            }
-        }
-        if state.uploaded_points_style.visible {
-            if let Some(centers) = state.uploaded_mercator.as_deref() {
-                points = points.saturating_add(centers.len().min(2_000_000) as u32);
-                draw_points_mercator(centers, state.uploaded_points_style.color, r);
-            } else if let Some(centers) = state.uploaded_centers.as_deref() {
-                points = points.saturating_add(centers.len().min(2_000_000) as u32);
-                draw_points(centers, state.uploaded_points_style.color, r);
-            }
-        }
-        for layer in state.feed_layers.values() {
-            if layer.style.visible && !layer.centers_mercator.is_empty() {
-                points = points.saturating_add(layer.centers_mercator.len().min(2_000_000) as u32);
-                draw_points_mercator(&layer.centers_mercator, layer.style.color, r);
-            }
-        }
-        if state.selection_style.visible
-            && let Some(c) = state.selection_center
-        {
-            points = points.saturating_add(1);
-            draw_points(
-                std::slice::from_ref(&c),
-                state.selection_style.color,
-                r * 1.35,
-            );
-        }
-
-        let tpt1 = now_ms();
-
-        let t1 = now_ms();
-        Some(Render2DStats {
-            total_ms: (t1 - t0).max(0.0),
-            poly_ms: (tp1 - tp0).max(0.0),
-            line_ms: (tl1 - tl0).max(0.0),
-            point_ms: (tpt1 - tpt0).max(0.0),
-            poly_tris,
-            line_segs,
-            points,
+            let t1 = now_ms();
+            Some(Render2DStats {
+                total_ms: (t1 - t0).max(0.0),
+                poly_ms: (tp1 - tp0).max(0.0),
+                line_ms: (tl1 - tl0).max(0.0),
+                point_ms: (tpt1 - tpt0).max(0.0),
+                poly_tris,
+                line_segs,
+                points,
+            })
         })
-    }).ok().flatten();
+        .ok()
+        .flatten();
 
     // Second pass: write stats (mutable borrow, after the immutable borrow is released).
     if let Some(stats) = stats_opt {
@@ -1794,13 +1808,41 @@ pub fn get_2d_perf_stats() -> Result<JsValue, JsValue> {
             s.perf_2d_points,
         )
     });
-    js_sys::Reflect::set(&out, &JsValue::from_str("total_ms"), &JsValue::from_f64(total))?;
-    js_sys::Reflect::set(&out, &JsValue::from_str("poly_ms"), &JsValue::from_f64(poly))?;
-    js_sys::Reflect::set(&out, &JsValue::from_str("line_ms"), &JsValue::from_f64(line))?;
-    js_sys::Reflect::set(&out, &JsValue::from_str("point_ms"), &JsValue::from_f64(point))?;
-    js_sys::Reflect::set(&out, &JsValue::from_str("poly_tris"), &JsValue::from_f64(tris as f64))?;
-    js_sys::Reflect::set(&out, &JsValue::from_str("line_segs"), &JsValue::from_f64(segs as f64))?;
-    js_sys::Reflect::set(&out, &JsValue::from_str("points"), &JsValue::from_f64(pts as f64))?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("total_ms"),
+        &JsValue::from_f64(total),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("poly_ms"),
+        &JsValue::from_f64(poly),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("line_ms"),
+        &JsValue::from_f64(line),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("point_ms"),
+        &JsValue::from_f64(point),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("poly_tris"),
+        &JsValue::from_f64(tris as f64),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("line_segs"),
+        &JsValue::from_f64(segs as f64),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("points"),
+        &JsValue::from_f64(pts as f64),
+    )?;
     Ok(out.into())
 }
 
@@ -4817,16 +4859,15 @@ fn cursor_click_2d(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
                 (s.cities_centers.as_deref(), s.cities_mercator.as_deref())
             {
                 for (i, m) in merc.iter().take(2_000_000).enumerate() {
-                    let (sx, sy) =
-                        projector.project_mercator_m(m[0] as f64, m[1] as f64, w, h);
+                    let (sx, sy) = projector.project_mercator_m(m[0] as f64, m[1] as f64, w, h);
                     let dx = sx - x_px;
                     let dy = sy - y_px;
                     let d2 = dx * dx + dy * dy;
-                    if d2 < best_d2 {
-                        if let Some(&c) = world.get(i) {
-                            best_center = Some(c);
-                            best_d2 = d2;
-                        }
+                    if d2 < best_d2
+                        && let Some(&c) = world.get(i)
+                    {
+                        best_center = Some(c);
+                        best_d2 = d2;
                     }
                 }
             } else if let Some(world) = s.cities_centers.as_deref() {
@@ -4844,20 +4885,20 @@ fn cursor_click_2d(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
             }
         }
         if s.uploaded_points_style.visible {
-            if let (Some(world), Some(merc)) =
-                (s.uploaded_centers.as_deref(), s.uploaded_mercator.as_deref())
-            {
+            if let (Some(world), Some(merc)) = (
+                s.uploaded_centers.as_deref(),
+                s.uploaded_mercator.as_deref(),
+            ) {
                 for (i, m) in merc.iter().take(2_000_000).enumerate() {
-                    let (sx, sy) =
-                        projector.project_mercator_m(m[0] as f64, m[1] as f64, w, h);
+                    let (sx, sy) = projector.project_mercator_m(m[0] as f64, m[1] as f64, w, h);
                     let dx = sx - x_px;
                     let dy = sy - y_px;
                     let d2 = dx * dx + dy * dy;
-                    if d2 < best_d2 {
-                        if let Some(&c) = world.get(i) {
-                            best_center = Some(c);
-                            best_d2 = d2;
-                        }
+                    if d2 < best_d2
+                        && let Some(&c) = world.get(i)
+                    {
+                        best_center = Some(c);
+                        best_d2 = d2;
                     }
                 }
             } else if let Some(world) = s.uploaded_centers.as_deref() {
@@ -4879,22 +4920,16 @@ fn cursor_click_2d(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
                 continue;
             }
             if !layer.centers_mercator.is_empty() {
-                for (i, m) in layer
-                    .centers_mercator
-                    .iter()
-                    .take(2_000_000)
-                    .enumerate()
-                {
-                    let (sx, sy) =
-                        projector.project_mercator_m(m[0] as f64, m[1] as f64, w, h);
+                for (i, m) in layer.centers_mercator.iter().take(2_000_000).enumerate() {
+                    let (sx, sy) = projector.project_mercator_m(m[0] as f64, m[1] as f64, w, h);
                     let dx = sx - x_px;
                     let dy = sy - y_px;
                     let d2 = dx * dx + dy * dy;
-                    if d2 < best_d2 {
-                        if let Some(&c) = layer.centers.get(i) {
-                            best_center = Some(c);
-                            best_d2 = d2;
-                        }
+                    if d2 < best_d2
+                        && let Some(&c) = layer.centers.get(i)
+                    {
+                        best_center = Some(c);
+                        best_d2 = d2;
                     }
                 }
             } else {
@@ -5079,7 +5114,11 @@ pub fn list_feed_layers() -> Result<JsValue, JsValue> {
 }
 
 #[wasm_bindgen]
-pub async fn load_geojson_file(name: String, geojson_text: String, max_size_mb: Option<u32>) -> Result<JsValue, JsValue> {
+pub async fn load_geojson_file(
+    name: String,
+    geojson_text: String,
+    max_size_mb: Option<u32>,
+) -> Result<JsValue, JsValue> {
     // Guardrails: large uploads can exceed wasm memory or browser storage limits.
     // (We currently persist catalog entries via LocalStorage; IndexedDB/DuckDB comes next.)
     // Default 200MB, can be reduced by JS-side settings.
