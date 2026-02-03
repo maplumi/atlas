@@ -1,7 +1,19 @@
+#[derive(Debug, Copy, Clone, Default)]
+pub struct WgpuPerfSnapshot {
+    pub upload_calls: u32,
+    pub upload_bytes: u64,
+    pub render_passes: u32,
+    pub draw_calls: u32,
+    pub draw_instances: u64,
+    pub draw_vertices: u64,
+    pub draw_indices: u64,
+}
+
 #[cfg(target_arch = "wasm32")]
 mod imp {
     use ::wgpu::util::DeviceExt;
     use std::borrow::Cow;
+    use std::cell::Cell;
     use wasm_bindgen::JsCast;
     use wasm_bindgen::prelude::*;
 
@@ -27,9 +39,23 @@ mod imp {
         pub graticule_pipeline: ::wgpu::RenderPipeline,
         pub cities_pipeline: ::wgpu::RenderPipeline,
         pub corridors_pipeline: ::wgpu::RenderPipeline,
-        pub regions_pipeline: ::wgpu::RenderPipeline,
-        pub base_regions_pipeline: ::wgpu::RenderPipeline,
+        pub overlays_pipeline: ::wgpu::RenderPipeline,
+        pub base_overlays_pipeline: ::wgpu::RenderPipeline,
+        pub terrain_pipeline: ::wgpu::RenderPipeline,
+
+        // 2D (Web Mercator) pipelines.
+        pub map2d_polys_pipeline: ::wgpu::RenderPipeline,
+        pub map2d_lines_pipeline: ::wgpu::RenderPipeline,
+        pub map2d_points_pipeline: ::wgpu::RenderPipeline,
+
+        // 2D globals + bind group (shares the same bind group layout as 3D).
+        pub uniform2d_buffer: ::wgpu::Buffer,
+        pub uniform2d_bind_group: ::wgpu::BindGroup,
         pub uniform_buffer: ::wgpu::Buffer,
+        pub styles_buffer: ::wgpu::Buffer,
+        pub styles_capacity_bytes: u64,
+        pub styles_count: u32,
+        pub uniform_bind_group_layout: ::wgpu::BindGroupLayout,
         pub uniform_bind_group: ::wgpu::BindGroup,
         pub depth_view: ::wgpu::TextureView,
         pub vertex_buffer: ::wgpu::Buffer,
@@ -37,16 +63,49 @@ mod imp {
         pub index_count: u32,
         pub graticule_vertex_buffer: ::wgpu::Buffer,
         pub graticule_vertex_count: u32,
-        pub cities_vertex_buffer: ::wgpu::Buffer,
-        pub cities_vertex_count: u32,
-        pub corridors_vertex_buffer: ::wgpu::Buffer,
-        pub corridors_vertex_count: u32,
-        pub base_regions_vertex_buffer: ::wgpu::Buffer,
-        pub base_regions_vertex_count: u32,
+        pub cities_quad_vertex_buffer: ::wgpu::Buffer,
+        pub cities_instance_buffer: ::wgpu::Buffer,
+        pub cities_instance_capacity_bytes: u64,
+        pub cities_instance_count: u32,
+        pub corridor_quad_vertex_buffer: ::wgpu::Buffer,
+        pub corridors_instance_buffer: ::wgpu::Buffer,
+        pub corridors_instance_capacity_bytes: u64,
+        pub corridors_instance_count: u32,
         pub regions_vertex_buffer: ::wgpu::Buffer,
+        pub regions_vertex_capacity_bytes: u64,
         pub regions_vertex_count: u32,
         pub terrain_vertex_buffer: ::wgpu::Buffer,
+        pub terrain_vertex_capacity_bytes: u64,
         pub terrain_vertex_count: u32,
+        pub base_regions_vertex_buffer: ::wgpu::Buffer,
+        pub base_regions_vertex_capacity_bytes: u64,
+        pub base_regions_vertex_count: u32,
+
+        // 2D geometry buffers (Mercator meters).
+        pub base_regions2d_vertex_buffer: ::wgpu::Buffer,
+        pub base_regions2d_vertex_capacity_bytes: u64,
+        pub base_regions2d_vertex_count: u32,
+        pub regions2d_vertex_buffer: ::wgpu::Buffer,
+        pub regions2d_vertex_capacity_bytes: u64,
+        pub regions2d_vertex_count: u32,
+        pub points2d_instance_buffer: ::wgpu::Buffer,
+        pub points2d_instance_capacity_bytes: u64,
+        pub points2d_instance_count: u32,
+        pub lines2d_instance_buffer: ::wgpu::Buffer,
+        pub lines2d_instance_capacity_bytes: u64,
+        pub lines2d_instance_count: u32,
+        pub grid2d_instance_buffer: ::wgpu::Buffer,
+        pub grid2d_instance_capacity_bytes: u64,
+        pub grid2d_instance_count: u32,
+
+        // Lightweight per-frame perf counters (reset externally per frame).
+        pub perf_upload_calls: Cell<u32>,
+        pub perf_upload_bytes: Cell<u64>,
+        pub perf_render_passes: Cell<u32>,
+        pub perf_draw_calls: Cell<u32>,
+        pub perf_draw_instances: Cell<u64>,
+        pub perf_draw_vertices: Cell<u64>,
+        pub perf_draw_indices: Cell<u64>,
     }
 
     const GLOBE_SHADER: &str = r#"
@@ -62,7 +121,7 @@ struct Globals {
 };
 
 @group(0) @binding(0)
-var<storage, read> globals: Globals;
+var<uniform> globals: Globals;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -103,7 +162,7 @@ struct Globals {
 };
 
 @group(0) @binding(0)
-var<storage, read> globals: Globals;
+var<uniform> globals: Globals;
 
 @vertex
 fn vs_main(@location(0) position: vec3<f32>) -> @builtin(position) vec4<f32> {
@@ -130,7 +189,7 @@ struct Globals {
 };
 
 @group(0) @binding(0)
-var<storage, read> globals: Globals;
+var<uniform> globals: Globals;
 
 fn hash_u32(x_in: u32) -> u32 {
     // 32-bit integer mix (non-linear) to avoid visible correlation patterns.
@@ -183,6 +242,156 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
+    const MAP2D_SHADER: &str = r#"
+struct Globals2D {
+    center_m: vec2<f32>,
+    scale_px_per_m: f32,
+    world_width_m: f32,
+    viewport_px: vec2<f32>,
+    _pad0: vec2<f32>,
+};
+
+@group(0) @binding(0)
+var<uniform> globals2d: Globals2D;
+
+struct Style {
+    color: vec4<f32>,
+    lift_m: f32,
+    size_px: f32,
+    width_px: f32,
+    _pad0: f32,
+};
+
+@group(0) @binding(1)
+var<storage, read> styles: array<Style>;
+
+fn wrap_dx(dx: f32, ww: f32) -> f32 {
+    // dx wrapped into [-ww/2, +ww/2] with Euclidean modulo.
+    let t = (dx + 0.5 * ww) / ww;
+    return (dx + 0.5 * ww) - ww * floor(t) - 0.5 * ww;
+}
+
+fn mercator_to_clip_from_anchor(x_m: f32, y_m: f32, anchor_x_m: f32) -> vec4<f32> {
+    let ww = globals2d.world_width_m;
+    let center_x = globals2d.center_m.x;
+    let center_y = globals2d.center_m.y;
+
+    let anchor_adj_x = center_x + wrap_dx(anchor_x_m - center_x, ww);
+    let x_adj = anchor_adj_x + (x_m - anchor_x_m);
+    let dx_px = (x_adj - center_x) * globals2d.scale_px_per_m;
+    let dy_px = (y_m - center_y) * globals2d.scale_px_per_m;
+
+    let ndc_x = dx_px / (globals2d.viewport_px.x * 0.5);
+    let ndc_y = -dy_px / (globals2d.viewport_px.y * 0.5);
+    return vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+}
+
+fn mercator_to_clip(x_m: f32, y_m: f32) -> vec4<f32> {
+    return mercator_to_clip_from_anchor(x_m, y_m, x_m);
+}
+
+struct PolyOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) @interpolate(flat) style_id: u32,
+};
+
+@vertex
+fn vs_poly(
+    @location(0) position_m: vec2<f32>,
+    @location(1) anchor_x_m: f32,
+    @location(2) style_id: u32,
+) -> PolyOut {
+    var out: PolyOut;
+    out.pos = mercator_to_clip_from_anchor(position_m.x, position_m.y, anchor_x_m);
+    out.style_id = style_id;
+    return out;
+}
+
+@fragment
+fn fs_poly(in: PolyOut) -> @location(0) vec4<f32> {
+    return styles[in.style_id].color;
+}
+
+struct PointOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) @interpolate(flat) style_id: u32,
+};
+
+@vertex
+fn vs_point(
+    @location(0) corner: vec2<f32>,
+    @location(1) center_m: vec2<f32>,
+    @location(2) style_id: u32,
+) -> PointOut {
+    let s = styles[style_id];
+    let base = mercator_to_clip(center_m.x, center_m.y);
+    let offset_px = corner * s.size_px;
+    let offset_ndc = vec2<f32>(
+        offset_px.x / (globals2d.viewport_px.x * 0.5),
+        -offset_px.y / (globals2d.viewport_px.y * 0.5)
+    );
+
+    var out: PointOut;
+    out.pos = vec4<f32>(base.xy + offset_ndc, 0.0, 1.0);
+    out.style_id = style_id;
+    return out;
+}
+
+@fragment
+fn fs_point(in: PointOut) -> @location(0) vec4<f32> {
+    return styles[in.style_id].color;
+}
+
+struct LineOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) @interpolate(flat) style_id: u32,
+};
+
+@vertex
+fn vs_line(
+    @location(0) along: f32,
+    @location(1) side: f32,
+    @location(2) a_m: vec2<f32>,
+    @location(3) b_m: vec2<f32>,
+    @location(4) style_id: u32,
+) -> LineOut {
+    let s = styles[style_id];
+    let ww = globals2d.world_width_m;
+    let cx = globals2d.center_m.x;
+
+    // Keep segment local around the camera center.
+    let ax_adj = cx + wrap_dx(a_m.x - cx, ww);
+    let bx_adj = ax_adj + (b_m.x - a_m.x);
+
+    let a_adj = vec2<f32>(ax_adj, a_m.y);
+    let b_adj = vec2<f32>(bx_adj, b_m.y);
+    let p = a_adj + (b_adj - a_adj) * along;
+
+    let base = mercator_to_clip_from_anchor(p.x, p.y, ax_adj);
+
+    let d_m = b_adj - a_adj;
+    let d_px = d_m * globals2d.scale_px_per_m;
+    let len = max(length(d_px), 1e-6);
+    let dir = d_px / len;
+    let perp = vec2<f32>(-dir.y, dir.x);
+    let offset_px = perp * (side * 0.5 * s.width_px);
+    let offset_ndc = vec2<f32>(
+        offset_px.x / (globals2d.viewport_px.x * 0.5),
+        -offset_px.y / (globals2d.viewport_px.y * 0.5)
+    );
+
+    var out: LineOut;
+    out.pos = vec4<f32>(base.xy + offset_ndc, 0.0, 1.0);
+    out.style_id = style_id;
+    return out;
+}
+
+@fragment
+fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
+    return styles[in.style_id].color;
+}
+"#;
+
     const CITIES_SHADER: &str = r#"
 struct Globals {
     view_proj: mat4x4<f32>,
@@ -196,7 +405,18 @@ struct Globals {
 };
 
 @group(0) @binding(0)
-var<storage, read> globals: Globals;
+var<uniform> globals: Globals;
+
+struct Style {
+    color: vec4<f32>,
+    lift_m: f32,
+    size_px: f32,
+    width_px: f32,
+    _pad0: f32,
+};
+
+@group(0) @binding(1)
+var<storage, read> styles: array<Style>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -214,24 +434,26 @@ fn ellipsoid_normal(p: vec3<f32>) -> vec3<f32> {
 
 @vertex
 fn vs_main(
-    @location(0) center: vec3<f32>,
-    @location(1) lift: f32,
-    // Half-size offset in screen pixels.
-    @location(2) offset_px: vec2<f32>,
-    @location(3) color: vec4<f32>,
+    // Quad corner in [-1,+1] (per-vertex)
+    @location(0) corner: vec2<f32>,
+    // Per-instance
+    @location(1) center: vec3<f32>,
+    @location(2) style_id: u32,
 ) -> VsOut {
+    let st = styles[style_id];
     let n = ellipsoid_normal(center);
-    let world_center = center + n * lift;
+    let world_center = center + n * st.lift_m;
 
     // Project the center, then offset in clip space so size stays constant in pixels.
     let clip_center = globals.view_proj * vec4<f32>(world_center, 1.0);
     let vp = max(globals.viewport, vec2<f32>(1.0, 1.0));
+    let offset_px = corner * st.size_px;
     let ndc_offset = vec2<f32>(
         (offset_px.x * 2.0) / vp.x,
         (-offset_px.y * 2.0) / vp.y,
     );
     let clip = clip_center + vec4<f32>(ndc_offset * clip_center.w, 0.0, 0.0);
-    return VsOut(clip, color);
+    return VsOut(clip, st.color);
 }
 
 @fragment
@@ -253,7 +475,18 @@ struct Globals {
 };
 
 @group(0) @binding(0)
-var<storage, read> globals: Globals;
+var<uniform> globals: Globals;
+
+struct Style {
+    color: vec4<f32>,
+    lift_m: f32,
+    size_px: f32,
+    width_px: f32,
+    _pad0: f32,
+};
+
+@group(0) @binding(1)
+var<storage, read> styles: array<Style>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -271,14 +504,17 @@ fn ellipsoid_normal(p: vec3<f32>) -> vec3<f32> {
 
 @vertex
 fn vs_main(
-    @location(0) a: vec3<f32>,
-    @location(1) b: vec3<f32>,
-    @location(2) along: f32,
-    @location(3) side: f32,
-    @location(4) lift: f32,
-    @location(5) width_px: f32,
-    @location(6) color: vec4<f32>,
+    // Per-vertex for the segment quad
+    @location(0) along: f32,
+    @location(1) side: f32,
+    // Per-instance
+    @location(2) a: vec3<f32>,
+    @location(3) b: vec3<f32>,
+    @location(4) style_id: u32,
 ) -> VsOut {
+    let st = styles[style_id];
+    let lift = st.lift_m;
+    let width_px = st.width_px;
     // Apply lift along the ellipsoid normal at each endpoint.
     let a_world = a + ellipsoid_normal(a) * lift;
     let b_world = b + ellipsoid_normal(b) * lift;
@@ -299,7 +535,7 @@ fn vs_main(
     var clip = mix(clip_a, clip_b, along);
     let delta = offset_ndc * clip.w;
     clip = vec4<f32>(clip.x + delta.x, clip.y + delta.y, clip.z, clip.w);
-    return VsOut(clip, color);
+    return VsOut(clip, st.color);
 }
 
 @fragment
@@ -308,7 +544,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 }
 "#;
 
-    const REGIONS_SHADER: &str = r#"
+    const OVERLAYS_SHADER: &str = r#"
 struct Globals {
     view_proj: mat4x4<f32>,
     light_dir: vec3<f32>,
@@ -321,7 +557,18 @@ struct Globals {
 };
 
 @group(0) @binding(0)
-var<storage, read> globals: Globals;
+var<uniform> globals: Globals;
+
+struct Style {
+    color: vec4<f32>,
+    lift_m: f32,
+    size_px: f32,
+    width_px: f32,
+    _pad0: f32,
+};
+
+@group(0) @binding(1)
+var<storage, read> styles: array<Style>;
 
 struct VsOut {
     @builtin(position) pos: vec4<f32>,
@@ -340,11 +587,55 @@ fn ellipsoid_normal(p: vec3<f32>) -> vec3<f32> {
 @vertex
 fn vs_main(
     @location(0) position: vec3<f32>,
-    @location(1) lift: f32,
+    @location(1) style_id: u32,
+) -> VsOut {
+    let st = styles[style_id];
+    let n = ellipsoid_normal(position);
+    let world_pos = position + n * st.lift_m;
+    return VsOut(globals.view_proj * vec4<f32>(world_pos, 1.0), st.color);
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    return in.color;
+}
+"#;
+
+    const TERRAIN_SHADER: &str = r#"
+struct Globals {
+    view_proj: mat4x4<f32>,
+    light_dir: vec3<f32>,
+    _pad0: f32,
+    viewport: vec2<f32>,
+    globe_alpha: f32,
+    _pad1: f32,
+    globe_color: vec3<f32>,
+    stars_alpha: f32,
+};
+
+@group(0) @binding(0)
+var<uniform> globals: Globals;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) color: vec4<f32>,
+};
+
+fn ellipsoid_normal(p: vec3<f32>) -> vec3<f32> {
+    let a: f32 = 6378137.0;
+    let b: f32 = 6356752.314245179;
+    let a2 = a * a;
+    let b2 = b * b;
+    return normalize(vec3<f32>(p.x / a2, p.y / b2, p.z / a2));
+}
+
+@vertex
+fn vs_main(
+    @location(0) position: vec3<f32>,
+    @location(1) lift_m: f32,
     @location(2) color: vec4<f32>,
 ) -> VsOut {
-    let n = ellipsoid_normal(position);
-    let world_pos = position + n * lift;
+    let world_pos = position + ellipsoid_normal(position) * lift_m;
     return VsOut(globals.view_proj * vec4<f32>(world_pos, 1.0), color);
 }
 
@@ -369,31 +660,95 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     #[repr(C)]
     #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-    pub struct CityVertex {
+    pub struct CityInstance {
         pub center: [f32; 3],
-        pub lift: f32,
-        pub offset_px: [f32; 2],
-        pub color: [f32; 4],
+        pub style_id: u32,
     }
+
+    pub type CityVertex = CityInstance;
 
     #[repr(C)]
     #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct OverlayVertex {
         pub position: [f32; 3],
-        pub lift: f32,
+        pub style_id: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct TerrainVertex {
+        pub position: [f32; 3],
+        pub lift_m: f32,
         pub color: [f32; 4],
     }
 
     #[repr(C)]
     #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-    pub struct CorridorVertex {
+    pub struct CorridorInstance {
         pub a: [f32; 3],
+        pub _pad0: u32,
         pub b: [f32; 3],
-        pub along: f32,
-        pub side: f32,
-        pub lift: f32,
-        pub width_px: f32,
+        pub style_id: u32,
+    }
+
+    pub type CorridorVertex = CorridorInstance;
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct Style {
         pub color: [f32; 4],
+        pub lift_m: f32,
+        pub size_px: f32,
+        pub width_px: f32,
+        pub _pad0: f32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct Globals2D {
+        pub center_m: [f32; 2],
+        pub scale_px_per_m: f32,
+        pub world_width_m: f32,
+        pub viewport_px: [f32; 2],
+        pub _pad0: [f32; 2],
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct Overlay2DVertex {
+        pub position_m: [f32; 2],
+        pub anchor_x_m: f32,
+        pub style_id: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct Point2DInstance {
+        pub center_m: [f32; 2],
+        pub style_id: u32,
+        pub _pad0: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct Segment2DInstance {
+        pub a_m: [f32; 2],
+        pub b_m: [f32; 2],
+        pub style_id: u32,
+        pub _pad0: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    struct QuadVertex {
+        corner: [f32; 2],
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    struct SegmentVertex {
+        along: f32,
+        side: f32,
     }
 
     #[repr(C)]
@@ -418,6 +773,131 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         ctx.clear_color = clear_color;
         ctx.globe_color = globe_color;
         ctx.stars_alpha = stars_alpha;
+    }
+
+    pub fn set_styles(ctx: &mut WgpuContext, styles: &[Style]) {
+        let required_bytes = (styles.len() * std::mem::size_of::<Style>()) as u64;
+        if required_bytes > ctx.styles_capacity_bytes {
+            ensure_buffer_capacity(
+                &ctx.device,
+                &mut ctx.styles_buffer,
+                &mut ctx.styles_capacity_bytes,
+                required_bytes.max(std::mem::size_of::<Style>() as u64),
+                ::wgpu::BufferUsages::STORAGE | ::wgpu::BufferUsages::COPY_DST,
+                "atlas-styles",
+            );
+
+            ctx.uniform_bind_group = ctx.device.create_bind_group(&::wgpu::BindGroupDescriptor {
+                label: Some("atlas-unified-bg"),
+                layout: &ctx.uniform_bind_group_layout,
+                entries: &[
+                    ::wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ctx.uniform_buffer.as_entire_binding(),
+                    },
+                    ::wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: ctx.styles_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+
+            ctx.uniform2d_bind_group = ctx.device.create_bind_group(&::wgpu::BindGroupDescriptor {
+                label: Some("atlas-unified-bg-2d"),
+                layout: &ctx.uniform_bind_group_layout,
+                entries: &[
+                    ::wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ctx.uniform2d_buffer.as_entire_binding(),
+                    },
+                    ::wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: ctx.styles_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        }
+
+        if !styles.is_empty() {
+            ctx.queue
+                .write_buffer(&ctx.styles_buffer, 0, bytemuck::cast_slice(styles));
+            perf_on_write(ctx, (styles.len() * std::mem::size_of::<Style>()) as u64);
+        }
+        ctx.styles_count = styles.len() as u32;
+    }
+
+    #[inline]
+    fn perf_on_write(ctx: &WgpuContext, bytes: u64) {
+        ctx.perf_upload_calls
+            .set(ctx.perf_upload_calls.get().saturating_add(1));
+        ctx.perf_upload_bytes
+            .set(ctx.perf_upload_bytes.get().saturating_add(bytes));
+    }
+
+    #[inline]
+    fn perf_on_pass(ctx: &WgpuContext) {
+        ctx.perf_render_passes
+            .set(ctx.perf_render_passes.get().saturating_add(1));
+    }
+
+    #[inline]
+    fn perf_on_draw(ctx: &WgpuContext, vertices: u64, indices: u64, instances: u64) {
+        ctx.perf_draw_calls
+            .set(ctx.perf_draw_calls.get().saturating_add(1));
+        ctx.perf_draw_vertices
+            .set(ctx.perf_draw_vertices.get().saturating_add(vertices));
+        ctx.perf_draw_indices
+            .set(ctx.perf_draw_indices.get().saturating_add(indices));
+        ctx.perf_draw_instances
+            .set(ctx.perf_draw_instances.get().saturating_add(instances));
+    }
+
+    pub fn perf_reset(ctx: &WgpuContext) {
+        ctx.perf_upload_calls.set(0);
+        ctx.perf_upload_bytes.set(0);
+        ctx.perf_render_passes.set(0);
+        ctx.perf_draw_calls.set(0);
+        ctx.perf_draw_instances.set(0);
+        ctx.perf_draw_vertices.set(0);
+        ctx.perf_draw_indices.set(0);
+    }
+
+    pub fn perf_snapshot(ctx: &WgpuContext) -> super::WgpuPerfSnapshot {
+        super::WgpuPerfSnapshot {
+            upload_calls: ctx.perf_upload_calls.get(),
+            upload_bytes: ctx.perf_upload_bytes.get(),
+            render_passes: ctx.perf_render_passes.get(),
+            draw_calls: ctx.perf_draw_calls.get(),
+            draw_instances: ctx.perf_draw_instances.get(),
+            draw_vertices: ctx.perf_draw_vertices.get(),
+            draw_indices: ctx.perf_draw_indices.get(),
+        }
+    }
+
+    fn ensure_buffer_capacity(
+        device: &::wgpu::Device,
+        buffer: &mut ::wgpu::Buffer,
+        capacity_bytes: &mut u64,
+        required_bytes: u64,
+        usage: ::wgpu::BufferUsages,
+        label: &str,
+    ) {
+        if required_bytes <= *capacity_bytes {
+            return;
+        }
+
+        let mut new_cap = (*capacity_bytes).max(1) * 2;
+        if new_cap < required_bytes {
+            new_cap = required_bytes.next_power_of_two();
+        }
+
+        *buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some(label),
+            size: new_cap,
+            usage,
+            mapped_at_creation: false,
+        });
+        *capacity_bytes = new_cap;
     }
 
     pub fn set_globe_transparent(ctx: &mut WgpuContext, transparent: bool) {
@@ -711,40 +1191,99 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(CORRIDORS_SHADER)),
         });
 
-        let regions_shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
-            label: Some("atlas-regions-shader"),
-            source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(REGIONS_SHADER)),
+        let overlays_shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
+            label: Some("atlas-overlays-shader"),
+            source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(OVERLAYS_SHADER)),
+        });
+
+        let terrain_shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
+            label: Some("atlas-terrain-shader"),
+            source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(TERRAIN_SHADER)),
+        });
+
+        let map2d_shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
+            label: Some("atlas-map2d-shader"),
+            source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(MAP2D_SHADER)),
         });
 
         let uniform_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
             label: Some("atlas-globals"),
             size: std::mem::size_of::<Globals>() as u64,
+            usage: ::wgpu::BufferUsages::UNIFORM | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let uniform2d_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-globals-2d"),
+            size: std::mem::size_of::<Globals2D>() as u64,
+            usage: ::wgpu::BufferUsages::UNIFORM | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // A small style lookup table; grows as needed.
+        let styles_capacity_bytes = (std::mem::size_of::<Style>().max(16)) as u64;
+        let styles_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-styles"),
+            size: styles_capacity_bytes,
             usage: ::wgpu::BufferUsages::STORAGE | ::wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&::wgpu::BindGroupLayoutDescriptor {
-                label: Some("atlas-globals-bgl"),
-                entries: &[::wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ::wgpu::ShaderStages::VERTEX_FRAGMENT,
-                    ty: ::wgpu::BindingType::Buffer {
-                        ty: ::wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                label: Some("atlas-unified-bgl"),
+                entries: &[
+                    ::wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ::wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: ::wgpu::BindingType::Buffer {
+                            ty: ::wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    ::wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ::wgpu::ShaderStages::VERTEX_FRAGMENT,
+                        ty: ::wgpu::BindingType::Buffer {
+                            ty: ::wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
 
         let uniform_bind_group = device.create_bind_group(&::wgpu::BindGroupDescriptor {
-            label: Some("atlas-globals-bg"),
+            label: Some("atlas-unified-bg"),
             layout: &uniform_bind_group_layout,
-            entries: &[::wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                ::wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                ::wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: styles_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let uniform2d_bind_group = device.create_bind_group(&::wgpu::BindGroupDescriptor {
+            label: Some("atlas-unified-bg-2d"),
+            layout: &uniform_bind_group_layout,
+            entries: &[
+                ::wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform2d_buffer.as_entire_binding(),
+                },
+                ::wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: styles_buffer.as_entire_binding(),
+                },
+            ],
         });
 
         let pipeline_layout = device.create_pipeline_layout(&::wgpu::PipelineLayoutDescriptor {
@@ -946,7 +1485,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 unclipped_depth: false,
                 conservative: false,
             },
-            // Depth-test against the globe so back-side lines don't show through.
             depth_stencil: Some(::wgpu::DepthStencilState {
                 format: ::wgpu::TextureFormat::Depth24PlusStencil8,
                 depth_write_enabled: false,
@@ -966,32 +1504,33 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 module: &cities_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[::wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<CityVertex>() as ::wgpu::BufferAddress,
-                    step_mode: ::wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32x3,
+                buffers: &[
+                    ::wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<QuadVertex>() as ::wgpu::BufferAddress,
+                        step_mode: ::wgpu::VertexStepMode::Vertex,
+                        attributes: &[::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32x2,
                             offset: 0,
                             shader_location: 0,
-                        },
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32,
-                            offset: 12,
-                            shader_location: 1,
-                        },
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32x2,
-                            offset: 16,
-                            shader_location: 2,
-                        },
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32x4,
-                            offset: 24,
-                            shader_location: 3,
-                        },
-                    ],
-                }],
+                        }],
+                    },
+                    ::wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<CityInstance>() as ::wgpu::BufferAddress,
+                        step_mode: ::wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 1,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Uint32,
+                                offset: 12,
+                                shader_location: 2,
+                            },
+                        ],
+                    },
+                ],
             },
             fragment: Some(::wgpu::FragmentState {
                 module: &cities_shader,
@@ -1031,47 +1570,46 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 module: &corridors_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
-                buffers: &[::wgpu::VertexBufferLayout {
-                    array_stride: std::mem::size_of::<CorridorVertex>() as ::wgpu::BufferAddress,
-                    step_mode: ::wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32x3,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32x3,
-                            offset: 12,
-                            shader_location: 1,
-                        },
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32,
-                            offset: 24,
-                            shader_location: 2,
-                        },
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32,
-                            offset: 28,
-                            shader_location: 3,
-                        },
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32,
-                            offset: 32,
-                            shader_location: 4,
-                        },
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32,
-                            offset: 36,
-                            shader_location: 5,
-                        },
-                        ::wgpu::VertexAttribute {
-                            format: ::wgpu::VertexFormat::Float32x4,
-                            offset: 40,
-                            shader_location: 6,
-                        },
-                    ],
-                }],
+                buffers: &[
+                    ::wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<SegmentVertex>() as ::wgpu::BufferAddress,
+                        step_mode: ::wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32,
+                                offset: 4,
+                                shader_location: 1,
+                            },
+                        ],
+                    },
+                    ::wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<CorridorInstance>()
+                            as ::wgpu::BufferAddress,
+                        step_mode: ::wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 2,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x3,
+                                offset: 16,
+                                shader_location: 3,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Uint32,
+                                offset: 28,
+                                shader_location: 4,
+                            },
+                        ],
+                    },
+                ],
             },
             fragment: Some(::wgpu::FragmentState {
                 module: &corridors_shader,
@@ -1104,15 +1642,130 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             cache: None,
         });
 
-        let regions_pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
-            label: Some("atlas-regions-pipeline"),
+        let overlays_pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+            label: Some("atlas-overlays-pipeline"),
             layout: Some(&pipeline_layout),
             vertex: ::wgpu::VertexState {
-                module: &regions_shader,
+                module: &overlays_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: Default::default(),
                 buffers: &[::wgpu::VertexBufferLayout {
                     array_stride: std::mem::size_of::<OverlayVertex>() as ::wgpu::BufferAddress,
+                    step_mode: ::wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32x3,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        ::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Uint32,
+                            offset: 12,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            fragment: Some(::wgpu::FragmentState {
+                module: &overlays_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(::wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: ::wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: ::wgpu::PrimitiveState {
+                topology: ::wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: ::wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: ::wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(::wgpu::DepthStencilState {
+                format: ::wgpu::TextureFormat::Depth24PlusStencil8,
+                depth_write_enabled: false,
+                depth_compare: ::wgpu::CompareFunction::LessEqual,
+                stencil: stencil_test_eq_1(),
+                bias: ::wgpu::DepthBiasState {
+                    constant: -2,
+                    slope_scale: -1.0,
+                    clamp: 0.0,
+                },
+            }),
+            multisample: ::wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let base_overlays_pipeline =
+            device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+                label: Some("atlas-base-overlays-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: ::wgpu::VertexState {
+                    module: &overlays_shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[::wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<OverlayVertex>() as ::wgpu::BufferAddress,
+                        step_mode: ::wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x3,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Uint32,
+                                offset: 12,
+                                shader_location: 1,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(::wgpu::FragmentState {
+                    module: &overlays_shader,
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(::wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: ::wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: ::wgpu::PrimitiveState {
+                    topology: ::wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: ::wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: ::wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(::wgpu::DepthStencilState {
+                    format: ::wgpu::TextureFormat::Depth24PlusStencil8,
+                    depth_write_enabled: false,
+                    depth_compare: ::wgpu::CompareFunction::Always,
+                    stencil: stencil_test_eq_1(),
+                    bias: ::wgpu::DepthBiasState::default(),
+                }),
+                multisample: ::wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let terrain_pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+            label: Some("atlas-terrain-pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: ::wgpu::VertexState {
+                module: &terrain_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[::wgpu::VertexBufferLayout {
+                    array_stride: std::mem::size_of::<TerrainVertex>() as ::wgpu::BufferAddress,
                     step_mode: ::wgpu::VertexStepMode::Vertex,
                     attributes: &[
                         ::wgpu::VertexAttribute {
@@ -1134,7 +1787,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 }],
             },
             fragment: Some(::wgpu::FragmentState {
-                module: &regions_shader,
+                module: &terrain_shader,
                 entry_point: Some("fs_main"),
                 compilation_options: Default::default(),
                 targets: &[Some(::wgpu::ColorTargetState {
@@ -1152,65 +1805,59 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 unclipped_depth: false,
                 conservative: false,
             },
-            // Depth bias helps with z-fighting by pushing polygon depth slightly towards
-            // the camera. Combined with the lift mechanism, this ensures overlay polygons
-            // render correctly on top of the globe without requiring manual tilt adjustment.
-            // constant: shifts depth by a fixed amount (negative = towards camera)
-            // slope_scale: scales bias based on polygon slope (helps at grazing angles)
             depth_stencil: Some(::wgpu::DepthStencilState {
                 format: ::wgpu::TextureFormat::Depth24PlusStencil8,
                 depth_write_enabled: false,
                 depth_compare: ::wgpu::CompareFunction::LessEqual,
                 stencil: stencil_test_eq_1(),
-                bias: ::wgpu::DepthBiasState {
-                    constant: -2, // Push towards camera
-                    slope_scale: -1.0,
-                    clamp: 0.0,
-                },
+                bias: ::wgpu::DepthBiasState::default(),
             }),
             multisample: ::wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
         });
 
-        // Separate pipeline for base_regions with depth_compare: Always.
-        // This bypasses depth testing so the base surface always renders on top of
-        // the globe. Without this, large triangles that span curved areas of the
-        // globe intersect the globe surface geometrically and fail depth tests.
-        // We still use stencil testing to mask to the visible globe area.
-        let base_regions_pipeline =
+        let map2d_pipeline_layout =
+            device.create_pipeline_layout(&::wgpu::PipelineLayoutDescriptor {
+                label: Some("atlas-map2d-pipeline-layout"),
+                bind_group_layouts: &[&uniform_bind_group_layout],
+                immediate_size: 0,
+            });
+
+        let map2d_polys_pipeline =
             device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
-                label: Some("atlas-base-regions-pipeline"),
-                layout: Some(&pipeline_layout),
+                label: Some("atlas-map2d-polys-pipeline"),
+                layout: Some(&map2d_pipeline_layout),
                 vertex: ::wgpu::VertexState {
-                    module: &regions_shader,
-                    entry_point: Some("vs_main"),
+                    module: &map2d_shader,
+                    entry_point: Some("vs_poly"),
                     compilation_options: Default::default(),
                     buffers: &[::wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<OverlayVertex>() as ::wgpu::BufferAddress,
+                        array_stride: std::mem::size_of::<Overlay2DVertex>()
+                            as ::wgpu::BufferAddress,
                         step_mode: ::wgpu::VertexStepMode::Vertex,
                         attributes: &[
                             ::wgpu::VertexAttribute {
-                                format: ::wgpu::VertexFormat::Float32x3,
+                                format: ::wgpu::VertexFormat::Float32x2,
                                 offset: 0,
                                 shader_location: 0,
                             },
                             ::wgpu::VertexAttribute {
                                 format: ::wgpu::VertexFormat::Float32,
-                                offset: 12,
+                                offset: 8,
                                 shader_location: 1,
                             },
                             ::wgpu::VertexAttribute {
-                                format: ::wgpu::VertexFormat::Float32x4,
-                                offset: 16,
+                                format: ::wgpu::VertexFormat::Uint32,
+                                offset: 12,
                                 shader_location: 2,
                             },
                         ],
                     }],
                 },
                 fragment: Some(::wgpu::FragmentState {
-                    module: &regions_shader,
-                    entry_point: Some("fs_main"),
+                    module: &map2d_shader,
+                    entry_point: Some("fs_poly"),
                     compilation_options: Default::default(),
                     targets: &[Some(::wgpu::ColorTargetState {
                         format: config.format,
@@ -1227,16 +1874,145 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     unclipped_depth: false,
                     conservative: false,
                 },
-                // depth_compare: Always means we skip depth testing entirely.
-                // The base surface will always draw on top of the globe wherever
-                // the stencil mask (written by the globe pass) allows.
-                depth_stencil: Some(::wgpu::DepthStencilState {
-                    format: ::wgpu::TextureFormat::Depth24PlusStencil8,
-                    depth_write_enabled: false,
-                    depth_compare: ::wgpu::CompareFunction::Always,
-                    stencil: stencil_test_eq_1(),
-                    bias: ::wgpu::DepthBiasState::default(),
+                depth_stencil: None,
+                multisample: ::wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let map2d_points_pipeline =
+            device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+                label: Some("atlas-map2d-points-pipeline"),
+                layout: Some(&map2d_pipeline_layout),
+                vertex: ::wgpu::VertexState {
+                    module: &map2d_shader,
+                    entry_point: Some("vs_point"),
+                    compilation_options: Default::default(),
+                    buffers: &[
+                        ::wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<QuadVertex>()
+                                as ::wgpu::BufferAddress,
+                            step_mode: ::wgpu::VertexStepMode::Vertex,
+                            attributes: &[::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x2,
+                                offset: 0,
+                                shader_location: 0,
+                            }],
+                        },
+                        ::wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<Point2DInstance>()
+                                as ::wgpu::BufferAddress,
+                            step_mode: ::wgpu::VertexStepMode::Instance,
+                            attributes: &[
+                                ::wgpu::VertexAttribute {
+                                    format: ::wgpu::VertexFormat::Float32x2,
+                                    offset: 0,
+                                    shader_location: 1,
+                                },
+                                ::wgpu::VertexAttribute {
+                                    format: ::wgpu::VertexFormat::Uint32,
+                                    offset: 8,
+                                    shader_location: 2,
+                                },
+                            ],
+                        },
+                    ],
+                },
+                fragment: Some(::wgpu::FragmentState {
+                    module: &map2d_shader,
+                    entry_point: Some("fs_point"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(::wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: ::wgpu::ColorWrites::ALL,
+                    })],
                 }),
+                primitive: ::wgpu::PrimitiveState {
+                    topology: ::wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: ::wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: ::wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: ::wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+
+        let map2d_lines_pipeline =
+            device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+                label: Some("atlas-map2d-lines-pipeline"),
+                layout: Some(&map2d_pipeline_layout),
+                vertex: ::wgpu::VertexState {
+                    module: &map2d_shader,
+                    entry_point: Some("vs_line"),
+                    compilation_options: Default::default(),
+                    buffers: &[
+                        ::wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<SegmentVertex>()
+                                as ::wgpu::BufferAddress,
+                            step_mode: ::wgpu::VertexStepMode::Vertex,
+                            attributes: &[
+                                ::wgpu::VertexAttribute {
+                                    format: ::wgpu::VertexFormat::Float32,
+                                    offset: 0,
+                                    shader_location: 0,
+                                },
+                                ::wgpu::VertexAttribute {
+                                    format: ::wgpu::VertexFormat::Float32,
+                                    offset: 4,
+                                    shader_location: 1,
+                                },
+                            ],
+                        },
+                        ::wgpu::VertexBufferLayout {
+                            array_stride: std::mem::size_of::<Segment2DInstance>()
+                                as ::wgpu::BufferAddress,
+                            step_mode: ::wgpu::VertexStepMode::Instance,
+                            attributes: &[
+                                ::wgpu::VertexAttribute {
+                                    format: ::wgpu::VertexFormat::Float32x2,
+                                    offset: 0,
+                                    shader_location: 2,
+                                },
+                                ::wgpu::VertexAttribute {
+                                    format: ::wgpu::VertexFormat::Float32x2,
+                                    offset: 8,
+                                    shader_location: 3,
+                                },
+                                ::wgpu::VertexAttribute {
+                                    format: ::wgpu::VertexFormat::Uint32,
+                                    offset: 16,
+                                    shader_location: 4,
+                                },
+                            ],
+                        },
+                    ],
+                },
+                fragment: Some(::wgpu::FragmentState {
+                    module: &map2d_shader,
+                    entry_point: Some("fs_line"),
+                    compilation_options: Default::default(),
+                    targets: &[Some(::wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: ::wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: ::wgpu::PrimitiveState {
+                    topology: ::wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: ::wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: ::wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
                 multisample: ::wgpu::MultisampleState::default(),
                 multiview_mask: None,
                 cache: None,
@@ -1264,64 +2040,143 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 usage: ::wgpu::BufferUsages::VERTEX,
             });
 
-        let cities_vertex_buffer = device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-            label: Some("atlas-cities-vertices"),
-            contents: bytemuck::bytes_of(&CityVertex {
-                center: [0.0, 0.0, 0.0],
-                lift: 0.0,
-                offset_px: [0.0, 0.0],
-                color: [1.0, 1.0, 1.0, 1.0],
-            }),
+        let cities_quad_vertices: [QuadVertex; 6] = [
+            QuadVertex {
+                corner: [-1.0, -1.0],
+            },
+            QuadVertex {
+                corner: [1.0, -1.0],
+            },
+            QuadVertex { corner: [1.0, 1.0] },
+            QuadVertex {
+                corner: [-1.0, -1.0],
+            },
+            QuadVertex { corner: [1.0, 1.0] },
+            QuadVertex {
+                corner: [-1.0, 1.0],
+            },
+        ];
+        let cities_quad_vertex_buffer =
+            device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
+                label: Some("atlas-cities-quad"),
+                contents: bytemuck::cast_slice(&cities_quad_vertices),
+                usage: ::wgpu::BufferUsages::VERTEX,
+            });
+        let cities_instance_capacity_bytes = (std::mem::size_of::<CityVertex>().max(16)) as u64;
+        let cities_instance_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-cities-instances"),
+            size: cities_instance_capacity_bytes,
             usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
         });
 
-        let corridors_vertex_buffer =
+        let corridor_quad_vertices: [SegmentVertex; 6] = [
+            SegmentVertex {
+                along: 0.0,
+                side: -1.0,
+            },
+            SegmentVertex {
+                along: 1.0,
+                side: -1.0,
+            },
+            SegmentVertex {
+                along: 1.0,
+                side: 1.0,
+            },
+            SegmentVertex {
+                along: 0.0,
+                side: -1.0,
+            },
+            SegmentVertex {
+                along: 1.0,
+                side: 1.0,
+            },
+            SegmentVertex {
+                along: 0.0,
+                side: 1.0,
+            },
+        ];
+        let corridor_quad_vertex_buffer =
             device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                label: Some("atlas-corridors-vertices"),
-                contents: bytemuck::bytes_of(&CorridorVertex {
-                    a: [0.0, 0.0, 0.0],
-                    b: [0.0, 0.0, 0.0],
-                    along: 0.0,
-                    side: 0.0,
-                    lift: 0.0,
-                    width_px: 1.0,
-                    color: [1.0, 1.0, 1.0, 1.0],
-                }),
-                usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+                label: Some("atlas-corridors-quad"),
+                contents: bytemuck::cast_slice(&corridor_quad_vertices),
+                usage: ::wgpu::BufferUsages::VERTEX,
             });
+        let corridors_instance_capacity_bytes =
+            (std::mem::size_of::<CorridorVertex>().max(16)) as u64;
+        let corridors_instance_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-corridors-instances"),
+            size: corridors_instance_capacity_bytes,
+            usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-        let regions_vertex_buffer =
-            device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                label: Some("atlas-regions-vertices"),
-                contents: bytemuck::bytes_of(&OverlayVertex {
-                    position: [0.0, 0.0, 0.0],
-                    lift: 0.0,
-                    color: [1.0, 1.0, 1.0, 1.0],
-                }),
-                usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
-            });
+        let overlay2d_vertex_capacity_bytes =
+            (std::mem::size_of::<Overlay2DVertex>().max(16)) as u64;
+        let base_regions2d_vertex_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-base-regions2d-vertices"),
+            size: overlay2d_vertex_capacity_bytes,
+            usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let regions2d_vertex_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-regions2d-vertices"),
+            size: overlay2d_vertex_capacity_bytes,
+            usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let regions2d_vertex_capacity_bytes = overlay2d_vertex_capacity_bytes;
+        let base_regions2d_vertex_capacity_bytes = overlay2d_vertex_capacity_bytes;
 
-        let terrain_vertex_buffer =
-            device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                label: Some("atlas-terrain-vertices"),
-                contents: bytemuck::bytes_of(&OverlayVertex {
-                    position: [0.0, 0.0, 0.0],
-                    lift: 0.0,
-                    color: [1.0, 1.0, 1.0, 1.0],
-                }),
-                usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
-            });
+        let points2d_instance_capacity_bytes =
+            (std::mem::size_of::<Point2DInstance>().max(16)) as u64;
+        let points2d_instance_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-points2d-instances"),
+            size: points2d_instance_capacity_bytes,
+            usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
-        let base_regions_vertex_buffer =
-            device.create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                label: Some("atlas-base-regions-vertices"),
-                contents: bytemuck::bytes_of(&OverlayVertex {
-                    position: [0.0, 0.0, 0.0],
-                    lift: 0.0,
-                    color: [1.0, 1.0, 1.0, 1.0],
-                }),
-                usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
-            });
+        let lines2d_instance_capacity_bytes =
+            (std::mem::size_of::<Segment2DInstance>().max(16)) as u64;
+        let lines2d_instance_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-lines2d-instances"),
+            size: lines2d_instance_capacity_bytes,
+            usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let grid2d_instance_capacity_bytes =
+            (std::mem::size_of::<Segment2DInstance>().max(16)) as u64;
+        let grid2d_instance_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-grid2d-instances"),
+            size: grid2d_instance_capacity_bytes,
+            usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let overlay_vertex_capacity_bytes = (std::mem::size_of::<OverlayVertex>().max(16)) as u64;
+        let regions_vertex_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-regions-vertices"),
+            size: overlay_vertex_capacity_bytes,
+            usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let terrain_vertex_capacity_bytes = (std::mem::size_of::<TerrainVertex>().max(16)) as u64;
+        let terrain_vertex_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-terrain-vertices"),
+            size: terrain_vertex_capacity_bytes,
+            usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let base_regions_vertex_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-base-regions-vertices"),
+            size: overlay_vertex_capacity_bytes,
+            usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let regions_vertex_capacity_bytes = overlay_vertex_capacity_bytes;
+        let base_regions_vertex_capacity_bytes = overlay_vertex_capacity_bytes;
 
         // Initialize uniforms so the first render doesn't read uninitialized memory.
         let globals = Globals {
@@ -1335,6 +2190,24 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             stars_alpha: 1.0,
         };
         queue.write_buffer(&uniform_buffer, 0, bytemuck::bytes_of(&globals));
+
+        let globals2d = Globals2D {
+            center_m: [0.0, 0.0],
+            scale_px_per_m: 1e-6,
+            world_width_m: (2.0 * std::f32::consts::PI) * (WGS84_A as f32),
+            viewport_px: [1.0, 1.0],
+            _pad0: [0.0, 0.0],
+        };
+        queue.write_buffer(&uniform2d_buffer, 0, bytemuck::bytes_of(&globals2d));
+
+        let default_style = Style {
+            color: [1.0, 1.0, 1.0, 1.0],
+            lift_m: 0.0,
+            size_px: 3.0,
+            width_px: 1.0,
+            _pad0: 0.0,
+        };
+        queue.write_buffer(&styles_buffer, 0, bytemuck::bytes_of(&default_style));
 
         Ok(WgpuContext {
             _instance: instance,
@@ -1360,59 +2233,118 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             graticule_pipeline,
             cities_pipeline,
             corridors_pipeline,
-            regions_pipeline,
-            base_regions_pipeline,
+            overlays_pipeline,
+            base_overlays_pipeline,
+            terrain_pipeline,
+            map2d_polys_pipeline,
+            map2d_lines_pipeline,
+            map2d_points_pipeline,
             uniform_buffer,
+            uniform2d_buffer,
+            styles_buffer,
+            styles_capacity_bytes,
+            styles_count: 1,
+            uniform_bind_group_layout,
             uniform_bind_group,
+            uniform2d_bind_group,
             depth_view,
             vertex_buffer,
             index_buffer,
             index_count: indices.len() as u32,
             graticule_vertex_buffer,
             graticule_vertex_count: graticule_vertices.len() as u32,
-            cities_vertex_buffer,
-            cities_vertex_count: 0,
-            corridors_vertex_buffer,
-            corridors_vertex_count: 0,
+            cities_quad_vertex_buffer,
+            cities_instance_buffer,
+            cities_instance_capacity_bytes,
+            cities_instance_count: 0,
+            corridor_quad_vertex_buffer,
+            corridors_instance_buffer,
+            corridors_instance_capacity_bytes,
+            corridors_instance_count: 0,
+            regions_vertex_buffer,
+            regions_vertex_capacity_bytes,
+            regions_vertex_count: 0,
             terrain_vertex_buffer,
+            terrain_vertex_capacity_bytes,
             terrain_vertex_count: 0,
             base_regions_vertex_buffer,
+            base_regions_vertex_capacity_bytes,
             base_regions_vertex_count: 0,
-            regions_vertex_buffer,
-            regions_vertex_count: 0,
+            base_regions2d_vertex_buffer,
+            base_regions2d_vertex_capacity_bytes,
+            base_regions2d_vertex_count: 0,
+            regions2d_vertex_buffer,
+            regions2d_vertex_capacity_bytes,
+            regions2d_vertex_count: 0,
+            points2d_instance_buffer,
+            points2d_instance_capacity_bytes,
+            points2d_instance_count: 0,
+            lines2d_instance_buffer,
+            lines2d_instance_capacity_bytes,
+            lines2d_instance_count: 0,
+            grid2d_instance_buffer,
+            grid2d_instance_capacity_bytes,
+            grid2d_instance_count: 0,
+
+            perf_upload_calls: Cell::new(0),
+            perf_upload_bytes: Cell::new(0),
+            perf_render_passes: Cell::new(0),
+            perf_draw_calls: Cell::new(0),
+            perf_draw_instances: Cell::new(0),
+            perf_draw_vertices: Cell::new(0),
+            perf_draw_indices: Cell::new(0),
         })
     }
 
     pub fn set_cities_points(ctx: &mut WgpuContext, points: &[CityVertex]) {
         if points.is_empty() {
-            ctx.cities_vertex_count = 0;
+            ctx.cities_instance_count = 0;
             return;
         }
 
-        ctx.cities_vertex_buffer =
-            ctx.device
-                .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                    label: Some("atlas-cities-vertices"),
-                    contents: bytemuck::cast_slice(points),
-                    usage: ::wgpu::BufferUsages::VERTEX,
-                });
-        ctx.cities_vertex_count = points.len() as u32;
+        let required_bytes = (points.len() * std::mem::size_of::<CityVertex>()) as u64;
+        ensure_buffer_capacity(
+            &ctx.device,
+            &mut ctx.cities_instance_buffer,
+            &mut ctx.cities_instance_capacity_bytes,
+            required_bytes,
+            ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            "atlas-cities-instances",
+        );
+        ctx.queue
+            .write_buffer(&ctx.cities_instance_buffer, 0, bytemuck::cast_slice(points));
+        perf_on_write(
+            ctx,
+            (points.len() * std::mem::size_of::<CityVertex>()) as u64,
+        );
+        ctx.cities_instance_count = points.len() as u32;
     }
 
     pub fn set_corridors_points(ctx: &mut WgpuContext, points: &[CorridorVertex]) {
         if points.is_empty() {
-            ctx.corridors_vertex_count = 0;
+            ctx.corridors_instance_count = 0;
             return;
         }
 
-        ctx.corridors_vertex_buffer =
-            ctx.device
-                .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                    label: Some("atlas-corridors-vertices"),
-                    contents: bytemuck::cast_slice(points),
-                    usage: ::wgpu::BufferUsages::VERTEX,
-                });
-        ctx.corridors_vertex_count = points.len() as u32;
+        let required_bytes = (points.len() * std::mem::size_of::<CorridorVertex>()) as u64;
+        ensure_buffer_capacity(
+            &ctx.device,
+            &mut ctx.corridors_instance_buffer,
+            &mut ctx.corridors_instance_capacity_bytes,
+            required_bytes,
+            ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            "atlas-corridors-instances",
+        );
+        ctx.queue.write_buffer(
+            &ctx.corridors_instance_buffer,
+            0,
+            bytemuck::cast_slice(points),
+        );
+        perf_on_write(
+            ctx,
+            (points.len() * std::mem::size_of::<CorridorVertex>()) as u64,
+        );
+        ctx.corridors_instance_count = points.len() as u32;
     }
 
     pub fn set_regions_points(ctx: &mut WgpuContext, points: &[OverlayVertex]) {
@@ -1421,29 +2353,45 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             return;
         }
 
-        ctx.regions_vertex_buffer =
-            ctx.device
-                .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                    label: Some("atlas-regions-vertices"),
-                    contents: bytemuck::cast_slice(points),
-                    usage: ::wgpu::BufferUsages::VERTEX,
-                });
+        let required_bytes = (points.len() * std::mem::size_of::<OverlayVertex>()) as u64;
+        ensure_buffer_capacity(
+            &ctx.device,
+            &mut ctx.regions_vertex_buffer,
+            &mut ctx.regions_vertex_capacity_bytes,
+            required_bytes,
+            ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            "atlas-regions-vertices",
+        );
+        ctx.queue
+            .write_buffer(&ctx.regions_vertex_buffer, 0, bytemuck::cast_slice(points));
+        perf_on_write(
+            ctx,
+            (points.len() * std::mem::size_of::<OverlayVertex>()) as u64,
+        );
         ctx.regions_vertex_count = points.len() as u32;
     }
 
-    pub fn set_terrain_points(ctx: &mut WgpuContext, points: &[OverlayVertex]) {
+    pub fn set_terrain_points(ctx: &mut WgpuContext, points: &[TerrainVertex]) {
         if points.is_empty() {
             ctx.terrain_vertex_count = 0;
             return;
         }
 
-        ctx.terrain_vertex_buffer =
-            ctx.device
-                .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                    label: Some("atlas-terrain-vertices"),
-                    contents: bytemuck::cast_slice(points),
-                    usage: ::wgpu::BufferUsages::VERTEX,
-                });
+        let required_bytes = (points.len() * std::mem::size_of::<TerrainVertex>()) as u64;
+        ensure_buffer_capacity(
+            &ctx.device,
+            &mut ctx.terrain_vertex_buffer,
+            &mut ctx.terrain_vertex_capacity_bytes,
+            required_bytes,
+            ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            "atlas-terrain-vertices",
+        );
+        ctx.queue
+            .write_buffer(&ctx.terrain_vertex_buffer, 0, bytemuck::cast_slice(points));
+        perf_on_write(
+            ctx,
+            (points.len() * std::mem::size_of::<TerrainVertex>()) as u64,
+        );
         ctx.terrain_vertex_count = points.len() as u32;
     }
 
@@ -1453,14 +2401,148 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             return;
         }
 
-        ctx.base_regions_vertex_buffer =
-            ctx.device
-                .create_buffer_init(&::wgpu::util::BufferInitDescriptor {
-                    label: Some("atlas-base-regions-vertices"),
-                    contents: bytemuck::cast_slice(points),
-                    usage: ::wgpu::BufferUsages::VERTEX,
-                });
+        let required_bytes = (points.len() * std::mem::size_of::<OverlayVertex>()) as u64;
+        ensure_buffer_capacity(
+            &ctx.device,
+            &mut ctx.base_regions_vertex_buffer,
+            &mut ctx.base_regions_vertex_capacity_bytes,
+            required_bytes,
+            ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            "atlas-base-regions-vertices",
+        );
+        ctx.queue.write_buffer(
+            &ctx.base_regions_vertex_buffer,
+            0,
+            bytemuck::cast_slice(points),
+        );
+        perf_on_write(
+            ctx,
+            (points.len() * std::mem::size_of::<OverlayVertex>()) as u64,
+        );
         ctx.base_regions_vertex_count = points.len() as u32;
+    }
+
+    pub fn set_base_regions2d_vertices(ctx: &mut WgpuContext, verts: &[Overlay2DVertex]) {
+        if verts.is_empty() {
+            ctx.base_regions2d_vertex_count = 0;
+            return;
+        }
+
+        let required_bytes = (verts.len() * std::mem::size_of::<Overlay2DVertex>()) as u64;
+        ensure_buffer_capacity(
+            &ctx.device,
+            &mut ctx.base_regions2d_vertex_buffer,
+            &mut ctx.base_regions2d_vertex_capacity_bytes,
+            required_bytes,
+            ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            "atlas-base-regions2d-vertices",
+        );
+        ctx.queue.write_buffer(
+            &ctx.base_regions2d_vertex_buffer,
+            0,
+            bytemuck::cast_slice(verts),
+        );
+        perf_on_write(
+            ctx,
+            (verts.len() * std::mem::size_of::<Overlay2DVertex>()) as u64,
+        );
+        ctx.base_regions2d_vertex_count = verts.len() as u32;
+    }
+
+    pub fn set_regions2d_vertices(ctx: &mut WgpuContext, verts: &[Overlay2DVertex]) {
+        if verts.is_empty() {
+            ctx.regions2d_vertex_count = 0;
+            return;
+        }
+
+        let required_bytes = (verts.len() * std::mem::size_of::<Overlay2DVertex>()) as u64;
+        ensure_buffer_capacity(
+            &ctx.device,
+            &mut ctx.regions2d_vertex_buffer,
+            &mut ctx.regions2d_vertex_capacity_bytes,
+            required_bytes,
+            ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            "atlas-regions2d-vertices",
+        );
+        ctx.queue
+            .write_buffer(&ctx.regions2d_vertex_buffer, 0, bytemuck::cast_slice(verts));
+        perf_on_write(
+            ctx,
+            (verts.len() * std::mem::size_of::<Overlay2DVertex>()) as u64,
+        );
+        ctx.regions2d_vertex_count = verts.len() as u32;
+    }
+
+    pub fn set_points2d_instances(ctx: &mut WgpuContext, inst: &[Point2DInstance]) {
+        if inst.is_empty() {
+            ctx.points2d_instance_count = 0;
+            return;
+        }
+
+        let required_bytes = (inst.len() * std::mem::size_of::<Point2DInstance>()) as u64;
+        ensure_buffer_capacity(
+            &ctx.device,
+            &mut ctx.points2d_instance_buffer,
+            &mut ctx.points2d_instance_capacity_bytes,
+            required_bytes,
+            ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            "atlas-points2d-instances",
+        );
+        ctx.queue
+            .write_buffer(&ctx.points2d_instance_buffer, 0, bytemuck::cast_slice(inst));
+        perf_on_write(
+            ctx,
+            (inst.len() * std::mem::size_of::<Point2DInstance>()) as u64,
+        );
+        ctx.points2d_instance_count = inst.len() as u32;
+    }
+
+    pub fn set_lines2d_instances(ctx: &mut WgpuContext, inst: &[Segment2DInstance]) {
+        if inst.is_empty() {
+            ctx.lines2d_instance_count = 0;
+            return;
+        }
+
+        let required_bytes = (inst.len() * std::mem::size_of::<Segment2DInstance>()) as u64;
+        ensure_buffer_capacity(
+            &ctx.device,
+            &mut ctx.lines2d_instance_buffer,
+            &mut ctx.lines2d_instance_capacity_bytes,
+            required_bytes,
+            ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            "atlas-lines2d-instances",
+        );
+        ctx.queue
+            .write_buffer(&ctx.lines2d_instance_buffer, 0, bytemuck::cast_slice(inst));
+        perf_on_write(
+            ctx,
+            (inst.len() * std::mem::size_of::<Segment2DInstance>()) as u64,
+        );
+        ctx.lines2d_instance_count = inst.len() as u32;
+    }
+
+    pub fn set_grid2d_instances(ctx: &mut WgpuContext, inst: &[Segment2DInstance]) {
+        if inst.is_empty() {
+            ctx.grid2d_instance_count = 0;
+            return;
+        }
+
+        let required_bytes = (inst.len() * std::mem::size_of::<Segment2DInstance>()) as u64;
+        ensure_buffer_capacity(
+            &ctx.device,
+            &mut ctx.grid2d_instance_buffer,
+            &mut ctx.grid2d_instance_capacity_bytes,
+            required_bytes,
+            ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            "atlas-grid2d-instances",
+        );
+        ctx.queue
+            .write_buffer(&ctx.grid2d_instance_buffer, 0, bytemuck::cast_slice(inst));
+        perf_on_write(
+            ctx,
+            (inst.len() * std::mem::size_of::<Segment2DInstance>()) as u64,
+        );
+        ctx.grid2d_instance_count = inst.len() as u32;
     }
 
     pub fn resize_wgpu(ctx: &mut WgpuContext, width: u32, height: u32) {
@@ -1502,6 +2584,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         };
         ctx.queue
             .write_buffer(&ctx.uniform_buffer, 0, bytemuck::bytes_of(&globals));
+        perf_on_write(ctx, std::mem::size_of::<Globals>() as u64);
 
         let mut encoder = ctx
             .device
@@ -1511,6 +2594,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
         // Pass 1: clear to deep space and draw stars (no depth attachment).
         {
+            perf_on_pass(ctx);
             let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
                 label: Some("atlas-stars-pass"),
                 color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
@@ -1531,12 +2615,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             rpass.set_pipeline(&ctx.stars_pipeline);
             rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
             rpass.draw(0..ctx.stars_count, 0..1);
+            perf_on_draw(ctx, ctx.stars_count as u64, 0, 1);
         }
 
-        // Pass 2: draw globe with depth, preserving the starfield color.
+        // Pass 2: single main pass (globe + all overlays), preserving the starfield color.
         {
+            perf_on_pass(ctx);
             let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
-                label: Some("atlas-globe-pass"),
+                label: Some("atlas-main-pass"),
                 color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -1562,234 +2648,169 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 multiview_mask: None,
             });
 
+            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            // Globe writes stencil=1 anywhere it draws.
+            rpass.set_stencil_reference(1);
+
+            // Globe
             let globe_pipeline = if ctx.globe_transparent {
                 &ctx.globe_pipeline_transparent
             } else {
                 &ctx.globe_pipeline_solid
             };
             rpass.set_pipeline(globe_pipeline);
-            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
-            // Globe writes stencil=1 anywhere it draws.
-            rpass.set_stencil_reference(1);
             rpass.set_vertex_buffer(0, ctx.vertex_buffer.slice(..));
             rpass.set_index_buffer(ctx.index_buffer.slice(..), ::wgpu::IndexFormat::Uint16);
             rpass.draw_indexed(0..ctx.index_count, 0, 0..1);
+            perf_on_draw(ctx, 0, ctx.index_count as u64, 1);
+
+            // Terrain
+            if show_terrain && ctx.terrain_vertex_count > 0 {
+                rpass.set_pipeline(&ctx.terrain_pipeline);
+                rpass.set_vertex_buffer(0, ctx.terrain_vertex_buffer.slice(..));
+                rpass.draw(0..ctx.terrain_vertex_count, 0..1);
+                perf_on_draw(ctx, ctx.terrain_vertex_count as u64, 0, 1);
+            }
+
+            // Graticule
+            if show_graticule {
+                rpass.set_pipeline(&ctx.graticule_pipeline);
+                rpass.set_vertex_buffer(0, ctx.graticule_vertex_buffer.slice(..));
+                rpass.draw(0..ctx.graticule_vertex_count, 0..1);
+                perf_on_draw(ctx, ctx.graticule_vertex_count as u64, 0, 1);
+            }
+
+            // Base polygons
+            if show_base_regions && ctx.base_regions_vertex_count > 0 {
+                rpass.set_pipeline(&ctx.base_overlays_pipeline);
+                rpass.set_vertex_buffer(0, ctx.base_regions_vertex_buffer.slice(..));
+                rpass.draw(0..ctx.base_regions_vertex_count, 0..1);
+                perf_on_draw(ctx, ctx.base_regions_vertex_count as u64, 0, 1);
+            }
+
+            // Region polygons
+            if show_regions && ctx.regions_vertex_count > 0 {
+                rpass.set_pipeline(&ctx.overlays_pipeline);
+                rpass.set_vertex_buffer(0, ctx.regions_vertex_buffer.slice(..));
+                rpass.draw(0..ctx.regions_vertex_count, 0..1);
+                perf_on_draw(ctx, ctx.regions_vertex_count as u64, 0, 1);
+            }
+
+            // Air corridors (instanced)
+            if show_corridors && ctx.corridors_instance_count > 0 {
+                rpass.set_pipeline(&ctx.corridors_pipeline);
+                rpass.set_vertex_buffer(0, ctx.corridor_quad_vertex_buffer.slice(..));
+                rpass.set_vertex_buffer(1, ctx.corridors_instance_buffer.slice(..));
+                rpass.draw(0..6, 0..ctx.corridors_instance_count);
+                perf_on_draw(ctx, 6, 0, ctx.corridors_instance_count as u64);
+            }
+
+            // City markers (instanced)
+            if show_cities && ctx.cities_instance_count > 0 {
+                rpass.set_pipeline(&ctx.cities_pipeline);
+                rpass.set_vertex_buffer(0, ctx.cities_quad_vertex_buffer.slice(..));
+                rpass.set_vertex_buffer(1, ctx.cities_instance_buffer.slice(..));
+                rpass.draw(0..6, 0..ctx.cities_instance_count);
+                perf_on_draw(ctx, 6, 0, ctx.cities_instance_count as u64);
+            }
         }
 
-        // Pass 3 (optional): terrain mesh (depth-tested, alpha blended).
-        if show_terrain && ctx.terrain_vertex_count > 0 {
+        ctx.queue.submit(std::iter::once(encoder.finish()));
+        frame.present();
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_map2d(
+        ctx: &WgpuContext,
+        globals2d: Globals2D,
+        show_graticule: bool,
+        show_base_regions: bool,
+        show_regions: bool,
+        show_lines: bool,
+        show_points: bool,
+    ) -> Result<(), JsValue> {
+        let frame = ctx
+            .surface
+            .get_current_texture()
+            .map_err(|e| JsValue::from_str(&format!("surface acquire failed: {e}")))?;
+        let view = frame
+            .texture
+            .create_view(&::wgpu::TextureViewDescriptor::default());
+
+        ctx.queue
+            .write_buffer(&ctx.uniform2d_buffer, 0, bytemuck::bytes_of(&globals2d));
+        perf_on_write(ctx, std::mem::size_of::<Globals2D>() as u64);
+
+        let mut encoder = ctx
+            .device
+            .create_command_encoder(&::wgpu::CommandEncoderDescriptor {
+                label: Some("atlas-map2d-encoder"),
+            });
+
+        {
+            perf_on_pass(ctx);
             let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
-                label: Some("atlas-terrain-pass"),
+                label: Some("atlas-map2d-pass"),
                 color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: ::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
+                        load: ::wgpu::LoadOp::Clear(ctx.clear_color),
                         store: ::wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: Some(::wgpu::RenderPassDepthStencilAttachment {
-                    view: &ctx.depth_view,
-                    depth_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                }),
+                depth_stencil_attachment: None,
                 occlusion_query_set: None,
                 timestamp_writes: None,
                 multiview_mask: None,
             });
 
-            rpass.set_pipeline(&ctx.regions_pipeline);
-            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
-            rpass.set_stencil_reference(1);
-            rpass.set_vertex_buffer(0, ctx.terrain_vertex_buffer.slice(..));
-            rpass.draw(0..ctx.terrain_vertex_count, 0..1);
-        }
+            rpass.set_bind_group(0, &ctx.uniform2d_bind_group, &[]);
 
-        // Pass 4 (optional): graticule overlay (depth-tested, alpha blended).
-        if show_graticule {
-            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
-                label: Some("atlas-graticule-pass"),
-                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: ::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(::wgpu::RenderPassDepthStencilAttachment {
-                    view: &ctx.depth_view,
-                    depth_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
+            // Graticule (as instanced thick segments).
+            if show_graticule && ctx.grid2d_instance_count > 0 {
+                rpass.set_pipeline(&ctx.map2d_lines_pipeline);
+                rpass.set_vertex_buffer(0, ctx.corridor_quad_vertex_buffer.slice(..));
+                rpass.set_vertex_buffer(1, ctx.grid2d_instance_buffer.slice(..));
+                rpass.draw(0..6, 0..ctx.grid2d_instance_count);
+                perf_on_draw(ctx, 6, 0, ctx.grid2d_instance_count as u64);
+            }
 
-            rpass.set_pipeline(&ctx.graticule_pipeline);
-            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
-            rpass.set_stencil_reference(1);
-            rpass.set_vertex_buffer(0, ctx.graticule_vertex_buffer.slice(..));
-            rpass.draw(0..ctx.graticule_vertex_count, 0..1);
-        }
+            // Base polygons.
+            if show_base_regions && ctx.base_regions2d_vertex_count > 0 {
+                rpass.set_pipeline(&ctx.map2d_polys_pipeline);
+                rpass.set_vertex_buffer(0, ctx.base_regions2d_vertex_buffer.slice(..));
+                rpass.draw(0..ctx.base_regions2d_vertex_count, 0..1);
+                perf_on_draw(ctx, ctx.base_regions2d_vertex_count as u64, 0, 1);
+            }
 
-        // Pass 5 (optional): base world polygons (depth-tested, alpha blended).
-        if show_base_regions && ctx.base_regions_vertex_count > 0 {
-            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
-                label: Some("atlas-base-regions-pass"),
-                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: ::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(::wgpu::RenderPassDepthStencilAttachment {
-                    view: &ctx.depth_view,
-                    depth_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
+            // Polygons.
+            if show_regions && ctx.regions2d_vertex_count > 0 {
+                rpass.set_pipeline(&ctx.map2d_polys_pipeline);
+                rpass.set_vertex_buffer(0, ctx.regions2d_vertex_buffer.slice(..));
+                rpass.draw(0..ctx.regions2d_vertex_count, 0..1);
+                perf_on_draw(ctx, ctx.regions2d_vertex_count as u64, 0, 1);
+            }
 
-            rpass.set_pipeline(&ctx.base_regions_pipeline);
-            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
-            rpass.set_stencil_reference(1);
-            rpass.set_vertex_buffer(0, ctx.base_regions_vertex_buffer.slice(..));
-            rpass.draw(0..ctx.base_regions_vertex_count, 0..1);
-        }
+            // Lines.
+            if show_lines && ctx.lines2d_instance_count > 0 {
+                rpass.set_pipeline(&ctx.map2d_lines_pipeline);
+                rpass.set_vertex_buffer(0, ctx.corridor_quad_vertex_buffer.slice(..));
+                rpass.set_vertex_buffer(1, ctx.lines2d_instance_buffer.slice(..));
+                rpass.draw(0..6, 0..ctx.lines2d_instance_count);
+                perf_on_draw(ctx, 6, 0, ctx.lines2d_instance_count as u64);
+            }
 
-        // Pass 6 (optional): region polygons (depth-tested, alpha blended).
-        if show_regions && ctx.regions_vertex_count > 0 {
-            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
-                label: Some("atlas-regions-pass"),
-                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: ::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(::wgpu::RenderPassDepthStencilAttachment {
-                    view: &ctx.depth_view,
-                    depth_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            rpass.set_pipeline(&ctx.regions_pipeline);
-            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
-            rpass.set_stencil_reference(1);
-            rpass.set_vertex_buffer(0, ctx.regions_vertex_buffer.slice(..));
-            rpass.draw(0..ctx.regions_vertex_count, 0..1);
-        }
-
-        // Pass 7 (optional): air corridors (depth-tested, alpha blended).
-        if show_corridors && ctx.corridors_vertex_count > 0 {
-            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
-                label: Some("atlas-corridors-pass"),
-                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: ::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(::wgpu::RenderPassDepthStencilAttachment {
-                    view: &ctx.depth_view,
-                    depth_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            rpass.set_pipeline(&ctx.corridors_pipeline);
-            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
-            rpass.set_stencil_reference(1);
-            rpass.set_vertex_buffer(0, ctx.corridors_vertex_buffer.slice(..));
-            rpass.draw(0..ctx.corridors_vertex_count, 0..1);
-        }
-
-        // Pass 8 (optional): city markers (depth-tested triangles).
-        if show_cities && ctx.cities_vertex_count > 0 {
-            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
-                label: Some("atlas-cities-pass"),
-                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: ::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(::wgpu::RenderPassDepthStencilAttachment {
-                    view: &ctx.depth_view,
-                    depth_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: Some(::wgpu::Operations {
-                        load: ::wgpu::LoadOp::Load,
-                        store: ::wgpu::StoreOp::Store,
-                    }),
-                }),
-                occlusion_query_set: None,
-                timestamp_writes: None,
-                multiview_mask: None,
-            });
-
-            rpass.set_pipeline(&ctx.cities_pipeline);
-            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
-            rpass.set_stencil_reference(1);
-            rpass.set_vertex_buffer(0, ctx.cities_vertex_buffer.slice(..));
-            rpass.draw(0..ctx.cities_vertex_count, 0..1);
+            // Points.
+            if show_points && ctx.points2d_instance_count > 0 {
+                rpass.set_pipeline(&ctx.map2d_points_pipeline);
+                rpass.set_vertex_buffer(0, ctx.cities_quad_vertex_buffer.slice(..));
+                rpass.set_vertex_buffer(1, ctx.points2d_instance_buffer.slice(..));
+                rpass.draw(0..6, 0..ctx.points2d_instance_count);
+                perf_on_draw(ctx, 6, 0, ctx.points2d_instance_count as u64);
+            }
         }
 
         ctx.queue.submit(std::iter::once(encoder.finish()));
@@ -1818,16 +2839,21 @@ mod imp {
     #[allow(dead_code)]
     pub struct CityVertex {
         pub center: [f32; 3],
-        pub lift: f32,
-        pub offset_px: [f32; 2],
-        pub color: [f32; 4],
+        pub style_id: u32,
     }
 
     #[derive(Debug, Copy, Clone)]
     #[allow(dead_code)]
     pub struct OverlayVertex {
         pub position: [f32; 3],
-        pub lift: f32,
+        pub style_id: u32,
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    #[allow(dead_code)]
+    pub struct TerrainVertex {
+        pub position: [f32; 3],
+        pub lift_m: f32,
         pub color: [f32; 4],
     }
 
@@ -1835,12 +2861,54 @@ mod imp {
     #[allow(dead_code)]
     pub struct CorridorVertex {
         pub a: [f32; 3],
+        pub _pad0: u32,
         pub b: [f32; 3],
-        pub along: f32,
-        pub side: f32,
-        pub lift: f32,
-        pub width_px: f32,
+        pub style_id: u32,
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    #[allow(dead_code)]
+    pub struct Style {
         pub color: [f32; 4],
+        pub lift_m: f32,
+        pub size_px: f32,
+        pub width_px: f32,
+        pub _pad0: f32,
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    #[allow(dead_code)]
+    pub struct Globals2D {
+        pub center_m: [f32; 2],
+        pub scale_px_per_m: f32,
+        pub world_width_m: f32,
+        pub viewport_px: [f32; 2],
+        pub _pad0: [f32; 2],
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    #[allow(dead_code)]
+    pub struct Overlay2DVertex {
+        pub position_m: [f32; 2],
+        pub anchor_x_m: f32,
+        pub style_id: u32,
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    #[allow(dead_code)]
+    pub struct Point2DInstance {
+        pub center_m: [f32; 2],
+        pub style_id: u32,
+        pub _pad0: u32,
+    }
+
+    #[derive(Debug, Copy, Clone)]
+    #[allow(dead_code)]
+    pub struct Segment2DInstance {
+        pub a_m: [f32; 2],
+        pub b_m: [f32; 2],
+        pub style_id: u32,
+        pub _pad0: u32,
     }
 
     pub fn set_cities_points(_ctx: &mut WgpuContext, _points: &[CityVertex]) {}
@@ -1849,9 +2917,21 @@ mod imp {
 
     pub fn set_regions_points(_ctx: &mut WgpuContext, _points: &[OverlayVertex]) {}
 
-    pub fn set_terrain_points(_ctx: &mut WgpuContext, _points: &[OverlayVertex]) {}
+    pub fn set_terrain_points(_ctx: &mut WgpuContext, _points: &[TerrainVertex]) {}
 
     pub fn set_base_regions_points(_ctx: &mut WgpuContext, _points: &[OverlayVertex]) {}
+
+    pub fn set_base_regions2d_vertices(_ctx: &mut WgpuContext, _verts: &[Overlay2DVertex]) {}
+
+    pub fn set_regions2d_vertices(_ctx: &mut WgpuContext, _verts: &[Overlay2DVertex]) {}
+
+    pub fn set_points2d_instances(_ctx: &mut WgpuContext, _inst: &[Point2DInstance]) {}
+
+    pub fn set_lines2d_instances(_ctx: &mut WgpuContext, _inst: &[Segment2DInstance]) {}
+
+    pub fn set_grid2d_instances(_ctx: &mut WgpuContext, _inst: &[Segment2DInstance]) {}
+
+    pub fn set_styles(_ctx: &mut WgpuContext, _styles: &[Style]) {}
 
     pub fn set_theme(
         _ctx: &mut WgpuContext,
@@ -1879,10 +2959,34 @@ mod imp {
             "wgpu rendering is only available on wasm32 targets",
         ))
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render_map2d(
+        _ctx: &WgpuContext,
+        _globals2d: Globals2D,
+        _show_graticule: bool,
+        _show_base_regions: bool,
+        _show_regions: bool,
+        _show_lines: bool,
+        _show_points: bool,
+    ) -> Result<(), JsValue> {
+        Err(JsValue::from_str(
+            "wgpu rendering is only available on wasm32 targets",
+        ))
+    }
+
+    pub fn perf_reset(_ctx: &WgpuContext) {}
+
+    pub fn perf_snapshot(_ctx: &WgpuContext) -> super::WgpuPerfSnapshot {
+        super::WgpuPerfSnapshot::default()
+    }
 }
 
 pub use imp::{
-    CityVertex, CorridorVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh,
-    resize_wgpu, set_base_regions_points, set_cities_points, set_corridors_points,
-    set_globe_transparent, set_regions_points, set_terrain_points, set_theme,
+    CityVertex, CorridorVertex, Globals2D, Overlay2DVertex, OverlayVertex, Point2DInstance,
+    Segment2DInstance, Style, TerrainVertex, WgpuContext, init_wgpu_from_canvas_id, perf_reset,
+    perf_snapshot, render_map2d, render_mesh, resize_wgpu, set_base_regions_points,
+    set_base_regions2d_vertices, set_cities_points, set_corridors_points, set_globe_transparent,
+    set_grid2d_instances, set_lines2d_instances, set_points2d_instances, set_regions_points,
+    set_regions2d_vertices, set_styles, set_terrain_points, set_theme,
 };

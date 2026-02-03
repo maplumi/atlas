@@ -202,6 +202,8 @@
         display: block;
         touch-action: none;
       }
+      #atlas-canvas-3d { z-index: 1; }
+      #atlas-canvas-2d { z-index: 2; }
       #atlas-canvas-2d.hidden,
       #atlas-canvas-3d.hidden {
         display: none;
@@ -495,6 +497,53 @@
         background: rgba(2, 6, 23, 0.35);
         font-size: 11px;
         color: var(--muted);
+      }
+
+      /* Perf HUD (transparent, theme-friendly) */
+      .perf-hud {
+        position: absolute;
+        right: 12px;
+        bottom: 12px;
+        z-index: 15;
+        max-width: min(520px, calc(100vw - 24px));
+        background: color-mix(in srgb, var(--controls-bg) 86%, transparent);
+        border: 1px solid var(--controls-border);
+        border-radius: 12px;
+        box-shadow: 0 12px 24px var(--shadow);
+        backdrop-filter: blur(10px);
+        padding: 10px 12px;
+        user-select: none;
+        pointer-events: none; /* don't block map input */
+      }
+      .perf-hud.hidden { display: none; }
+      .perf-hud .hdr {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 6px;
+      }
+      .perf-hud .title {
+        font-size: 12px;
+        font-weight: 800;
+        letter-spacing: 0.02em;
+        color: var(--fg);
+        opacity: 0.92;
+      }
+      .perf-hud .hint {
+        font-size: 11px;
+        color: var(--muted);
+        opacity: 0.9;
+      }
+      .perf-hud pre {
+        margin: 0;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+        font-size: 11px;
+        line-height: 1.35;
+        color: var(--fg);
+        white-space: pre;
+        overflow: hidden;
+        text-overflow: ellipsis;
       }
     </style>
     <script>
@@ -793,6 +842,17 @@
               Affects UI and globe colors (base surface + ocean/space).
             </div>
           </div>
+
+          <div class="section">
+            <h3>Diagnostics</h3>
+            <label class="checkbox">
+              <input id="toggle-perf-hud" type="checkbox" />
+              <span>Show performance HUD (P)</span>
+            </label>
+            <div class="muted" style="font-size:12px; line-height:1.35; margin-top:6px;">
+              Shows per-frame WebGPU counters (uploads/draw calls) and 2D timings.
+            </div>
+          </div>
           <div class="section">
             <h3>Lighting</h3>
             <label class="checkbox">
@@ -836,6 +896,14 @@
       <div id="map-area">
         <canvas id="atlas-canvas-2d" width="1280" height="720" class="hidden"></canvas>
         <canvas id="atlas-canvas-3d" width="1280" height="720"></canvas>
+
+        <div id="perf-hud" class="perf-hud hidden" aria-label="Performance HUD">
+          <div class="hdr">
+            <div class="title">Perf</div>
+            <div class="hint">Toggle: P</div>
+          </div>
+          <pre id="perf-hud-text">—</pre>
+        </div>
         <div id="compact-tabs" class="compact-tabs" aria-label="Panel shortcuts">
           <button class="btn" data-tab="general" type="button" title="General" aria-label="General">
             <span class="icon" aria-hidden="true">
@@ -1526,6 +1594,8 @@
         wasm.init_wgpu();
         startSurfaceStatusPolling(wasm);
         start2DPerfPolling(wasm);
+        wirePerfHudUi(wasm);
+        startPerfHudPolling(wasm);
         startTerrainClientStatusPolling(wasm);
         startAnimation(wasm);
 
@@ -1636,6 +1706,9 @@
       }
 
       function startAnimation(wasm) {
+        let fpsFrames = 0;
+        let fpsLastT = performance.now();
+        window.__atlasFps = 0;
         function loop() {
           // If the tab is hidden, avoid burning CPU/GPU.
           // We still keep the RAF alive so we resume immediately when visible.
@@ -1643,6 +1716,16 @@
             window.requestAnimationFrame(loop);
             return;
           }
+
+          // Best-effort FPS meter based on the RAF loop.
+          fpsFrames += 1;
+          const now = performance.now();
+          if (now - fpsLastT >= 1000) {
+            window.__atlasFps = Math.round((fpsFrames * 1000) / Math.max(1, now - fpsLastT));
+            fpsFrames = 0;
+            fpsLastT = now;
+          }
+
           try {
             wasm.advance_frame();
           } catch (e) {
@@ -1652,6 +1735,137 @@
           window.requestAnimationFrame(loop);
         }
         window.requestAnimationFrame(loop);
+      }
+
+      function getPerfHudPreference() {
+        try {
+          const v = String(localStorage.getItem("atlas-perf-hud") || "").trim().toLowerCase();
+          if (v === "true") return true;
+          if (v === "false") return false;
+        } catch (_) {
+          // ignore
+        }
+        return false;
+      }
+
+      function setPerfHudPreference(enabled) {
+        try {
+          localStorage.setItem("atlas-perf-hud", enabled ? "true" : "false");
+        } catch (_) {
+          // ignore
+        }
+      }
+
+      function setPerfHudVisible(visible) {
+        const hud = document.getElementById("perf-hud");
+        if (hud) hud.classList.toggle("hidden", !visible);
+        const cb = document.getElementById("toggle-perf-hud");
+        if (cb) cb.checked = !!visible;
+      }
+
+      function wirePerfHudUi(_wasm) {
+        const initial = getPerfHudPreference();
+        setPerfHudVisible(initial);
+
+        const cb = document.getElementById("toggle-perf-hud");
+        if (cb) {
+          cb.checked = initial;
+          cb.addEventListener("change", () => {
+            const enabled = !!cb.checked;
+            setPerfHudPreference(enabled);
+            setPerfHudVisible(enabled);
+          });
+        }
+
+        window.addEventListener("keydown", (e) => {
+          // Avoid typing into inputs.
+          const t = e?.target;
+          const tag = t && t.tagName ? String(t.tagName).toLowerCase() : "";
+          if (tag === "input" || tag === "textarea" || tag === "select") return;
+
+          if (e.key === "p" || e.key === "P") {
+            const next = !getPerfHudPreference();
+            setPerfHudPreference(next);
+            setPerfHudVisible(next);
+          }
+        });
+      }
+
+      function startPerfHudPolling(wasm) {
+        function fmtBytes(n) {
+          const x = Number(n || 0);
+          if (!Number.isFinite(x) || x <= 0) return "0 B";
+          if (x < 1024) return `${Math.round(x)} B`;
+          if (x < 1024 * 1024) return `${(x / 1024).toFixed(1)} KiB`;
+          if (x < 1024 * 1024 * 1024) return `${(x / (1024 * 1024)).toFixed(2)} MiB`;
+          return `${(x / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+        }
+
+        function poll() {
+          if (document.hidden) return;
+          if (!getPerfHudPreference()) return;
+          const out = document.getElementById("perf-hud-text");
+          if (!out) return;
+
+          let lines = [];
+          try {
+            const fps = Math.round(Number(window.__atlasFps || 0));
+            lines.push(`${viewMode.toUpperCase()} • FPS ${fps}`);
+          } catch (_) {
+            // ignore
+          }
+
+          // WebGPU counters (both 2D+3D).
+          try {
+            if (wasm && wasm.get_gpu_perf_stats) {
+              const g = wasm.get_gpu_perf_stats();
+              const frameMs = Number(g.frame_ms || 0).toFixed(2);
+              const uploads = Math.round(Number(g.upload_calls || 0));
+              const bytes = Math.round(Number(g.upload_bytes || 0));
+              const mibps = Number(g.upload_mib_per_s || 0).toFixed(1);
+              const passes = Math.round(Number(g.render_passes || 0));
+              const draws = Math.round(Number(g.draw_calls || 0));
+              const inst = Math.round(Number(g.draw_instances || 0));
+              const vtx = Math.round(Number(g.draw_vertices || 0));
+              const idx = Math.round(Number(g.draw_indices || 0));
+              lines.push(
+                `GPU frame ${frameMs}ms • passes ${passes} • draws ${draws}`
+              );
+              lines.push(
+                `GPU uploads ${uploads} • ${fmtBytes(bytes)} • ${mibps} MiB/s`
+              );
+              lines.push(
+                `GPU verts ${vtx} • idx ${idx} • inst ${inst}`
+              );
+            }
+          } catch (_) {
+            // ignore
+          }
+
+          // 2D CPU timings (only meaningful in 2D mode, but safe to show).
+          try {
+            if (wasm && wasm.get_2d_perf_stats && viewMode === "2d") {
+              const s = wasm.get_2d_perf_stats();
+              const total = Number(s.total_ms || 0).toFixed(1);
+              const poly = Number(s.poly_ms || 0).toFixed(1);
+              const line = Number(s.line_ms || 0).toFixed(1);
+              const pt = Number(s.point_ms || 0).toFixed(1);
+              const tris = Math.round(Number(s.poly_tris || 0));
+              const segs = Math.round(Number(s.line_segs || 0));
+              const pts = Math.round(Number(s.points || 0));
+              lines.push(
+                `2D CPU ${total}ms • poly ${poly}ms/${tris} tri • line ${line}ms/${segs} seg • pt ${pt}ms/${pts}`
+              );
+            }
+          } catch (_) {
+            // ignore
+          }
+
+          out.textContent = lines.join("\n") || "—";
+        }
+
+        poll();
+        window.setInterval(poll, 500);
       }
 
       function start2DPerfPolling(wasm) {
@@ -3182,7 +3396,8 @@
           viewMode = next;
           try { localStorage.setItem("atlas.viewMode", viewMode); } catch (e) { /* ignore */ }
           canvas2d.classList.toggle("hidden", viewMode !== "2d");
-          canvas3d.classList.toggle("hidden", viewMode !== "3d");
+          // Keep WebGPU surface visible in both modes: the 2D path now renders via WebGPU too.
+          canvas3d.classList.toggle("hidden", false);
           mode2dBtn?.classList.toggle("active", viewMode === "2d");
           mode3dBtn?.classList.toggle("active", viewMode === "3d");
           if (mapView) mapView.textContent = viewMode.toUpperCase();

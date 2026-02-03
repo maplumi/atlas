@@ -32,9 +32,12 @@ use layers::vector::VectorLayer;
 use scene::components::VectorGeometryKind;
 mod wgpu;
 use wgpu::{
-    CityVertex, CorridorVertex, OverlayVertex, WgpuContext, init_wgpu_from_canvas_id, render_mesh,
-    resize_wgpu, set_base_regions_points, set_cities_points, set_corridors_points,
-    set_regions_points, set_terrain_points,
+    CityVertex, CorridorVertex, Globals2D, Overlay2DVertex, OverlayVertex, Point2DInstance,
+    Segment2DInstance, Style, TerrainVertex, WgpuContext, init_wgpu_from_canvas_id, perf_reset,
+    perf_snapshot, render_map2d, render_mesh, resize_wgpu, set_base_regions_points,
+    set_base_regions2d_vertices, set_cities_points, set_corridors_points, set_grid2d_instances,
+    set_lines2d_instances, set_points2d_instances, set_regions_points, set_regions2d_vertices,
+    set_styles, set_terrain_points,
 };
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
@@ -145,6 +148,89 @@ pub struct CameraState {
     pub pitch_rad: f64,
     pub distance: f64,
     pub target: [f64; 3],
+}
+
+#[derive(Debug, Copy, Clone)]
+struct Cull2DSnapshot {
+    center_m: [f32; 2],
+    scale_px_per_m: f32,
+    viewport_px: [f32; 2],
+    show_points: bool,
+    show_lines: bool,
+    geom_gen: u64,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct MercatorViewRect {
+    center_x: f32,
+    center_y: f32,
+    half_w_m: f32,
+    half_h_m: f32,
+    world_width_m: f32,
+}
+
+#[derive(Debug)]
+struct Cull2DJob {
+    snapshot: Cull2DSnapshot,
+    rect: MercatorViewRect,
+
+    // Point sources
+    cities_i: usize,
+    uploaded_i: usize,
+    feed_keys: Vec<String>,
+    feed_layer_i: usize,
+    feed_point_i: usize,
+    selection_point_done: bool,
+
+    // Line sources (segment index, not vertex index)
+    corridors_seg_i: usize,
+    uploaded_corridors_seg_i: usize,
+    selection_seg_i: usize,
+
+    last_uploaded_points: usize,
+    last_uploaded_lines: usize,
+
+    points_out: Vec<Point2DInstance>,
+    lines_out: Vec<Segment2DInstance>,
+}
+
+#[derive(Debug, Clone)]
+struct DebugLabel {
+    text: String,
+    mercator_m: [f32; 2],
+    viewer_pos: [f32; 3],
+    priority: f32,
+}
+
+#[derive(Debug, Copy, Clone)]
+struct Label2DSnapshot {
+    cam: Camera2DState,
+    viewport_px: [f32; 2],
+    generation: u64,
+}
+
+#[derive(Debug, Clone)]
+struct Label2DCandidate {
+    text: String,
+    mercator_m: [f32; 2],
+    priority: f32,
+}
+
+#[derive(Debug, Clone)]
+struct PlacedLabel2D {
+    text: String,
+    x_px: f32,
+    y_px: f32,
+    priority: f32,
+}
+
+#[derive(Debug)]
+struct Label2DJob {
+    snapshot: Label2DSnapshot,
+    candidates: Vec<Label2DCandidate>,
+    i: usize,
+    occupied_cells: std::collections::HashSet<u64>,
+    placed: Vec<PlacedLabel2D>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -285,7 +371,7 @@ struct ViewerState {
     surface_next_retry_ms: f64,
 
     terrain_tileset: Option<TerrainTileset>,
-    terrain_vertices: Option<Vec<OverlayVertex>>,
+    terrain_vertices: Option<Vec<TerrainVertex>>,
     terrain_zoom: Option<u32>,
     terrain_source: Option<String>,
     terrain_loading: bool,
@@ -311,6 +397,10 @@ struct ViewerState {
     // Online feeds (browser-fetched). For now these render as point layers.
     feed_layers: BTreeMap<String, FeedLayerState>,
 
+    // Stable GPU style IDs for feed layers (so style updates don't require geometry rebuild).
+    feed_style_ids: BTreeMap<String, u32>,
+    next_feed_style_id: u32,
+
     base_count_polys: usize,
     cities_count_points: usize,
     corridors_count_lines: usize,
@@ -332,12 +422,44 @@ struct ViewerState {
     perf_2d_line_segs: u32,
     perf_2d_points: u32,
 
+    // 2D viewport culling (WebGPU path): time-sliced rebuild of visible point/line instances.
+    cull2d_enabled: bool,
+    cull2d_geom_gen: u64,
+    cull2d_last_snapshot: Option<Cull2DSnapshot>,
+    cull2d_job: Option<Cull2DJob>,
+    cull2d_visible_points: u32,
+    cull2d_visible_line_segs: u32,
+
+    // GPU perf counters (best-effort; WebGPU path).
+    perf_gpu_upload_calls: u32,
+    perf_gpu_upload_bytes: u64,
+    perf_gpu_render_passes: u32,
+    perf_gpu_draw_calls: u32,
+    perf_gpu_draw_instances: u64,
+    perf_gpu_draw_vertices: u64,
+    perf_gpu_draw_indices: u64,
+    perf_gpu_frame_ms: f64,
+
+    // Labels (overlay canvas). This is intentionally a scaffold: incremental layout and batching.
+    labels_enabled: bool,
+    labels_gen: u64,
+    debug_labels: Vec<DebugLabel>,
+    labels2d_job: Option<Label2DJob>,
+    labels2d_last_snapshot: Option<Label2DSnapshot>,
+    labels2d_placed: Vec<PlacedLabel2D>,
+
     // Combined buffers (all visible layers), uploaded into the shared GPU buffers.
+    pending_styles: Option<Vec<Style>>,
     pending_cities: Option<Vec<CityVertex>>,
     pending_corridors: Option<Vec<CorridorVertex>>,
     pending_base_regions: Option<Vec<OverlayVertex>>,
     pending_regions: Option<Vec<OverlayVertex>>,
-    pending_terrain: Option<Vec<OverlayVertex>>,
+    pending_terrain: Option<Vec<TerrainVertex>>,
+    pending_base_regions2d: Option<Vec<Overlay2DVertex>>,
+    pending_regions2d: Option<Vec<Overlay2DVertex>>,
+    pending_points2d: Option<Vec<Point2DInstance>>,
+    pending_lines2d: Option<Vec<Segment2DInstance>>,
+    pending_grid2d: Option<Vec<Segment2DInstance>>,
     frame_index: u64,
     dt_s: f64,
     time_s: f64,
@@ -430,6 +552,9 @@ thread_local! {
 
         feed_layers: BTreeMap::new(),
 
+        feed_style_ids: BTreeMap::new(),
+        next_feed_style_id: 100,
+
         base_count_polys: 0,
         cities_count_points: 0,
         corridors_count_lines: 0,
@@ -449,11 +574,40 @@ thread_local! {
         perf_2d_poly_tris: 0,
         perf_2d_line_segs: 0,
         perf_2d_points: 0,
+
+        cull2d_enabled: true,
+        cull2d_geom_gen: 0,
+        cull2d_last_snapshot: None,
+        cull2d_job: None,
+        cull2d_visible_points: 0,
+        cull2d_visible_line_segs: 0,
+
+        perf_gpu_upload_calls: 0,
+        perf_gpu_upload_bytes: 0,
+        perf_gpu_render_passes: 0,
+        perf_gpu_draw_calls: 0,
+        perf_gpu_draw_instances: 0,
+        perf_gpu_draw_vertices: 0,
+        perf_gpu_draw_indices: 0,
+        perf_gpu_frame_ms: 0.0,
+
+        labels_enabled: true,
+        labels_gen: 0,
+        debug_labels: Vec::new(),
+        labels2d_job: None,
+        labels2d_last_snapshot: None,
+        labels2d_placed: Vec::new(),
+        pending_styles: None,
         pending_cities: None,
         pending_corridors: None,
         pending_base_regions: None,
         pending_regions: None,
         pending_terrain: None,
+        pending_base_regions2d: None,
+        pending_regions2d: None,
+        pending_points2d: None,
+        pending_lines2d: None,
+        pending_grid2d: None,
         frame_index: 0,
         dt_s: 1.0 / 60.0,
         time_s: 0.0,
@@ -700,6 +854,540 @@ fn unwrap_mercator_x_m(anchor_x_m: f64, x_m: f64) -> f64 {
     let ww = 2.0 * std::f64::consts::PI * WGS84_A;
     let dx = (x_m - anchor_x_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
     anchor_x_m + dx
+}
+
+fn wrap_dx_f32(dx: f32, ww: f32) -> f32 {
+    // Matches MAP2D_SHADER.wrap_dx: dx wrapped into [-ww/2, +ww/2].
+    let t = (dx + 0.5 * ww) / ww;
+    (dx + 0.5 * ww) - ww * t.floor() - 0.5 * ww
+}
+
+fn make_mercator_view_rect(
+    center_x: f32,
+    center_y: f32,
+    viewport_w_px: f32,
+    viewport_h_px: f32,
+    scale_px_per_m: f32,
+    world_width_m: f32,
+    pad_px: f32,
+) -> MercatorViewRect {
+    let inv_scale = 1.0 / scale_px_per_m.max(1e-6);
+    let pad_m = pad_px * inv_scale;
+    MercatorViewRect {
+        center_x,
+        center_y,
+        half_w_m: 0.5 * viewport_w_px * inv_scale + pad_m,
+        half_h_m: 0.5 * viewport_h_px * inv_scale + pad_m,
+        world_width_m,
+    }
+}
+
+fn mercator_point_visible(rect: MercatorViewRect, p: [f32; 2]) -> bool {
+    let dx = wrap_dx_f32(p[0] - rect.center_x, rect.world_width_m);
+    let dy = p[1] - rect.center_y;
+    dx.abs() <= rect.half_w_m && dy.abs() <= rect.half_h_m
+}
+
+fn mercator_segment_visible(rect: MercatorViewRect, a: [f32; 2], b: [f32; 2]) -> bool {
+    // Matches MAP2D_SHADER.vs_line unwrapping: wrap A near center, then keep B relative to A.
+    let ax_adj = rect.center_x + wrap_dx_f32(a[0] - rect.center_x, rect.world_width_m);
+    let bx_adj = ax_adj + (b[0] - a[0]);
+    let min_x = ax_adj.min(bx_adj);
+    let max_x = ax_adj.max(bx_adj);
+    let min_y = a[1].min(b[1]);
+    let max_y = a[1].max(b[1]);
+
+    let view_min_x = rect.center_x - rect.half_w_m;
+    let view_max_x = rect.center_x + rect.half_w_m;
+    let view_min_y = rect.center_y - rect.half_h_m;
+    let view_max_y = rect.center_y + rect.half_h_m;
+
+    !(max_x < view_min_x || min_x > view_max_x || max_y < view_min_y || min_y > view_max_y)
+}
+
+fn cull2d_should_restart(prev: Option<Cull2DSnapshot>, next: Cull2DSnapshot, ww: f32) -> bool {
+    let Some(prev) = prev else {
+        return true;
+    };
+    if prev.geom_gen != next.geom_gen {
+        return true;
+    }
+    if prev.show_points != next.show_points || prev.show_lines != next.show_lines {
+        return true;
+    }
+    if (prev.viewport_px[0] - next.viewport_px[0]).abs() > 0.5
+        || (prev.viewport_px[1] - next.viewport_px[1]).abs() > 0.5
+    {
+        return true;
+    }
+
+    // Avoid restarting on tiny camera changes so time-sliced jobs can complete.
+    // Restart when center shifts by ~25% of the viewport width or zoom changes significantly.
+    let prev_half_w_m = 0.5 * prev.viewport_px[0] / prev.scale_px_per_m.max(1e-6);
+    let prev_half_h_m = 0.5 * prev.viewport_px[1] / prev.scale_px_per_m.max(1e-6);
+    let shift_thresh = 0.25 * prev_half_w_m.min(prev_half_h_m).max(1.0);
+    let dx = wrap_dx_f32(next.center_m[0] - prev.center_m[0], ww);
+    let dy = next.center_m[1] - prev.center_m[1];
+    if dx.abs() > shift_thresh || dy.abs() > shift_thresh {
+        return true;
+    }
+
+    let scale_ratio = (next.scale_px_per_m / prev.scale_px_per_m.max(1e-6)).max(1e-6);
+    if !((1.0 / 1.15)..=1.15).contains(&scale_ratio) {
+        return true;
+    }
+
+    false
+}
+
+fn cull2d_start_job(
+    snapshot: Cull2DSnapshot,
+    rect: MercatorViewRect,
+    s: &ViewerState,
+) -> Cull2DJob {
+    let feed_keys = s.feed_layers.keys().cloned().collect::<Vec<_>>();
+    Cull2DJob {
+        snapshot,
+        rect,
+        cities_i: 0,
+        uploaded_i: 0,
+        feed_keys,
+        feed_layer_i: 0,
+        feed_point_i: 0,
+        selection_point_done: false,
+        corridors_seg_i: 0,
+        uploaded_corridors_seg_i: 0,
+        selection_seg_i: 0,
+
+        // Use sentinel so a completed empty result still uploads to clear old buffers.
+        last_uploaded_points: usize::MAX,
+        last_uploaded_lines: usize::MAX,
+        points_out: Vec::new(),
+        lines_out: Vec::new(),
+    }
+}
+
+fn cull2d_advance_job(
+    s: &ViewerState,
+    job: &mut Cull2DJob,
+    mut budget_points: usize,
+    mut budget_segs: usize,
+) -> bool {
+    // Points
+    if job.snapshot.show_points {
+        if !s.cities_style.visible {
+            job.cities_i = s.cities_mercator.as_deref().map(|v| v.len()).unwrap_or(0);
+        }
+        if !s.uploaded_points_style.visible {
+            job.uploaded_i = s.uploaded_mercator.as_deref().map(|v| v.len()).unwrap_or(0);
+        }
+        if !(s.selection_style.visible && s.selection_center_mercator.is_some()) {
+            job.selection_point_done = true;
+        }
+
+        if budget_points > 0 {
+            if s.cities_style.visible
+                && let Some(centers) = s.cities_mercator.as_deref()
+            {
+                while job.cities_i < centers.len() && budget_points > 0 {
+                    let c = centers[job.cities_i];
+                    if mercator_point_visible(job.rect, c) {
+                        job.points_out.push(Point2DInstance {
+                            center_m: c,
+                            style_id: STYLE_CITIES,
+                            _pad0: 0,
+                        });
+                    }
+                    job.cities_i += 1;
+                    budget_points -= 1;
+                }
+            } else if !s.cities_style.visible {
+                job.cities_i = s.cities_mercator.as_deref().map(|v| v.len()).unwrap_or(0);
+            } else {
+                job.cities_i = usize::MAX;
+            }
+        }
+
+        if budget_points > 0 {
+            if s.uploaded_points_style.visible
+                && let Some(centers) = s.uploaded_mercator.as_deref()
+            {
+                while job.uploaded_i < centers.len() && budget_points > 0 {
+                    let c = centers[job.uploaded_i];
+                    if mercator_point_visible(job.rect, c) {
+                        job.points_out.push(Point2DInstance {
+                            center_m: c,
+                            style_id: STYLE_UPLOADED_POINTS,
+                            _pad0: 0,
+                        });
+                    }
+                    job.uploaded_i += 1;
+                    budget_points -= 1;
+                }
+            } else if !s.uploaded_points_style.visible {
+                job.uploaded_i = s.uploaded_mercator.as_deref().map(|v| v.len()).unwrap_or(0);
+            } else {
+                job.uploaded_i = usize::MAX;
+            }
+        }
+
+        while budget_points > 0 && job.feed_layer_i < job.feed_keys.len() {
+            let key = &job.feed_keys[job.feed_layer_i];
+            let Some(layer) = s.feed_layers.get(key) else {
+                job.feed_layer_i += 1;
+                job.feed_point_i = 0;
+                continue;
+            };
+            if !layer.style.visible || layer.centers_mercator.is_empty() {
+                job.feed_layer_i += 1;
+                job.feed_point_i = 0;
+                continue;
+            }
+            let style_id = s.feed_style_ids.get(key).copied().unwrap_or(STYLE_DEFAULT);
+            while job.feed_point_i < layer.centers_mercator.len() && budget_points > 0 {
+                let c = layer.centers_mercator[job.feed_point_i];
+                if mercator_point_visible(job.rect, c) {
+                    job.points_out.push(Point2DInstance {
+                        center_m: c,
+                        style_id,
+                        _pad0: 0,
+                    });
+                }
+                job.feed_point_i += 1;
+                budget_points -= 1;
+            }
+            if job.feed_point_i >= layer.centers_mercator.len() {
+                job.feed_layer_i += 1;
+                job.feed_point_i = 0;
+            }
+        }
+
+        if budget_points > 0 && !job.selection_point_done {
+            job.selection_point_done = true;
+            if let Some(c) = s.selection_center_mercator
+                && mercator_point_visible(job.rect, c)
+            {
+                job.points_out.push(Point2DInstance {
+                    center_m: c,
+                    style_id: STYLE_SELECTION_POINT,
+                    _pad0: 0,
+                });
+            }
+        }
+    }
+
+    // Lines (segments)
+    if job.snapshot.show_lines {
+        if !s.corridors_style.visible {
+            job.corridors_seg_i = s
+                .corridors_mercator
+                .as_deref()
+                .map(|v| v.len() / 2)
+                .unwrap_or(0);
+        }
+        if !s.uploaded_corridors_style.visible {
+            job.uploaded_corridors_seg_i = s
+                .uploaded_corridors_mercator
+                .as_deref()
+                .map(|v| v.len() / 2)
+                .unwrap_or(0);
+        }
+        if !(s.selection_style.visible && s.selection_line_mercator.is_some()) {
+            job.selection_seg_i = s
+                .selection_line_mercator
+                .as_deref()
+                .map(|v| v.len() / 2)
+                .unwrap_or(0);
+        }
+
+        if budget_segs > 0 {
+            if s.corridors_style.visible
+                && let Some(pos) = s.corridors_mercator.as_deref()
+            {
+                let segs_total = pos.len() / 2;
+                while job.corridors_seg_i < segs_total && budget_segs > 0 {
+                    let i = job.corridors_seg_i * 2;
+                    let a = pos[i];
+                    let b = pos[i + 1];
+                    if mercator_segment_visible(job.rect, a, b) {
+                        job.lines_out.push(Segment2DInstance {
+                            a_m: a,
+                            b_m: b,
+                            style_id: STYLE_CORRIDORS,
+                            _pad0: 0,
+                        });
+                    }
+                    job.corridors_seg_i += 1;
+                    budget_segs -= 1;
+                }
+            } else if !s.corridors_style.visible {
+                job.corridors_seg_i = s
+                    .corridors_mercator
+                    .as_deref()
+                    .map(|v| v.len() / 2)
+                    .unwrap_or(0);
+            } else {
+                job.corridors_seg_i = usize::MAX;
+            }
+        }
+
+        if budget_segs > 0 {
+            if s.uploaded_corridors_style.visible
+                && let Some(pos) = s.uploaded_corridors_mercator.as_deref()
+            {
+                let segs_total = pos.len() / 2;
+                while job.uploaded_corridors_seg_i < segs_total && budget_segs > 0 {
+                    let i = job.uploaded_corridors_seg_i * 2;
+                    let a = pos[i];
+                    let b = pos[i + 1];
+                    if mercator_segment_visible(job.rect, a, b) {
+                        job.lines_out.push(Segment2DInstance {
+                            a_m: a,
+                            b_m: b,
+                            style_id: STYLE_UPLOADED_CORRIDORS,
+                            _pad0: 0,
+                        });
+                    }
+                    job.uploaded_corridors_seg_i += 1;
+                    budget_segs -= 1;
+                }
+            } else if !s.uploaded_corridors_style.visible {
+                job.uploaded_corridors_seg_i = s
+                    .uploaded_corridors_mercator
+                    .as_deref()
+                    .map(|v| v.len() / 2)
+                    .unwrap_or(0);
+            } else {
+                job.uploaded_corridors_seg_i = usize::MAX;
+            }
+        }
+
+        if budget_segs > 0 {
+            if s.selection_style.visible
+                && let Some(pos) = s.selection_line_mercator.as_deref()
+            {
+                let segs_total = pos.len() / 2;
+                while job.selection_seg_i < segs_total && budget_segs > 0 {
+                    let i = job.selection_seg_i * 2;
+                    let a = pos[i];
+                    let b = pos[i + 1];
+                    if mercator_segment_visible(job.rect, a, b) {
+                        job.lines_out.push(Segment2DInstance {
+                            a_m: a,
+                            b_m: b,
+                            style_id: STYLE_SELECTION_LINE,
+                            _pad0: 0,
+                        });
+                    }
+                    job.selection_seg_i += 1;
+                    budget_segs -= 1;
+                }
+            } else {
+                job.selection_seg_i = usize::MAX;
+            }
+        }
+    }
+
+    // Completion check
+    let points_done = !job.snapshot.show_points
+        || (job.cities_i >= s.cities_mercator.as_deref().map(|v| v.len()).unwrap_or(0)
+            && job.uploaded_i >= s.uploaded_mercator.as_deref().map(|v| v.len()).unwrap_or(0)
+            && job.feed_layer_i >= job.feed_keys.len()
+            && job.selection_point_done);
+
+    let lines_done = !job.snapshot.show_lines
+        || (job.corridors_seg_i
+            >= s.corridors_mercator
+                .as_deref()
+                .map(|v| v.len() / 2)
+                .unwrap_or(0)
+            && job.uploaded_corridors_seg_i
+                >= s.uploaded_corridors_mercator
+                    .as_deref()
+                    .map(|v| v.len() / 2)
+                    .unwrap_or(0)
+            && job.selection_seg_i
+                >= s.selection_line_mercator
+                    .as_deref()
+                    .map(|v| v.len() / 2)
+                    .unwrap_or(0));
+
+    points_done && lines_done
+}
+
+fn label2d_should_restart(prev: Option<Label2DSnapshot>, next: Label2DSnapshot) -> bool {
+    let Some(prev) = prev else {
+        return true;
+    };
+    if prev.generation != next.generation {
+        return true;
+    }
+    // Restart if viewport changes materially.
+    if (prev.viewport_px[0] - next.viewport_px[0]).abs() > 0.5
+        || (prev.viewport_px[1] - next.viewport_px[1]).abs() > 0.5
+    {
+        return true;
+    }
+    // Restart if camera moved enough that label positions change.
+    let dlon = (next.cam.center_lon_deg - prev.cam.center_lon_deg).abs();
+    let dlat = (next.cam.center_lat_deg - prev.cam.center_lat_deg).abs();
+    if dlon > 0.05 || dlat > 0.05 {
+        return true;
+    }
+    let z_ratio = (next.cam.zoom / prev.cam.zoom.max(1e-9)).max(1e-9);
+    if !((1.0 / 1.1)..=1.1).contains(&z_ratio) {
+        return true;
+    }
+    false
+}
+
+fn label2d_cell_key(cx: i32, cy: i32) -> u64 {
+    ((cx as u32 as u64) << 32) | (cy as u32 as u64)
+}
+
+fn label2d_try_place(
+    occupied: &mut std::collections::HashSet<u64>,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+) -> bool {
+    // Coarse collision: grid-based occupancy.
+    // This is cheap and good enough for a scaffold.
+    let cell_w = 120.0;
+    let cell_h = 28.0;
+    if !(x.is_finite() && y.is_finite()) {
+        return false;
+    }
+    if x < 4.0 || x > (w - 4.0) || y < 4.0 || y > (h - 4.0) {
+        return false;
+    }
+
+    let cx = (x / cell_w).floor() as i32;
+    let cy = (y / cell_h).floor() as i32;
+    // Reserve a small neighborhood to reduce overlaps.
+    for oy in -1..=1 {
+        for ox in -1..=1 {
+            let k = label2d_cell_key(cx + ox, cy + oy);
+            if occupied.contains(&k) {
+                return false;
+            }
+        }
+    }
+    for oy in -1..=1 {
+        for ox in -1..=1 {
+            occupied.insert(label2d_cell_key(cx + ox, cy + oy));
+        }
+    }
+    true
+}
+
+fn label2d_build_candidates(s: &ViewerState) -> Vec<Label2DCandidate> {
+    let mut out: Vec<Label2DCandidate> = Vec::new();
+
+    // Selection label (highest priority).
+    if s.selection_style.visible
+        && let Some(c) = s.selection_center_mercator
+    {
+        let lon = wrap_lon_deg(inverse_mercator_lon_deg(c[0] as f64));
+        let lat = inverse_mercator_lat_deg(c[1] as f64);
+        out.push(Label2DCandidate {
+            text: format!("Selected ({lon:.5}, {lat:.5})"),
+            mercator_m: c,
+            priority: 10_000.0,
+        });
+    }
+
+    // User-supplied debug labels.
+    for dl in &s.debug_labels {
+        out.push(Label2DCandidate {
+            text: dl.text.clone(),
+            mercator_m: dl.mercator_m,
+            priority: dl.priority,
+        });
+    }
+
+    // Highest priority first.
+    out.sort_by(|a, b| {
+        b.priority
+            .partial_cmp(&a.priority)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    out
+}
+
+fn label2d_start_job(snapshot: Label2DSnapshot, candidates: Vec<Label2DCandidate>) -> Label2DJob {
+    Label2DJob {
+        snapshot,
+        candidates,
+        i: 0,
+        occupied_cells: std::collections::HashSet::new(),
+        placed: Vec::new(),
+    }
+}
+
+fn label2d_advance_job(
+    job: &mut Label2DJob,
+    projector: &MercatorProjector,
+    w: f32,
+    h: f32,
+    budget: usize,
+) -> bool {
+    let mut remaining = budget;
+    while job.i < job.candidates.len() && remaining > 0 {
+        let c = &job.candidates[job.i];
+        job.i += 1;
+        remaining -= 1;
+
+        let (x, y) = projector.project_mercator_m(
+            c.mercator_m[0] as f64,
+            c.mercator_m[1] as f64,
+            w as f64,
+            h as f64,
+        );
+        let x = x as f32;
+        let y = y as f32;
+
+        if label2d_try_place(&mut job.occupied_cells, x, y, w, h) {
+            job.placed.push(PlacedLabel2D {
+                text: c.text.clone(),
+                x_px: x,
+                y_px: y,
+                priority: c.priority,
+            });
+            if job.placed.len() >= 2000 {
+                break;
+            }
+        }
+    }
+
+    job.i >= job.candidates.len() || job.placed.len() >= 2000
+}
+
+fn render_labels2d_overlay(ctx2d: &CanvasRenderingContext2d, labels: &[PlacedLabel2D]) {
+    // Render as an overlay. Keep this conservative and readable.
+    ctx2d.set_font("12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif");
+    ctx2d.set_text_align("left");
+    ctx2d.set_text_baseline("middle");
+
+    // Draw in priority order (already sorted) so high-priority labels land on top.
+    for l in labels {
+        // Priority -> alpha ramp (kept subtle).
+        let a = (0.70 + 0.30 * (l.priority / 10_000.0).clamp(0.0, 1.0)) as f64;
+        ctx2d.set_global_alpha(a);
+        let x = l.x_px as f64 + 6.0;
+        let y = l.y_px as f64 - 10.0;
+        // Outline for contrast.
+        ctx_set_stroke_style(ctx2d, "rgba(0,0,0,0.85)");
+        ctx2d.set_line_width(3.5);
+        let _ = ctx2d.stroke_text(&l.text, x, y);
+        // Fill.
+        ctx_set_fill_style(ctx2d, "rgba(255,255,255,0.92)");
+        let _ = ctx2d.fill_text(&l.text, x, y);
+    }
+
+    // Restore default alpha for any other overlay drawing.
+    ctx2d.set_global_alpha(1.0);
 }
 
 fn clip_polygon_lat_band(mut poly: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
@@ -1298,9 +1986,11 @@ fn render_scene() -> Result<(), JsValue> {
     };
     match mode {
         ViewMode::ThreeD => {
+            let t0 = now_ms();
             let _ = STATE.try_with(|state_ref| {
                 let state = state_ref.borrow();
                 if let Some(ctx) = &state.wgpu {
+                    perf_reset(ctx);
                     let view_proj =
                         camera_view_proj(state.camera, state.canvas_width, state.canvas_height);
 
@@ -1330,10 +2020,114 @@ fn render_scene() -> Result<(), JsValue> {
                     );
                 }
             });
+
+            // Snapshot GPU counters for this frame.
+            let t1 = now_ms();
+            let _ = STATE.try_with(|state_ref| {
+                let mut s = state_ref.borrow_mut();
+                if let Some(ctx) = &s.wgpu {
+                    let snap = perf_snapshot(ctx);
+                    s.perf_gpu_upload_calls = snap.upload_calls;
+                    s.perf_gpu_upload_bytes = snap.upload_bytes;
+                    s.perf_gpu_render_passes = snap.render_passes;
+                    s.perf_gpu_draw_calls = snap.draw_calls;
+                    s.perf_gpu_draw_instances = snap.draw_instances;
+                    s.perf_gpu_draw_vertices = snap.draw_vertices;
+                    s.perf_gpu_draw_indices = snap.draw_indices;
+                    s.perf_gpu_frame_ms = (t1 - t0).max(0.0);
+                }
+            });
+
+            // Draw overlay labels on the 2D canvas (selection/debug labels).
+            // Keep this separate from the WebGPU pass to avoid text/GPU complexity.
+            render_labels_overlay_3d();
             Ok(())
         }
-        ViewMode::TwoD => render_scene_2d(),
+        ViewMode::TwoD => {
+            if with_state(|state| state.borrow().wgpu.is_some()) {
+                render_scene_2d_wgpu()
+            } else {
+                render_scene_2d()
+            }
+        }
     }
+}
+
+fn project_viewer_to_screen(
+    view_proj: [[f32; 4]; 4],
+    p: [f32; 3],
+    w: f32,
+    h: f32,
+) -> Option<(f32, f32)> {
+    let clip = mat4_mul_vec4(view_proj, [p[0], p[1], p[2], 1.0]);
+    if !clip[0].is_finite() || !clip[1].is_finite() || !clip[3].is_finite() {
+        return None;
+    }
+    if clip[3].abs() < 1e-6 {
+        return None;
+    }
+    let ndc_x = clip[0] / clip[3];
+    let ndc_y = clip[1] / clip[3];
+    if !(ndc_x.is_finite() && ndc_y.is_finite()) {
+        return None;
+    }
+    let sx = (ndc_x * 0.5 + 0.5) * w;
+    let sy = (1.0 - (ndc_y * 0.5 + 0.5)) * h;
+    Some((sx, sy))
+}
+
+fn render_labels_overlay_3d() {
+    let _ = STATE.try_with(|state_ref| {
+        let s = state_ref.borrow();
+        let Some(ctx2d) = s.ctx_2d.as_ref() else {
+            return;
+        };
+
+        // Clear the overlay each frame.
+        let w = s.canvas_width.max(1.0);
+        let h = s.canvas_height.max(1.0);
+        ctx2d.clear_rect(0.0, 0.0, w, h);
+
+        if !s.labels_enabled {
+            return;
+        }
+
+        let view_proj = camera_view_proj(s.camera, s.canvas_width, s.canvas_height);
+        let wf = w as f32;
+        let hf = h as f32;
+
+        // Assemble a small set of labels.
+        let mut labels: Vec<(f32, String, [f32; 3])> = Vec::new();
+        if s.selection_style.visible
+            && let Some(p) = s.selection_center
+        {
+            labels.push((10_000.0, "Selected".to_string(), p));
+        }
+        for dl in &s.debug_labels {
+            labels.push((dl.priority, dl.text.clone(), dl.viewer_pos));
+        }
+        labels.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+        ctx2d.set_font("12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif");
+        ctx2d.set_text_align("left");
+        ctx2d.set_text_baseline("middle");
+
+        for (_prio, text, pos) in labels.iter().take(256) {
+            let Some((sx, sy)) = project_viewer_to_screen(view_proj, *pos, wf, hf) else {
+                continue;
+            };
+            if sx < 0.0 || sx > wf || sy < 0.0 || sy > hf {
+                continue;
+            }
+            let x = sx as f64 + 6.0;
+            let y = sy as f64 - 10.0;
+            ctx_set_stroke_style(ctx2d, "rgba(0,0,0,0.85)");
+            ctx2d.set_line_width(3.5);
+            let _ = ctx2d.stroke_text(text, x, y);
+            ctx_set_fill_style(ctx2d, "rgba(255,255,255,0.92)");
+            let _ = ctx2d.fill_text(text, x, y);
+        }
+    });
 }
 
 /// Perf stats collected during a 2D render pass.
@@ -1793,6 +2587,306 @@ fn render_scene_2d() -> Result<(), JsValue> {
     Ok(())
 }
 
+fn render_scene_2d_wgpu() -> Result<(), JsValue> {
+    let t0 = now_ms();
+    match STATE.try_with(|state_ref| {
+        let mut state = state_ref.borrow_mut();
+        if state.wgpu.is_none() {
+            return Ok(());
+        }
+
+        // Reset per-frame GPU counters (used for metrics UI).
+        if let Some(ctx) = state.wgpu.as_ref() {
+            perf_reset(ctx);
+        }
+
+        // If the 2D canvas is visible (it remains the input target), keep it transparent so it
+        // doesn't occlude the WebGPU output.
+        if let Some(ctx2d) = state.ctx_2d.as_ref() {
+            let w = state.canvas_width.max(1.0);
+            let h = state.canvas_height.max(1.0);
+            ctx2d.clear_rect(0.0, 0.0, w, h);
+        }
+
+        let w = state.canvas_width.max(1.0);
+        let h = state.canvas_height.max(1.0);
+
+        let center_x = mercator_x_m(state.camera_2d.center_lon_deg) as f32;
+        let center_y = mercator_y_m(state.camera_2d.center_lat_deg) as f32;
+        let scale_px_per_m = camera2d_scale_px_per_m(state.camera_2d, w, h) as f32;
+        let world_width_m = (2.0 * std::f64::consts::PI * WGS84_A) as f32;
+
+        let globals2d = Globals2D {
+            center_m: [center_x, center_y],
+            scale_px_per_m,
+            world_width_m,
+            viewport_px: [w as f32, h as f32],
+            _pad0: [0.0, 0.0],
+        };
+
+        let any_feed_points = state
+            .feed_layers
+            .values()
+            .any(|layer| layer.style.visible && !layer.centers_mercator.is_empty());
+
+        let show_graticule = state.show_graticule;
+        let show_base_regions = state.base_regions_style.visible;
+        let show_regions = state.regions_style.visible
+            || state.uploaded_regions_style.visible
+            || (state.selection_style.visible && state.selection_poly_mercator.is_some());
+        let show_lines = state.corridors_style.visible
+            || state.uploaded_corridors_style.visible
+            || (state.selection_style.visible && state.selection_line_mercator.is_some());
+        let show_points = state.cities_style.visible
+            || state.uploaded_points_style.visible
+            || any_feed_points
+            || (state.selection_style.visible && state.selection_center_mercator.is_some());
+
+        // Time-sliced 2D viewport culling for points/lines.
+        // This keeps pan/zoom responsive on large datasets by uploading only visible instances.
+        let snapshot = Cull2DSnapshot {
+            center_m: [center_x, center_y],
+            scale_px_per_m,
+            viewport_px: [w as f32, h as f32],
+            show_points,
+            show_lines,
+            geom_gen: state.cull2d_geom_gen,
+        };
+
+        if state.cull2d_enabled && (show_points || show_lines) {
+            let pad_px = (state.city_marker_size.max(state.line_width_px * 0.5 + 2.0))
+                .clamp(4.0, 96.0)
+                + 8.0;
+            let rect = make_mercator_view_rect(
+                center_x,
+                center_y,
+                w as f32,
+                h as f32,
+                scale_px_per_m,
+                world_width_m,
+                pad_px,
+            );
+
+            let need_restart = if let Some(job) = state.cull2d_job.as_ref() {
+                cull2d_should_restart(Some(job.snapshot), snapshot, rect.world_width_m)
+            } else {
+                cull2d_should_restart(state.cull2d_last_snapshot, snapshot, rect.world_width_m)
+            };
+            if need_restart {
+                let job = {
+                    let s_ro: &ViewerState = &state;
+                    cull2d_start_job(snapshot, rect, s_ro)
+                };
+                state.cull2d_job = Some(job);
+            }
+
+            if let Some(mut job) = state.cull2d_job.take() {
+                // If the camera drifted far from the job snapshot, restart to avoid uploading stale results.
+                if cull2d_should_restart(Some(job.snapshot), snapshot, rect.world_width_m) {
+                    let new_job = {
+                        let s_ro: &ViewerState = &state;
+                        cull2d_start_job(snapshot, rect, s_ro)
+                    };
+                    job = new_job;
+                }
+
+                let done = {
+                    let s_ro: &ViewerState = &state;
+                    cull2d_advance_job(s_ro, &mut job, 50_000, 50_000)
+                };
+
+                // Progressive upload: keep the on-screen buffers close to the view while the
+                // time-sliced culling job is still running.
+                if let Some(ctx_mut) = state.wgpu.as_mut() {
+                    let want_upload_points = job.snapshot.show_points
+                        && job.points_out.len() != job.last_uploaded_points
+                        && (done || !job.points_out.is_empty());
+                    if want_upload_points {
+                        set_points2d_instances(ctx_mut, &job.points_out);
+                        job.last_uploaded_points = job.points_out.len();
+                    }
+
+                    let want_upload_lines = job.snapshot.show_lines
+                        && job.lines_out.len() != job.last_uploaded_lines
+                        && (done || !job.lines_out.is_empty());
+                    if want_upload_lines {
+                        set_lines2d_instances(ctx_mut, &job.lines_out);
+                        job.last_uploaded_lines = job.lines_out.len();
+                    }
+                }
+
+                if done {
+                    state.cull2d_last_snapshot = Some(job.snapshot);
+                    state.cull2d_visible_points = job.points_out.len() as u32;
+                    state.cull2d_visible_line_segs = job.lines_out.len() as u32;
+                } else {
+                    state.cull2d_job = Some(job);
+                }
+            }
+        } else {
+            state.cull2d_job = None;
+            state.cull2d_last_snapshot = None;
+            state.cull2d_visible_points = 0;
+            state.cull2d_visible_line_segs = 0;
+        }
+
+        let ctx = state.wgpu.as_ref().unwrap();
+
+        let res = render_map2d(
+            ctx,
+            globals2d,
+            show_graticule,
+            show_base_regions,
+            show_regions,
+            show_lines,
+            show_points,
+        );
+
+        // Labels overlay (Canvas2D): layout is time-sliced and drawn on top.
+        if state.labels_enabled
+            && let Some(ctx2d) = state.ctx_2d.clone()
+        {
+            let snapshot = Label2DSnapshot {
+                cam: state.camera_2d,
+                viewport_px: [w as f32, h as f32],
+                generation: state.labels_gen,
+            };
+
+            let need_restart = if let Some(job) = state.labels2d_job.as_ref() {
+                label2d_should_restart(Some(job.snapshot), snapshot)
+            } else {
+                label2d_should_restart(state.labels2d_last_snapshot, snapshot)
+            };
+
+            if need_restart {
+                let candidates = {
+                    let s_ro: &ViewerState = &state;
+                    label2d_build_candidates(s_ro)
+                };
+                state.labels2d_job = Some(label2d_start_job(snapshot, candidates));
+                state.labels2d_placed.clear();
+            }
+
+            let projector = MercatorProjector::new(state.camera_2d, w, h);
+            if let Some(mut job) = state.labels2d_job.take() {
+                let done = label2d_advance_job(&mut job, &projector, w as f32, h as f32, 250);
+                // Render progressively.
+                state.labels2d_placed = job.placed.clone();
+                if done {
+                    state.labels2d_last_snapshot = Some(job.snapshot);
+                    state.labels2d_job = None;
+                } else {
+                    state.labels2d_job = Some(job);
+                }
+            }
+
+            render_labels2d_overlay(&ctx2d, &state.labels2d_placed);
+        }
+
+        let t1 = now_ms();
+        state.perf_2d_total_ms = t1 - t0;
+        state.perf_2d_poly_ms = 0.0;
+        state.perf_2d_line_ms = 0.0;
+        state.perf_2d_point_ms = 0.0;
+
+        let mut tris: u32 = 0;
+        if state.base_regions_style.visible
+            && let Some(pos) = state.base_regions_mercator.as_deref()
+        {
+            tris = tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+        }
+        if state.regions_style.visible
+            && let Some(pos) = state.regions_mercator.as_deref()
+        {
+            tris = tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+        }
+        if state.uploaded_regions_style.visible
+            && let Some(pos) = state.uploaded_regions_mercator.as_deref()
+        {
+            tris = tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+        }
+        if state.selection_style.visible
+            && let Some(pos) = state.selection_poly_mercator.as_deref()
+        {
+            tris = tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+        }
+
+        let mut segs: u32 = 0;
+        if state.cull2d_enabled {
+            segs = if show_lines {
+                state.cull2d_visible_line_segs
+            } else {
+                0
+            };
+        } else {
+            if state.corridors_style.visible
+                && let Some(pos) = state.corridors_mercator.as_deref()
+            {
+                segs = segs.saturating_add((pos.len() / 2).min(1_500_000) as u32);
+            }
+            if state.uploaded_corridors_style.visible
+                && let Some(pos) = state.uploaded_corridors_mercator.as_deref()
+            {
+                segs = segs.saturating_add((pos.len() / 2).min(1_500_000) as u32);
+            }
+            if state.selection_style.visible
+                && let Some(pos) = state.selection_line_mercator.as_deref()
+            {
+                segs = segs.saturating_add((pos.len() / 2).min(1_500_000) as u32);
+            }
+        }
+
+        let mut pts: u32 = 0;
+        if state.cull2d_enabled {
+            pts = if show_points {
+                state.cull2d_visible_points
+            } else {
+                0
+            };
+        } else {
+            if state.cities_style.visible
+                && let Some(pos) = state.cities_mercator.as_deref()
+            {
+                pts = pts.saturating_add(pos.len().min(2_000_000) as u32);
+            }
+            if state.uploaded_points_style.visible
+                && let Some(pos) = state.uploaded_mercator.as_deref()
+            {
+                pts = pts.saturating_add(pos.len().min(2_000_000) as u32);
+            }
+            for layer in state.feed_layers.values() {
+                if layer.style.visible {
+                    pts = pts.saturating_add(layer.centers_mercator.len().min(2_000_000) as u32);
+                }
+            }
+            if state.selection_style.visible && state.selection_center_mercator.is_some() {
+                pts = pts.saturating_add(1);
+            }
+        }
+
+        state.perf_2d_poly_tris = tris;
+        state.perf_2d_line_segs = segs;
+        state.perf_2d_points = pts;
+
+        // Snapshot GPU counters for this frame.
+        if let Some(ctx) = state.wgpu.as_ref() {
+            let snap = perf_snapshot(ctx);
+            state.perf_gpu_upload_calls = snap.upload_calls;
+            state.perf_gpu_upload_bytes = snap.upload_bytes;
+            state.perf_gpu_render_passes = snap.render_passes;
+            state.perf_gpu_draw_calls = snap.draw_calls;
+            state.perf_gpu_draw_instances = snap.draw_instances;
+            state.perf_gpu_draw_vertices = snap.draw_vertices;
+            state.perf_gpu_draw_indices = snap.draw_indices;
+            state.perf_gpu_frame_ms = (t1 - t0).max(0.0);
+        }
+        res
+    }) {
+        Ok(res) => res,
+        Err(_) => Ok(()),
+    }
+}
+
 #[wasm_bindgen]
 pub fn get_2d_perf_stats() -> Result<JsValue, JsValue> {
     let out = js_sys::Object::new();
@@ -1846,50 +2940,85 @@ pub fn get_2d_perf_stats() -> Result<JsValue, JsValue> {
     Ok(out.into())
 }
 
-fn build_city_vertices(
-    centers: &[[f32; 3]],
-    size_px: f32,
-    color: [f32; 4],
-    lift: f32,
-) -> Vec<CityVertex> {
-    let size_px = size_px.clamp(1.0, 64.0);
+#[wasm_bindgen]
+pub fn get_gpu_perf_stats() -> Result<JsValue, JsValue> {
+    let out = js_sys::Object::new();
+    let (upload_calls, upload_bytes, passes, draw_calls, inst, vtx, idx, frame_ms) =
+        with_state(|state| {
+            let s = state.borrow();
+            (
+                s.perf_gpu_upload_calls,
+                s.perf_gpu_upload_bytes,
+                s.perf_gpu_render_passes,
+                s.perf_gpu_draw_calls,
+                s.perf_gpu_draw_instances,
+                s.perf_gpu_draw_vertices,
+                s.perf_gpu_draw_indices,
+                s.perf_gpu_frame_ms,
+            )
+        });
 
-    // `lift` is a fraction of Earth radius (legacy UI semantics); convert to meters.
-    let mut lift_m = lift * (WGS84_A as f32);
-    if lift_m <= 0.0 {
-        // Keep points slightly above the surface to avoid z-fighting.
-        lift_m = 50.0;
-    }
+    let mbps = if frame_ms > 0.0 {
+        (upload_bytes as f64) / (1024.0 * 1024.0) / (frame_ms / 1000.0)
+    } else {
+        0.0
+    };
 
-    let mut out: Vec<CityVertex> = Vec::with_capacity(centers.len() * 6);
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("frame_ms"),
+        &JsValue::from_f64(frame_ms),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("upload_calls"),
+        &JsValue::from_f64(upload_calls as f64),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("upload_bytes"),
+        &JsValue::from_f64(upload_bytes as f64),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("upload_mib_per_s"),
+        &JsValue::from_f64(mbps),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("render_passes"),
+        &JsValue::from_f64(passes as f64),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("draw_calls"),
+        &JsValue::from_f64(draw_calls as f64),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("draw_instances"),
+        &JsValue::from_f64(inst as f64),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("draw_vertices"),
+        &JsValue::from_f64(vtx as f64),
+    )?;
+    js_sys::Reflect::set(
+        &out,
+        &JsValue::from_str("draw_indices"),
+        &JsValue::from_f64(idx as f64),
+    )?;
+    Ok(out.into())
+}
+
+fn build_city_vertices(centers: &[[f32; 3]], style_id: u32) -> Vec<CityVertex> {
+    let mut out: Vec<CityVertex> = Vec::with_capacity(centers.len());
     for &c in centers {
-        let v0 = CityVertex {
+        out.push(CityVertex {
             center: c,
-            lift: lift_m,
-            offset_px: [-size_px, -size_px],
-            color,
-        };
-        let v1 = CityVertex {
-            center: c,
-            lift: lift_m,
-            offset_px: [size_px, -size_px],
-            color,
-        };
-        let v2 = CityVertex {
-            center: c,
-            lift: lift_m,
-            offset_px: [size_px, size_px],
-            color,
-        };
-        let v3 = CityVertex {
-            center: c,
-            lift: lift_m,
-            offset_px: [-size_px, size_px],
-            color,
-        };
-
-        // Two triangles: (v0,v1,v2) and (v0,v2,v3)
-        out.extend([v0, v1, v2, v0, v2, v3]);
+            style_id,
+        });
     }
     out
 }
@@ -1961,46 +3090,17 @@ fn world_from_vector_chunk(
     world
 }
 
-fn build_corridor_vertices(
-    positions_line_list: &[[f32; 3]],
-    width_px: f32,
-    color: [f32; 4],
-    lift: f32,
-) -> Vec<CorridorVertex> {
-    let width_px = width_px.clamp(1.0, 24.0);
-    // `lift` is a fraction of Earth radius (legacy UI semantics); convert to meters.
-    let mut lift_m = lift * (WGS84_A as f32);
-    if lift_m <= 0.0 {
-        // Keep corridors slightly above the surface to avoid z-fighting.
-        lift_m = 50.0;
-    }
+fn build_corridor_vertices(positions_line_list: &[[f32; 3]], style_id: u32) -> Vec<CorridorVertex> {
     let seg_count = positions_line_list.len() / 2;
-    let mut out: Vec<CorridorVertex> = Vec::with_capacity(seg_count.saturating_mul(6));
+    let mut out: Vec<CorridorVertex> = Vec::with_capacity(seg_count);
 
     let push_segment = |out: &mut Vec<CorridorVertex>, a: [f32; 3], b: [f32; 3]| {
-        let v00 = CorridorVertex {
+        out.push(CorridorVertex {
             a,
+            _pad0: 0,
             b,
-            along: 0.0,
-            side: -1.0,
-            lift: lift_m,
-            width_px,
-            color,
-        };
-        let v01 = CorridorVertex { side: 1.0, ..v00 };
-        let v11 = CorridorVertex {
-            along: 1.0,
-            side: 1.0,
-            ..v00
-        };
-        let v10 = CorridorVertex {
-            along: 1.0,
-            side: -1.0,
-            ..v00
-        };
-
-        // Two triangles for the segment quad.
-        out.extend([v00, v01, v11, v00, v11, v10]);
+            style_id,
+        });
     };
 
     const MAX_SEGMENTS: usize = 1_500_000;
@@ -2057,6 +3157,148 @@ fn build_corridor_vertices(
 
     out
 }
+// Stable GPU style IDs. Geometry references these IDs so we can update style values
+// without rebuilding / re-uploading geometry.
+const STYLE_DEFAULT: u32 = 0;
+const STYLE_BASE_REGIONS: u32 = 1;
+const STYLE_REGIONS: u32 = 2;
+const STYLE_UPLOADED_REGIONS: u32 = 3;
+const STYLE_SELECTION_POLY: u32 = 4;
+
+const STYLE_CITIES: u32 = 10;
+const STYLE_UPLOADED_POINTS: u32 = 11;
+const STYLE_SELECTION_POINT: u32 = 12;
+
+const STYLE_CORRIDORS: u32 = 20;
+const STYLE_UPLOADED_CORRIDORS: u32 = 21;
+const STYLE_SELECTION_LINE: u32 = 22;
+
+const STYLE_GRATICULE_2D: u32 = 30;
+
+fn feed_style_id(s: &mut ViewerState, feed_layer_id: &str) -> u32 {
+    if let Some(id) = s.feed_style_ids.get(feed_layer_id).copied() {
+        return id;
+    }
+    let id = s.next_feed_style_id.max(100);
+    s.next_feed_style_id = id.saturating_add(1);
+    s.feed_style_ids.insert(feed_layer_id.to_string(), id);
+    id
+}
+
+fn default_style() -> Style {
+    Style {
+        color: [1.0, 1.0, 1.0, 1.0],
+        lift_m: 0.0,
+        size_px: 3.0,
+        width_px: 1.0,
+        _pad0: 0.0,
+    }
+}
+
+fn style_from_layer(style: LayerStyle, lift_default_m: f32, size_px: f32, width_px: f32) -> Style {
+    let mut lift_m = style.lift * (WGS84_A as f32);
+    if lift_m <= 0.0 {
+        lift_m = lift_default_m;
+    }
+    Style {
+        color: style.color,
+        lift_m,
+        size_px,
+        width_px,
+        _pad0: 0.0,
+    }
+}
+
+fn rebuild_styles_table(s: &mut ViewerState) -> Vec<Style> {
+    // Ensure all current feed layers have a stable ID.
+    let feed_layer_ids: Vec<String> = s.feed_layers.keys().cloned().collect();
+    for feed_layer_id in &feed_layer_ids {
+        let _ = feed_style_id(s, feed_layer_id);
+    }
+
+    let mut max_id = STYLE_SELECTION_LINE.max(STYLE_GRATICULE_2D);
+    if let Some(max_feed) = s.feed_style_ids.values().copied().max() {
+        max_id = max_id.max(max_feed);
+    }
+
+    let mut styles = vec![default_style(); (max_id as usize).saturating_add(1)];
+
+    // Polygons
+    styles[STYLE_BASE_REGIONS as usize] = style_from_layer(s.base_regions_style, 100.0, 0.0, 0.0);
+    styles[STYLE_REGIONS as usize] = style_from_layer(s.regions_style, 25.0, 0.0, 0.0);
+    styles[STYLE_UPLOADED_REGIONS as usize] =
+        style_from_layer(s.uploaded_regions_style, 25.0, 0.0, 0.0);
+    styles[STYLE_SELECTION_POLY as usize] = Style {
+        color: s.selection_style.color,
+        lift_m: (s.selection_style.lift + 0.03) * (WGS84_A as f32),
+        size_px: 0.0,
+        width_px: 0.0,
+        _pad0: 0.0,
+    };
+
+    // Points
+    let size_px = s.city_marker_size.clamp(1.0, 64.0);
+    styles[STYLE_CITIES as usize] = style_from_layer(s.cities_style, 50.0, size_px, 1.0);
+    styles[STYLE_UPLOADED_POINTS as usize] =
+        style_from_layer(s.uploaded_points_style, 50.0, size_px, 1.0);
+    styles[STYLE_SELECTION_POINT as usize] = style_from_layer(
+        s.selection_style,
+        50.0,
+        (s.city_marker_size * 1.35).clamp(1.0, 64.0),
+        1.0,
+    );
+
+    // Lines
+    let width_px = s.line_width_px.clamp(1.0, 24.0);
+    styles[STYLE_CORRIDORS as usize] = style_from_layer(s.corridors_style, 50.0, 0.0, width_px);
+    styles[STYLE_UPLOADED_CORRIDORS as usize] =
+        style_from_layer(s.uploaded_corridors_style, 50.0, 0.0, width_px);
+    styles[STYLE_SELECTION_LINE as usize] = Style {
+        color: s.selection_style.color,
+        lift_m: (s.selection_style.lift + 0.03) * (WGS84_A as f32),
+        size_px: 0.0,
+        width_px: (s.line_width_px * 1.6).clamp(1.0, 24.0),
+        _pad0: 0.0,
+    };
+
+    // 2D graticule (Web Mercator). Rendered as instanced segments in the 2D WebGPU path.
+    styles[STYLE_GRATICULE_2D as usize] = Style {
+        color: [0.58, 0.64, 0.72, 0.20],
+        lift_m: 0.0,
+        size_px: 0.0,
+        width_px: 0.75,
+        _pad0: 0.0,
+    };
+
+    // Feed layers
+    for (feed_layer_id, layer) in &s.feed_layers {
+        if let Some(id) = s.feed_style_ids.get(feed_layer_id).copied()
+            && (id as usize) < styles.len()
+        {
+            styles[id as usize] = style_from_layer(layer.style, 50.0, size_px, 1.0);
+        }
+    }
+
+    styles[STYLE_DEFAULT as usize] = default_style();
+    styles
+}
+
+fn rebuild_styles_and_upload_only() -> Result<(), JsValue> {
+    match STATE.try_with(|state| {
+        let mut s = state.borrow_mut();
+        let styles = rebuild_styles_table(&mut s);
+        if let Some(ctx) = &mut s.wgpu {
+            set_styles(ctx, &styles);
+            s.pending_styles = None;
+        } else {
+            s.pending_styles = Some(styles);
+        }
+        Ok(())
+    }) {
+        Ok(res) => res,
+        Err(_) => Ok(()),
+    }
+}
 
 fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
     // Budget guardrails: the web viewer will trap on extremely large GPU buffers.
@@ -2067,6 +3309,14 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
 
     match STATE.try_with(|state| {
         let mut s = state.borrow_mut();
+
+        // Sources for 2D culling (mercator caches + layer visibility) may change during rebuild.
+        // Bump generation to force a fresh cull on the next 2D WebGPU frame.
+        s.cull2d_geom_gen = s.cull2d_geom_gen.wrapping_add(1);
+        s.cull2d_job = None;
+        s.cull2d_last_snapshot = None;
+        s.cull2d_visible_points = 0;
+        s.cull2d_visible_line_segs = 0;
 
         // Refresh cached viewer-space geometry from the engine worlds.
         // This ensures all rendered features flow through `layers`.
@@ -2222,40 +3472,39 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
             .as_ref()
             .map(|pos| world_tris_to_mercator_clipped(pos));
 
+        let styles = rebuild_styles_table(&mut s);
+
         let mut points: Vec<CityVertex> = Vec::new();
         let mut lines: Vec<CorridorVertex> = Vec::new();
         let mut base_polys: Vec<OverlayVertex> = Vec::new();
         let mut polys: Vec<OverlayVertex> = Vec::new();
 
-        // Points
+        // 2D (Web Mercator) GPU buffers.
+        let mut base_polys2d: Vec<Overlay2DVertex> = Vec::new();
+        let mut polys2d: Vec<Overlay2DVertex> = Vec::new();
+        let mut points2d: Vec<Point2DInstance> = Vec::new();
+        let mut lines2d: Vec<Segment2DInstance> = Vec::new();
+        let mut grid2d: Vec<Segment2DInstance> = Vec::new();
+
+        // Points (instanced)
         if s.cities_style.visible
             && let Some(centers) = s.cities_centers.as_deref()
         {
-            points.extend(build_city_vertices(
-                centers,
-                s.city_marker_size,
-                s.cities_style.color,
-                s.cities_style.lift,
-            ));
+            points.extend(build_city_vertices(centers, STYLE_CITIES));
         }
         if s.uploaded_points_style.visible
             && let Some(centers) = s.uploaded_centers.as_deref()
         {
-            points.extend(build_city_vertices(
-                centers,
-                s.city_marker_size,
-                s.uploaded_points_style.color,
-                s.uploaded_points_style.lift,
-            ));
+            points.extend(build_city_vertices(centers, STYLE_UPLOADED_POINTS));
         }
-        for layer in s.feed_layers.values() {
+        for (feed_layer_id, layer) in &s.feed_layers {
             if layer.style.visible && !layer.centers.is_empty() {
-                points.extend(build_city_vertices(
-                    &layer.centers,
-                    s.city_marker_size,
-                    layer.style.color,
-                    layer.style.lift,
-                ));
+                let style_id = s
+                    .feed_style_ids
+                    .get(feed_layer_id)
+                    .copied()
+                    .unwrap_or(STYLE_DEFAULT);
+                points.extend(build_city_vertices(&layer.centers, style_id));
             }
         }
         if s.selection_style.visible
@@ -2263,116 +3512,324 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
         {
             points.extend(build_city_vertices(
                 std::slice::from_ref(&c),
-                s.city_marker_size * 1.35,
-                s.selection_style.color,
-                s.selection_style.lift,
+                STYLE_SELECTION_POINT,
             ));
         }
 
-        // Lines (thick quads)
+        // Lines (instanced)
         if s.corridors_style.visible
             && let Some(pos) = s.corridors_positions.as_deref()
         {
-            lines.extend(build_corridor_vertices(
-                pos,
-                s.line_width_px,
-                s.corridors_style.color,
-                s.corridors_style.lift,
-            ));
+            lines.extend(build_corridor_vertices(pos, STYLE_CORRIDORS));
         }
         if s.uploaded_corridors_style.visible
             && let Some(pos) = s.uploaded_corridors_positions.as_deref()
         {
-            lines.extend(build_corridor_vertices(
-                pos,
-                s.line_width_px,
-                s.uploaded_corridors_style.color,
-                s.uploaded_corridors_style.lift,
-            ));
+            lines.extend(build_corridor_vertices(pos, STYLE_UPLOADED_CORRIDORS));
         }
         if s.selection_style.visible
             && let Some(pos) = s.selection_line_positions.as_deref()
             && !pos.is_empty()
         {
-            lines.extend(build_corridor_vertices(
-                pos,
-                (s.line_width_px * 1.6).clamp(1.0, 24.0),
-                s.selection_style.color,
-                s.selection_style.lift + 0.03,
-            ));
+            lines.extend(build_corridor_vertices(pos, STYLE_SELECTION_LINE));
         }
 
         // Base polygons (triangles)
         if s.base_regions_style.visible
             && let Some(pos) = s.base_regions_positions.as_deref()
         {
-            let mut lift_m = s.base_regions_style.lift * (WGS84_A as f32);
-            if lift_m <= 0.0 {
-                // Small lift combined with depth bias prevents z-fighting
-                // without causing visible "floating" at grazing angles.
-                lift_m = 100.0;
-            }
+            let style_id = STYLE_BASE_REGIONS;
             base_polys.extend(pos.iter().map(|&p| OverlayVertex {
                 position: p,
-                lift: lift_m,
-                color: s.base_regions_style.color,
+                style_id,
             }));
+        }
+
+        // 2D base polygons (Mercator triangles)
+        if s.base_regions_style.visible
+            && let Some(pos) = s.base_regions_mercator.as_deref()
+        {
+            base_polys2d.reserve(pos.len());
+            for tri in pos.chunks_exact(3).take(2_000_000) {
+                let anchor_x_m = tri[0][0];
+                base_polys2d.push(Overlay2DVertex {
+                    position_m: tri[0],
+                    anchor_x_m,
+                    style_id: STYLE_BASE_REGIONS,
+                });
+                base_polys2d.push(Overlay2DVertex {
+                    position_m: tri[1],
+                    anchor_x_m,
+                    style_id: STYLE_BASE_REGIONS,
+                });
+                base_polys2d.push(Overlay2DVertex {
+                    position_m: tri[2],
+                    anchor_x_m,
+                    style_id: STYLE_BASE_REGIONS,
+                });
+            }
         }
 
         // Polygons (triangles)
         if s.regions_style.visible
             && let Some(pos) = s.regions_positions.as_deref()
         {
-            let mut lift_m = s.regions_style.lift * (WGS84_A as f32);
-            if lift_m <= 0.0 {
-                // Small lift combined with depth bias prevents z-fighting.
-                lift_m = 25.0;
-            }
+            let style_id = STYLE_REGIONS;
             polys.extend(pos.iter().map(|&p| OverlayVertex {
                 position: p,
-                lift: lift_m,
-                color: s.regions_style.color,
+                style_id,
             }));
         }
         if s.uploaded_regions_style.visible
             && let Some(pos) = s.uploaded_regions_positions.as_deref()
         {
-            let mut lift_m = s.uploaded_regions_style.lift * (WGS84_A as f32);
-            if lift_m <= 0.0 {
-                lift_m = 25.0;
-            }
+            let style_id = STYLE_UPLOADED_REGIONS;
             polys.extend(pos.iter().map(|&p| OverlayVertex {
                 position: p,
-                lift: lift_m,
-                color: s.uploaded_regions_style.color,
+                style_id,
             }));
         }
         if s.selection_style.visible
             && let Some(pos) = s.selection_poly_positions.as_deref()
             && !pos.is_empty()
         {
-            let lift_m = (s.selection_style.lift + 0.03) * (WGS84_A as f32);
+            let style_id = STYLE_SELECTION_POLY;
             polys.extend(pos.iter().map(|&p| OverlayVertex {
                 position: p,
-                lift: lift_m,
-                color: s.selection_style.color,
+                style_id,
             }));
         }
 
+        // 2D polygons (Mercator triangles)
+        if s.regions_style.visible
+            && let Some(pos) = s.regions_mercator.as_deref()
+        {
+            polys2d.reserve(pos.len());
+            for tri in pos.chunks_exact(3).take(2_000_000) {
+                let anchor_x_m = tri[0][0];
+                polys2d.push(Overlay2DVertex {
+                    position_m: tri[0],
+                    anchor_x_m,
+                    style_id: STYLE_REGIONS,
+                });
+                polys2d.push(Overlay2DVertex {
+                    position_m: tri[1],
+                    anchor_x_m,
+                    style_id: STYLE_REGIONS,
+                });
+                polys2d.push(Overlay2DVertex {
+                    position_m: tri[2],
+                    anchor_x_m,
+                    style_id: STYLE_REGIONS,
+                });
+            }
+        }
+        if s.uploaded_regions_style.visible
+            && let Some(pos) = s.uploaded_regions_mercator.as_deref()
+        {
+            polys2d.reserve(pos.len());
+            for tri in pos.chunks_exact(3).take(2_000_000) {
+                let anchor_x_m = tri[0][0];
+                polys2d.push(Overlay2DVertex {
+                    position_m: tri[0],
+                    anchor_x_m,
+                    style_id: STYLE_UPLOADED_REGIONS,
+                });
+                polys2d.push(Overlay2DVertex {
+                    position_m: tri[1],
+                    anchor_x_m,
+                    style_id: STYLE_UPLOADED_REGIONS,
+                });
+                polys2d.push(Overlay2DVertex {
+                    position_m: tri[2],
+                    anchor_x_m,
+                    style_id: STYLE_UPLOADED_REGIONS,
+                });
+            }
+        }
+        if s.selection_style.visible
+            && let Some(pos) = s.selection_poly_mercator.as_deref()
+            && !pos.is_empty()
+        {
+            polys2d.reserve(pos.len());
+            for tri in pos.chunks_exact(3).take(2_000_000) {
+                let anchor_x_m = tri[0][0];
+                polys2d.push(Overlay2DVertex {
+                    position_m: tri[0],
+                    anchor_x_m,
+                    style_id: STYLE_SELECTION_POLY,
+                });
+                polys2d.push(Overlay2DVertex {
+                    position_m: tri[1],
+                    anchor_x_m,
+                    style_id: STYLE_SELECTION_POLY,
+                });
+                polys2d.push(Overlay2DVertex {
+                    position_m: tri[2],
+                    anchor_x_m,
+                    style_id: STYLE_SELECTION_POLY,
+                });
+            }
+        }
+
+        // 2D lines (Mercator segments)
+        if s.corridors_style.visible
+            && let Some(pos) = s.corridors_mercator.as_deref()
+        {
+            lines2d.reserve(pos.len() / 2);
+            for seg in pos.chunks_exact(2).take(1_500_000) {
+                lines2d.push(Segment2DInstance {
+                    a_m: seg[0],
+                    b_m: seg[1],
+                    style_id: STYLE_CORRIDORS,
+                    _pad0: 0,
+                });
+            }
+        }
+        if s.uploaded_corridors_style.visible
+            && let Some(pos) = s.uploaded_corridors_mercator.as_deref()
+        {
+            lines2d.reserve(pos.len() / 2);
+            for seg in pos.chunks_exact(2).take(1_500_000) {
+                lines2d.push(Segment2DInstance {
+                    a_m: seg[0],
+                    b_m: seg[1],
+                    style_id: STYLE_UPLOADED_CORRIDORS,
+                    _pad0: 0,
+                });
+            }
+        }
+        if s.selection_style.visible
+            && let Some(pos) = s.selection_line_mercator.as_deref()
+            && !pos.is_empty()
+        {
+            lines2d.reserve(pos.len() / 2);
+            for seg in pos.chunks_exact(2).take(1_500_000) {
+                lines2d.push(Segment2DInstance {
+                    a_m: seg[0],
+                    b_m: seg[1],
+                    style_id: STYLE_SELECTION_LINE,
+                    _pad0: 0,
+                });
+            }
+        }
+
+        // 2D points (Mercator)
+        if s.cities_style.visible
+            && let Some(centers) = s.cities_mercator.as_deref()
+        {
+            points2d.reserve(centers.len());
+            for &c in centers.iter().take(2_000_000) {
+                points2d.push(Point2DInstance {
+                    center_m: c,
+                    style_id: STYLE_CITIES,
+                    _pad0: 0,
+                });
+            }
+        }
+        if s.uploaded_points_style.visible
+            && let Some(centers) = s.uploaded_mercator.as_deref()
+        {
+            points2d.reserve(centers.len());
+            for &c in centers.iter().take(2_000_000) {
+                points2d.push(Point2DInstance {
+                    center_m: c,
+                    style_id: STYLE_UPLOADED_POINTS,
+                    _pad0: 0,
+                });
+            }
+        }
+        for (feed_layer_id, layer) in &s.feed_layers {
+            if layer.style.visible && !layer.centers_mercator.is_empty() {
+                let style_id = s
+                    .feed_style_ids
+                    .get(feed_layer_id)
+                    .copied()
+                    .unwrap_or(STYLE_DEFAULT);
+                points2d.reserve(layer.centers_mercator.len());
+                for &c in layer.centers_mercator.iter().take(2_000_000) {
+                    points2d.push(Point2DInstance {
+                        center_m: c,
+                        style_id,
+                        _pad0: 0,
+                    });
+                }
+            }
+        }
+        if s.selection_style.visible
+            && let Some(c) = s.selection_center_mercator
+        {
+            points2d.push(Point2DInstance {
+                center_m: c,
+                style_id: STYLE_SELECTION_POINT,
+                _pad0: 0,
+            });
+        }
+
+        // 2D graticule (Mercator). Small enough to regenerate per rebuild.
+        {
+            let y0 = mercator_y_m(-85.0) as f32;
+            let y1 = mercator_y_m(85.0) as f32;
+            for lon in (-180..=180).step_by(10) {
+                let x = mercator_x_m(lon as f64) as f32;
+                grid2d.push(Segment2DInstance {
+                    a_m: [x, y0],
+                    b_m: [x, y1],
+                    style_id: STYLE_GRATICULE_2D,
+                    _pad0: 0,
+                });
+            }
+            for lat in (-80..=80).step_by(10) {
+                let y = mercator_y_m(lat as f64) as f32;
+                let mut prev = None;
+                for lon in (-180..=180).step_by(10) {
+                    let x = mercator_x_m(lon as f64) as f32;
+                    let cur = [x, y];
+                    if let Some(p) = prev {
+                        grid2d.push(Segment2DInstance {
+                            a_m: p,
+                            b_m: cur,
+                            style_id: STYLE_GRATICULE_2D,
+                            _pad0: 0,
+                        });
+                    }
+                    prev = Some(cur);
+                }
+            }
+        }
+
         if let Some(ctx) = &mut s.wgpu {
+            set_styles(ctx, &styles);
             set_cities_points(ctx, &points);
             set_corridors_points(ctx, &lines);
             set_base_regions_points(ctx, &base_polys);
             set_regions_points(ctx, &polys);
+            set_base_regions2d_vertices(ctx, &base_polys2d);
+            set_regions2d_vertices(ctx, &polys2d);
+            set_points2d_instances(ctx, &points2d);
+            set_lines2d_instances(ctx, &lines2d);
+            set_grid2d_instances(ctx, &grid2d);
+            s.pending_styles = None;
             s.pending_cities = None;
             s.pending_corridors = None;
             s.pending_base_regions = None;
             s.pending_regions = None;
+            s.pending_base_regions2d = None;
+            s.pending_regions2d = None;
+            s.pending_points2d = None;
+            s.pending_lines2d = None;
+            s.pending_grid2d = None;
         } else {
+            s.pending_styles = Some(styles);
             s.pending_cities = Some(points);
             s.pending_corridors = Some(lines);
             s.pending_base_regions = Some(base_polys);
             s.pending_regions = Some(polys);
+            s.pending_base_regions2d = Some(base_polys2d);
+            s.pending_regions2d = Some(polys2d);
+            s.pending_points2d = Some(points2d);
+            s.pending_lines2d = Some(lines2d);
+            s.pending_grid2d = Some(grid2d);
         }
 
         Ok(())
@@ -2834,7 +4291,7 @@ pub fn set_city_marker_size(size: f64) -> Result<(), JsValue> {
         s.city_marker_size = size;
     });
 
-    let _ = rebuild_overlays_and_upload();
+    let _ = rebuild_styles_and_upload_only();
     render_scene()
 }
 
@@ -2844,7 +4301,7 @@ pub fn set_line_width_px(width_px: f64) -> Result<(), JsValue> {
     with_state(|state| {
         state.borrow_mut().line_width_px = width_px;
     });
-    let _ = rebuild_overlays_and_upload();
+    let _ = rebuild_styles_and_upload_only();
     render_scene()
 }
 
@@ -2854,6 +4311,75 @@ pub fn set_graticule_enabled(enabled: bool) -> Result<(), JsValue> {
         state.borrow_mut().show_graticule = enabled;
     });
     // Render immediately so the toggle feels responsive.
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_labels_enabled(enabled: bool) -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.labels_enabled = enabled;
+        // Force a refresh.
+        s.labels_gen = s.labels_gen.wrapping_add(1);
+        s.labels2d_job = None;
+        s.labels2d_last_snapshot = None;
+        s.labels2d_placed.clear();
+    });
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn clear_debug_labels() -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.debug_labels.clear();
+        s.labels_gen = s.labels_gen.wrapping_add(1);
+        s.labels2d_job = None;
+        s.labels2d_last_snapshot = None;
+        s.labels2d_placed.clear();
+    });
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn add_debug_label(lon_deg: f64, lat_deg: f64, text: String) -> Result<(), JsValue> {
+    add_debug_label_with_priority(lon_deg, lat_deg, text, 1000.0)
+}
+
+#[wasm_bindgen]
+pub fn add_debug_label_with_priority(
+    lon_deg: f64,
+    lat_deg: f64,
+    text: String,
+    priority: f64,
+) -> Result<(), JsValue> {
+    if !lon_deg.is_finite() || !lat_deg.is_finite() || !priority.is_finite() {
+        return Err(JsValue::from_str("add_debug_label args must be finite"));
+    }
+    if text.len() > 256 {
+        return Err(JsValue::from_str("debug label text too long"));
+    }
+    let lon = wrap_lon_deg(lon_deg);
+    let lat = clamp(lat_deg, -MERCATOR_MAX_LAT_DEG, MERCATOR_MAX_LAT_DEG);
+
+    let x_m = mercator_x_m(lon) as f32;
+    let y_m = mercator_y_m(lat) as f32;
+    let viewer_pos = lon_lat_deg_to_world(lon, lat);
+
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.debug_labels.push(DebugLabel {
+            text,
+            mercator_m: [x_m, y_m],
+            viewer_pos,
+            priority: priority as f32,
+        });
+        s.labels_gen = s.labels_gen.wrapping_add(1);
+        // Keep prior placements, but restart the job so it can incorporate the new label.
+        s.labels2d_job = None;
+        s.labels2d_last_snapshot = None;
+    });
+
     render_scene()
 }
 
@@ -3617,14 +5143,14 @@ fn terrain_height_color(height_m: f32, min_m: f32, max_m: f32, alpha: f32) -> [f
     [r, g, b, alpha]
 }
 
-fn build_terrain_mesh(tileset: &TerrainTileset, tiles: &[TerrainTile]) -> Vec<OverlayVertex> {
+fn build_terrain_mesh(tileset: &TerrainTileset, tiles: &[TerrainTile]) -> Vec<TerrainVertex> {
     let tile_size = tileset.tile_size as usize;
     let step = tileset.sample_step.unwrap_or(4).max(1) as usize;
     let no_data = tileset.no_data.unwrap_or(-9999.0) as f32;
     let min_h = tileset.min_height as f32;
     let max_h = tileset.max_height as f32;
 
-    let mut vertices: Vec<OverlayVertex> = Vec::new();
+    let mut vertices: Vec<TerrainVertex> = Vec::new();
 
     for tile in tiles {
         if tile.heights_m.len() < tile_size * tile_size {
@@ -3672,36 +5198,36 @@ fn build_terrain_mesh(tileset: &TerrainTileset, tiles: &[TerrainTile]) -> Vec<Ov
                 let c11 = terrain_height_color(h11, min_h, max_h, 0.95);
 
                 // Triangle 1: p00, p10, p11
-                vertices.push(OverlayVertex {
+                vertices.push(TerrainVertex {
                     position: p00,
-                    lift: h00,
+                    lift_m: h00,
                     color: c00,
                 });
-                vertices.push(OverlayVertex {
+                vertices.push(TerrainVertex {
                     position: p10,
-                    lift: h10,
+                    lift_m: h10,
                     color: c10,
                 });
-                vertices.push(OverlayVertex {
+                vertices.push(TerrainVertex {
                     position: p11,
-                    lift: h11,
+                    lift_m: h11,
                     color: c11,
                 });
 
                 // Triangle 2: p00, p11, p01
-                vertices.push(OverlayVertex {
+                vertices.push(TerrainVertex {
                     position: p00,
-                    lift: h00,
+                    lift_m: h00,
                     color: c00,
                 });
-                vertices.push(OverlayVertex {
+                vertices.push(TerrainVertex {
                     position: p11,
-                    lift: h11,
+                    lift_m: h11,
                     color: c11,
                 });
-                vertices.push(OverlayVertex {
+                vertices.push(TerrainVertex {
                     position: p01,
-                    lift: h01,
+                    lift_m: h01,
                     color: c01,
                 });
             }
@@ -4235,7 +5761,7 @@ pub fn set_layer_color_hex(id: &str, hex: &str) -> Result<(), JsValue> {
             st.color[2] = rgb[2];
         }
     });
-    let _ = rebuild_overlays_and_upload();
+    let _ = rebuild_styles_and_upload_only();
     render_scene()
 }
 
@@ -4248,7 +5774,7 @@ pub fn set_layer_opacity(id: &str, opacity: f64) -> Result<(), JsValue> {
             st.color[3] = a;
         }
     });
-    let _ = rebuild_overlays_and_upload();
+    let _ = rebuild_styles_and_upload_only();
     render_scene()
 }
 
@@ -4261,7 +5787,7 @@ pub fn set_layer_lift(id: &str, lift: f64) -> Result<(), JsValue> {
             st.lift = lift;
         }
     });
-    let _ = rebuild_overlays_and_upload();
+    let _ = rebuild_styles_and_upload_only();
     render_scene()
 }
 
@@ -5060,6 +6586,7 @@ pub fn remove_feed_layer(feed_layer_id: &str) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.feed_layers.remove(feed_layer_id);
+        s.feed_style_ids.remove(feed_layer_id);
     });
     let _ = rebuild_overlays_and_upload();
     render_scene()
@@ -5605,11 +7132,17 @@ async fn init_wgpu_inner() -> Result<(), JsValue> {
         let mut s = state.borrow_mut();
         let palette = palette_for(s.theme);
         let globe_transparent = s.globe_transparent;
+        let pending_styles = s.pending_styles.take();
         let pending = s.pending_cities.take();
         let pending_corridors = s.pending_corridors.take();
         let pending_base_regions = s.pending_base_regions.take();
         let pending_regions = s.pending_regions.take();
         let pending_terrain = s.pending_terrain.take();
+        let pending_base_regions2d = s.pending_base_regions2d.take();
+        let pending_regions2d = s.pending_regions2d.take();
+        let pending_points2d = s.pending_points2d.take();
+        let pending_lines2d = s.pending_lines2d.take();
+        let pending_grid2d = s.pending_grid2d.take();
         s.wgpu = Some(ctx);
 
         if let Some(ctx) = &mut s.wgpu {
@@ -5620,6 +7153,12 @@ async fn init_wgpu_inner() -> Result<(), JsValue> {
                 palette.stars_alpha,
             );
             wgpu::set_globe_transparent(ctx, globe_transparent);
+        }
+
+        if let Some(styles) = pending_styles
+            && let Some(ctx) = &mut s.wgpu
+        {
+            set_styles(ctx, &styles);
         }
 
         if let Some(points) = pending
@@ -5650,6 +7189,36 @@ async fn init_wgpu_inner() -> Result<(), JsValue> {
             && let Some(ctx) = &mut s.wgpu
         {
             set_terrain_points(ctx, &points);
+        }
+
+        if let Some(verts) = pending_base_regions2d
+            && let Some(ctx) = &mut s.wgpu
+        {
+            set_base_regions2d_vertices(ctx, &verts);
+        }
+
+        if let Some(verts) = pending_regions2d
+            && let Some(ctx) = &mut s.wgpu
+        {
+            set_regions2d_vertices(ctx, &verts);
+        }
+
+        if let Some(inst) = pending_points2d
+            && let Some(ctx) = &mut s.wgpu
+        {
+            set_points2d_instances(ctx, &inst);
+        }
+
+        if let Some(inst) = pending_lines2d
+            && let Some(ctx) = &mut s.wgpu
+        {
+            set_lines2d_instances(ctx, &inst);
+        }
+
+        if let Some(inst) = pending_grid2d
+            && let Some(ctx) = &mut s.wgpu
+        {
+            set_grid2d_instances(ctx, &inst);
         }
     });
 
