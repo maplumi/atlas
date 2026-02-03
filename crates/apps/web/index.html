@@ -438,6 +438,64 @@
           justify-content: center;
         }
       }
+
+      /* Glassy modal used for feeds + other map overlays. */
+      .modal-backdrop {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        background: rgba(2, 6, 23, 0.40);
+        backdrop-filter: blur(12px);
+        z-index: 40;
+      }
+      .modal-backdrop.hidden { display: none; }
+      .modal {
+        width: min(92vw, 560px);
+        max-height: min(82vh, 720px);
+        overflow: auto;
+        background: rgba(15, 23, 42, 0.72);
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 14px;
+        box-shadow: 0 18px 44px rgba(0, 0, 0, 0.35);
+        padding: 14px;
+      }
+      .modal h3 { margin: 0; }
+      .modal .modal-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        margin-bottom: 10px;
+      }
+      .modal .modal-footer {
+        display: flex;
+        justify-content: flex-end;
+        gap: 8px;
+        margin-top: 12px;
+      }
+      .modal .grid {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 10px;
+      }
+      .modal .row {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        padding: 3px 8px;
+        border-radius: 999px;
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        background: rgba(2, 6, 23, 0.35);
+        font-size: 11px;
+        color: var(--muted);
+      }
     </style>
     <script>
       // Apply theme as early as possible to avoid a flash.
@@ -462,6 +520,7 @@
         <div class="panel-tabs">
           <button id="tab-general-btn" class="tab-btn active" type="button">General</button>
           <button id="tab-layers-btn" class="tab-btn" type="button">Layers</button>
+          <button id="tab-feeds-btn" class="tab-btn" type="button">Feeds</button>
           <button id="tab-catalog-btn" class="tab-btn" type="button">Catalog</button>
           <button id="tab-settings-btn" class="tab-btn" type="button">Settings</button>
         </div>
@@ -470,7 +529,7 @@
           <div class="section">
             <h3>Mode</h3>
             <div class="tabs">
-              <button id="mode-2d" class="tab-btn" type="button" disabled>2D</button>
+              <button id="mode-2d" class="tab-btn" type="button">2D</button>
               <button id="mode-3d" class="tab-btn active" type="button">3D</button>
             </div>
             <div class="muted" style="font-size:12px; line-height:1.35; margin-top:8px;">
@@ -668,8 +727,38 @@
               </div>
             </div>
 
+            <div style="margin-top:12px; padding-top:12px; border-top:1px solid rgba(148, 163, 184, 0.14);">
+              <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+                <div style="font-weight:800;">Feed layers</div>
+                <span class="pill">dynamic</span>
+              </div>
+              <div id="feed-layer-controls" style="display:flex; flex-direction:column; gap:10px; margin-top:10px;"></div>
+              <div class="muted" style="font-size:12px; line-height:1.35; margin-top:8px;">
+                Online feeds you add in the Feeds tab will show up here as point layers.
+              </div>
+            </div>
+
             <div class="muted" style="font-size:12px; line-height:1.35; margin-top:10px;">
               Tip: you can enable multiple layers at once. Click on a point layer to pick the nearest marker.
+            </div>
+          </div>
+        </div>
+
+        <div id="tab-feeds" class="tab-page hidden">
+          <div class="section">
+            <h3>Online feeds</h3>
+            <div class="muted" style="font-size:12px; line-height:1.35; margin-bottom:10px;">
+              Add public CSV/JSON/RSS feeds and render them as point layers. Feeds are fetched via the Atlas backend (to avoid browser CORS limitations).
+            </div>
+            <div id="feeds-backend-hint" class="muted" style="font-size:12px; line-height:1.35; margin-bottom:10px;"></div>
+            <div class="row" style="gap:8px;">
+              <button id="feed-add-btn" type="button">Add feed…</button>
+              <button id="feed-sample-btn" type="button" class="btn" title="Add the provided sample CSV feed">Add sample</button>
+              <button id="feeds-refresh-all" type="button" class="btn" title="Refetch all feeds">Refresh all</button>
+            </div>
+            <div id="feeds-list" style="display:flex; flex-direction:column; gap:10px; margin-top:12px;"></div>
+            <div id="feeds-empty" class="muted" style="font-size:12px; line-height:1.35; margin-top:10px;">
+              No feeds yet. Click “Add feed…” to get started.
             </div>
           </div>
         </div>
@@ -752,6 +841,15 @@
             </span>
             <span class="sr-only">Layers</span>
           </button>
+          <button class="btn" data-tab="feeds" type="button" title="Feeds" aria-label="Feeds">
+            <span class="icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M4 4v16" />
+                <path d="M4 8c4-4 8 4 16-2v10c-8 6-12-2-16 2" />
+              </svg>
+            </span>
+            <span class="sr-only">Feeds</span>
+          </button>
           <button class="btn" data-tab="catalog" type="button" title="Catalog" aria-label="Catalog">
             <span class="icon" aria-hidden="true">
               <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -790,6 +888,92 @@
             2D: drag pan<br />
             Wheel / Pinch: zoom • Click: pick<br />
             R: reset
+          </div>
+        </div>
+      </div>
+
+      <!-- Feed setup modal (glassy) -->
+      <div id="feed-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Add data feed">
+        <div class="modal">
+          <div class="modal-header">
+            <h3>Add online feed</h3>
+            <button id="feed-modal-close" type="button" class="btn" title="Close">✕</button>
+          </div>
+
+          <div class="grid">
+            <div>
+              <label for="feed-name">Name</label>
+              <input id="feed-name" type="text" placeholder="e.g. GDACS Alerts" />
+            </div>
+            <div>
+              <label for="feed-url">URL</label>
+              <input id="feed-url" type="url" placeholder="https://…" />
+              <div class="muted" style="font-size:12px; line-height:1.35; margin-top:6px;">
+                Downloads are performed by the Atlas backend. If the backend is offline, adding/testing feeds is disabled.
+              </div>
+            </div>
+            <div class="row" style="gap:10px;">
+              <div style="flex:1;">
+                <label for="feed-format">Format</label>
+                <select id="feed-format">
+                  <option value="auto" selected>Auto-detect</option>
+                  <option value="csv">CSV</option>
+                  <option value="json">JSON</option>
+                  <option value="rss">RSS / XML</option>
+                </select>
+              </div>
+              <div style="flex:1;">
+                <label for="feed-max-rows">Max rows</label>
+                <input id="feed-max-rows" type="number" min="1" max="50000" step="1" value="5000" />
+              </div>
+            </div>
+
+            <div class="row" style="gap:10px; align-items:flex-end;">
+              <div style="flex:1;">
+                <label for="feed-csv-skip-rows">CSV: skip first rows</label>
+                <input id="feed-csv-skip-rows" type="number" min="0" max="10000" step="1" value="0" />
+              </div>
+              <label class="checkbox" style="flex:1; margin:0;">
+                <input id="feed-csv-header" type="checkbox" checked />
+                <span>CSV: first row is header</span>
+              </label>
+            </div>
+
+            <div>
+              <label for="feed-csv-skip">CSV: skip row numbers (optional)</label>
+              <input id="feed-csv-skip" type="text" placeholder="e.g. 2,5,10-12 (1=first non-empty row)" />
+              <div class="muted" style="font-size:12px; line-height:1.35; margin-top:6px;">
+                Uses 1-based row numbers after removing empty lines. Example: <span class="pill">2</span> skips the second row (often HDX metadata).
+              </div>
+            </div>
+
+            <div style="display:grid; grid-template-columns: 1fr 1fr; gap:10px;">
+              <div>
+                <label for="feed-lat">Latitude field</label>
+                <input id="feed-lat" type="text" placeholder="auto (e.g. lat, latitude, y)" />
+              </div>
+              <div>
+                <label for="feed-lon">Longitude field</label>
+                <input id="feed-lon" type="text" placeholder="auto (e.g. lon, longitude, x)" />
+              </div>
+            </div>
+
+            <div>
+              <label for="feed-filter">Filter (optional)</label>
+              <input id="feed-filter" type="text" placeholder="e.g. country contains 'Kenya'" />
+              <div class="muted" style="font-size:12px; line-height:1.35; margin-top:6px;">
+                Simple filter syntax: <span class="pill">field contains value</span> (case-insensitive).
+              </div>
+            </div>
+
+            <div id="feed-preview" class="muted" style="font-size:12px; line-height:1.35;">
+              Preview will appear after you click “Test download”.
+            </div>
+          </div>
+
+          <div class="modal-footer">
+            <button id="feed-test-btn" type="button" class="btn">Test download</button>
+            <button id="feed-save-btn" type="button">Save</button>
           </div>
         </div>
       </div>
@@ -1341,6 +1525,10 @@
       }
 
       async function detectBackendAvailability(wasm) {
+        const notify = () => {
+          try { window.dispatchEvent(new Event("atlas-backend-change")); } catch (_) {}
+        };
+
         // If the browser already knows we're offline, don't waste time probing.
         try {
           if (typeof navigator !== "undefined" && navigator && navigator.onLine === false) {
@@ -1348,6 +1536,7 @@
             window.__atlasStacUrl = "https://copernicus-dem-30m-stac.s3.amazonaws.com";
             setStatus("Backend: offline (using defaults)");
             setDemStatus("Terrain (backend): offline");
+            notify();
             return false;
           }
         } catch (_) {}
@@ -1384,6 +1573,7 @@
                 const cb = document.getElementById("layer-terrain");
                 if (cb) cb.checked = true;
               }
+              notify();
               return true;
             }
           } catch (err) {
@@ -1395,6 +1585,7 @@
         window.__atlasStacUrl = "https://copernicus-dem-30m-stac.s3.amazonaws.com";
         setStatus("Backend: offline (using defaults)");
         setDemStatus("Terrain (backend): offline");
+        notify();
         return false;
       }
 
@@ -1587,12 +1778,38 @@
 
         const tabGeneralBtn = document.getElementById("tab-general-btn");
         const tabLayersBtn = document.getElementById("tab-layers-btn");
+        const tabFeedsBtn = document.getElementById("tab-feeds-btn");
         const tabCatalogBtn = document.getElementById("tab-catalog-btn");
         const tabSettingsBtn = document.getElementById("tab-settings-btn");
         const tabGeneral = document.getElementById("tab-general");
         const tabLayers = document.getElementById("tab-layers");
+        const tabFeeds = document.getElementById("tab-feeds");
         const tabCatalog = document.getElementById("tab-catalog");
         const tabSettings = document.getElementById("tab-settings");
+
+        const feedLayerControls = document.getElementById("feed-layer-controls");
+        const feedsList = document.getElementById("feeds-list");
+        const feedsEmpty = document.getElementById("feeds-empty");
+        const feedsBackendHint = document.getElementById("feeds-backend-hint");
+        const feedAddBtn = document.getElementById("feed-add-btn");
+        const feedSampleBtn = document.getElementById("feed-sample-btn");
+        const feedsRefreshAllBtn = document.getElementById("feeds-refresh-all");
+
+        const feedModal = document.getElementById("feed-modal");
+        const feedModalClose = document.getElementById("feed-modal-close");
+        const feedName = document.getElementById("feed-name");
+        const feedUrl = document.getElementById("feed-url");
+        const feedFormat = document.getElementById("feed-format");
+        const feedLat = document.getElementById("feed-lat");
+        const feedLon = document.getElementById("feed-lon");
+        const feedMaxRows = document.getElementById("feed-max-rows");
+        const feedCsvSkipRows = document.getElementById("feed-csv-skip-rows");
+        const feedCsvHeader = document.getElementById("feed-csv-header");
+        const feedCsvSkip = document.getElementById("feed-csv-skip");
+        const feedFilter = document.getElementById("feed-filter");
+        const feedPreview = document.getElementById("feed-preview");
+        const feedTestBtn = document.getElementById("feed-test-btn");
+        const feedSaveBtn = document.getElementById("feed-save-btn");
 
         const catalogList = document.getElementById("catalog-list");
         const catalogEmpty = document.getElementById("catalog-empty");
@@ -1817,6 +2034,8 @@
           syncLayer("uploaded_corridors", layerUploadedCorridors, layerUploadedCorridorsColor, layerUploadedCorridorsOpacity, layerUploadedCorridorsLift);
           syncLayer("uploaded_regions", layerUploadedRegions, layerUploadedRegionsColor, layerUploadedRegionsOpacity, layerUploadedRegionsLift);
 
+          renderFeedLayerControls();
+
           if (wasm.get_city_marker_size) {
             try {
               const size = wasm.get_city_marker_size();
@@ -1836,21 +2055,27 @@
         function setTab(which) {
           const isGeneral = which === "general";
           const isLayers = which === "layers";
+          const isFeeds = which === "feeds";
           const isCatalog = which === "catalog";
           const isSettings = which === "settings";
 
           tabGeneralBtn.classList.toggle("active", isGeneral);
           tabLayersBtn.classList.toggle("active", isLayers);
+          tabFeedsBtn.classList.toggle("active", isFeeds);
           tabCatalogBtn.classList.toggle("active", isCatalog);
           tabSettingsBtn.classList.toggle("active", isSettings);
 
           tabGeneral.classList.toggle("hidden", !isGeneral);
           tabLayers.classList.toggle("hidden", !isLayers);
+          tabFeeds.classList.toggle("hidden", !isFeeds);
           tabCatalog.classList.toggle("hidden", !isCatalog);
           tabSettings.classList.toggle("hidden", !isSettings);
 
           if (isCatalog) {
             renderCatalog();
+          }
+          if (isFeeds) {
+            renderFeeds();
           }
           if (sidePanel && isCompactLayout()) {
             sidePanel.classList.add("compact-open");
@@ -1859,8 +2084,829 @@
 
         tabGeneralBtn.addEventListener("click", () => setTab("general"));
         tabLayersBtn.addEventListener("click", () => setTab("layers"));
+        tabFeedsBtn.addEventListener("click", () => setTab("feeds"));
         tabCatalogBtn.addEventListener("click", () => setTab("catalog"));
         tabSettingsBtn.addEventListener("click", () => setTab("settings"));
+
+        // -----------------
+        // Feeds UI + storage
+        // -----------------
+
+        const SAMPLE_FEED_URL = "https://data.humdata.org/dataset/a87f96f8-16e6-4d51-872c-cfa54a8251ec/resource/4ef001d1-7888-4f5d-98ce-0ca8006787f7/download/gdacs_rss_information.csv";
+
+        function newId() {
+          try { return crypto.randomUUID(); } catch (_) { return "f_" + Math.random().toString(16).slice(2) + "_" + Date.now(); }
+        }
+
+        function openFeedModal(seed) {
+          if (!feedModal) return;
+          feedModal.classList.remove("hidden");
+          if (feedPreview) feedPreview.textContent = "Preview will appear after you click “Test download”.";
+          if (feedName) feedName.value = String(seed?.name ?? "");
+          if (feedUrl) feedUrl.value = String(seed?.url ?? "");
+          if (feedFormat) feedFormat.value = String(seed?.format ?? "auto");
+          if (feedLat) feedLat.value = String(seed?.latField ?? "");
+          if (feedLon) feedLon.value = String(seed?.lonField ?? "");
+          if (feedMaxRows) feedMaxRows.value = String(seed?.maxRows ?? 5000);
+          if (feedCsvSkipRows) feedCsvSkipRows.value = String(seed?.csvSkipRows ?? 0);
+          if (feedCsvHeader) feedCsvHeader.checked = seed?.csvFirstRowHeader !== undefined ? !!seed.csvFirstRowHeader : true;
+          if (feedCsvSkip) feedCsvSkip.value = String(seed?.csvSkip ?? "");
+          if (feedFilter) feedFilter.value = String(seed?.filter ?? "");
+
+          syncFeedsBackendUi();
+        }
+
+        function closeFeedModal() {
+          if (!feedModal) return;
+          feedModal.classList.add("hidden");
+        }
+
+        feedModalClose?.addEventListener("click", closeFeedModal);
+        feedModal?.addEventListener("click", (e) => {
+          // Click outside modal closes.
+          if (e?.target === feedModal) closeFeedModal();
+        });
+
+        feedAddBtn?.addEventListener("click", () => openFeedModal());
+        feedSampleBtn?.addEventListener("click", () => {
+          openFeedModal({ name: "GDACS (sample)", url: SAMPLE_FEED_URL, format: "csv" });
+        });
+
+        function getBackendBase() {
+          try { return String(window.__atlasBackendUrl || "").trim(); } catch (_) { return ""; }
+        }
+
+        function isBackendOnline() {
+          return !!getBackendBase();
+        }
+
+        function syncFeedsBackendUi() {
+          const online = isBackendOnline();
+          if (feedAddBtn) feedAddBtn.disabled = !online;
+          if (feedSampleBtn) feedSampleBtn.disabled = !online;
+          if (feedsRefreshAllBtn) feedsRefreshAllBtn.disabled = !online;
+          if (feedTestBtn) feedTestBtn.disabled = !online;
+          if (feedSaveBtn) feedSaveBtn.disabled = !online;
+          if (feedsBackendHint) {
+            feedsBackendHint.textContent = online
+              ? `Backend connected (${getBackendBase()})`
+              : "Backend offline: feeds are read-only (cache-only).";
+          }
+          if (feedsEmpty && !online) {
+            feedsEmpty.textContent = "Backend offline. Connect the server to add or refresh feeds.";
+          } else if (feedsEmpty) {
+            feedsEmpty.textContent = "No feeds yet. Click “Add feed…” to get started.";
+          }
+        }
+
+        // Re-sync when backend detection completes.
+        window.addEventListener("atlas-backend-change", () => {
+          syncFeedsBackendUi();
+          renderFeeds();
+        });
+
+        // IndexedDB (feeds store)
+        const FEEDS_DB_NAME = "atlas-feeds";
+        const FEEDS_DB_VERSION = 1;
+        const FEEDS_STORE = "feeds";
+
+        function openFeedsDb() {
+          return new Promise((resolve, reject) => {
+            if (!window.indexedDB) {
+              reject(new Error("IndexedDB not available"));
+              return;
+            }
+            const req = indexedDB.open(FEEDS_DB_NAME, FEEDS_DB_VERSION);
+            req.onupgradeneeded = () => {
+              const db = req.result;
+              if (!db.objectStoreNames.contains(FEEDS_STORE)) {
+                const store = db.createObjectStore(FEEDS_STORE, { keyPath: "id" });
+                store.createIndex("byUpdatedAt", "updatedAt", { unique: false });
+              }
+            };
+            req.onsuccess = () => resolve(req.result);
+            req.onerror = () => reject(req.error || new Error("Failed to open IndexedDB"));
+          });
+        }
+
+        async function idbGetAllFeeds() {
+          const db = await openFeedsDb();
+          return new Promise((resolve, reject) => {
+            const tx = db.transaction([FEEDS_STORE], "readonly");
+            const store = tx.objectStore(FEEDS_STORE);
+            const req = store.getAll();
+            req.onsuccess = () => resolve(req.result || []);
+            req.onerror = () => reject(req.error || new Error("Failed to list feeds"));
+          });
+        }
+
+        async function idbPutFeed(feed) {
+          const db = await openFeedsDb();
+          return new Promise((resolve, reject) => {
+            const tx = db.transaction([FEEDS_STORE], "readwrite");
+            const store = tx.objectStore(FEEDS_STORE);
+            const req = store.put(feed);
+            req.onsuccess = () => resolve(true);
+            req.onerror = () => reject(req.error || new Error("Failed to save feed"));
+          });
+        }
+
+        async function idbDeleteFeed(id) {
+          const db = await openFeedsDb();
+          return new Promise((resolve, reject) => {
+            const tx = db.transaction([FEEDS_STORE], "readwrite");
+            const store = tx.objectStore(FEEDS_STORE);
+            const req = store.delete(id);
+            req.onsuccess = () => resolve(true);
+            req.onerror = () => reject(req.error || new Error("Failed to delete feed"));
+          });
+        }
+
+        function guessFormatFromUrl(url) {
+          const u = String(url || "").toLowerCase();
+          if (u.endsWith(".csv")) return "csv";
+          if (u.endsWith(".json") || u.endsWith(".geojson")) return "json";
+          if (u.endsWith(".rss") || u.endsWith(".xml")) return "rss";
+          return "auto";
+        }
+
+        function normalizeFieldName(s) {
+          return String(s || "").trim().toLowerCase().replace(/\s+/g, "_");
+        }
+
+        function detectLatLonFields(keys) {
+          const k = (keys || []).map(normalizeFieldName);
+          const latCandidates = ["lat", "latitude", "y", "lat_deg", "y_lat", "geo_lat", "location_lat"];
+          const lonCandidates = ["lon", "lng", "longitude", "x", "lon_deg", "x_lon", "geo_lon", "location_lon", "long"];
+          const find = (cands) => {
+            for (const c of cands) {
+              const idx = k.indexOf(c);
+              if (idx >= 0) return keys[idx];
+            }
+            return "";
+          };
+          return { lat: find(latCandidates), lon: find(lonCandidates) };
+        }
+
+        function parseRowSkipSpec(specText) {
+          const spec = String(specText || "").trim();
+          if (!spec) return [];
+
+          const parts = spec.split(",").map((s) => s.trim()).filter(Boolean);
+          const ranges = [];
+          for (const p of parts) {
+            const m = p.match(/^([0-9]+)\s*-\s*([0-9]+)$/);
+            if (m) {
+              const a = Number(m[1]);
+              const b = Number(m[2]);
+              if (!Number.isFinite(a) || !Number.isFinite(b) || a <= 0 || b <= 0) continue;
+              const start = Math.min(a, b);
+              const end = Math.max(a, b);
+              ranges.push([start, end]);
+              continue;
+            }
+            const n = Number(p);
+            if (Number.isFinite(n) && n > 0) {
+              ranges.push([Math.floor(n), Math.floor(n)]);
+            }
+          }
+
+          if (!ranges.length) throw new Error("Invalid CSV skip rows spec. Use e.g. 2,5,10-12");
+          ranges.sort((x, y) => x[0] - y[0]);
+
+          // Merge overlaps.
+          const merged = [];
+          for (const r of ranges) {
+            const last = merged[merged.length - 1];
+            if (!last || r[0] > last[1] + 1) {
+              merged.push([r[0], r[1]]);
+            } else {
+              last[1] = Math.max(last[1], r[1]);
+            }
+          }
+          return merged;
+        }
+
+        function isIndexInRanges(idx1Based, ranges) {
+          if (!ranges || !ranges.length) return false;
+          for (const [a, b] of ranges) {
+            if (idx1Based < a) return false;
+            if (idx1Based >= a && idx1Based <= b) return true;
+          }
+          return false;
+        }
+
+        function parseCsv(text, delimiter, options) {
+          const src = String(text || "");
+          const opts = options || {};
+          const skipRows = Math.max(0, Math.floor(Number(opts.skipRows) || 0));
+          const firstRowHeader = opts.firstRowHeader !== undefined ? !!opts.firstRowHeader : true;
+          const skipSpecText = String(opts.skip || "");
+          const skipRanges = skipSpecText.trim().length ? parseRowSkipSpec(skipSpecText) : [];
+
+          const linesAll = src.replace(/\r\n/g, "\n").replace(/\r/g, "\n").split("\n");
+          const nonEmptyAll = linesAll.filter((l) => String(l).trim().length > 0);
+          const nonEmpty = nonEmptyAll.filter((_, idx0) => {
+            const idx1 = idx0 + 1;
+            if (skipRows > 0 && idx1 <= skipRows) return false;
+            if (skipRanges.length && isIndexInRanges(idx1, skipRanges)) return false;
+            return true;
+          });
+          if (nonEmpty.length === 0) return { headers: [], rows: [] };
+
+          const head = nonEmpty[0];
+          const guessDelim = () => {
+            const candidates = [",", "\t", ";", "|"];
+            let best = ",";
+            let bestCount = -1;
+            for (const d of candidates) {
+              const count = head.split(d).length;
+              if (count > bestCount) { bestCount = count; best = d; }
+            }
+            return best;
+          };
+          const delim = delimiter && String(delimiter).length ? String(delimiter) : guessDelim();
+
+          const splitLine = (line) => {
+            const out = [];
+            let cur = "";
+            let inQuotes = false;
+            for (let i = 0; i < line.length; i++) {
+              const ch = line[i];
+              if (ch === '"') {
+                const next = line[i + 1];
+                if (inQuotes && next === '"') {
+                  cur += '"';
+                  i++;
+                } else {
+                  inQuotes = !inQuotes;
+                }
+              } else if (!inQuotes && ch === delim) {
+                out.push(cur);
+                cur = "";
+              } else {
+                cur += ch;
+              }
+            }
+            out.push(cur);
+            return out.map((v) => String(v).trim());
+          };
+
+          const rows = [];
+          let headers = [];
+
+          if (firstRowHeader) {
+            headers = splitLine(nonEmpty[0]).map((h, idx) => String(h || `col_${idx}`).trim() || `col_${idx}`);
+            const dataLinesAll = nonEmpty.slice(1);
+
+            // HDX datasets sometimes include a second "tagged" header row like:
+            //   #event+id,#country+code,...
+            // If present, skip it.
+            const shouldSkipAsSecondHeader = (line) => {
+              const t = String(line || "").trim();
+              if (!t) return false;
+              if (t.startsWith("#")) return true;
+              const parts = splitLine(t);
+              if (!parts.length) return false;
+              const hashy = parts.filter((p) => String(p || "").trim().startsWith("#")).length;
+              if (hashy >= Math.max(2, Math.floor(parts.length * 0.6))) return true;
+              if (t.includes("#event+id") || t.includes("#geo+lat") || t.includes("#geo+lon")) return true;
+              return false;
+            };
+
+            const dataLines = (dataLinesAll.length && shouldSkipAsSecondHeader(dataLinesAll[0]))
+              ? dataLinesAll.slice(1)
+              : dataLinesAll;
+
+            for (const line of dataLines) {
+              const parts = splitLine(line);
+              const row = {};
+              for (let i = 0; i < headers.length; i++) row[headers[i]] = parts[i] ?? "";
+              rows.push(row);
+            }
+          } else {
+            // Treat first row as data; generate generic headers based on its column count.
+            const firstParts = splitLine(nonEmpty[0]);
+            headers = firstParts.map((_, idx) => `col_${idx}`);
+            const pushParts = (parts) => {
+              const row = {};
+              for (let i = 0; i < headers.length; i++) row[headers[i]] = parts[i] ?? "";
+              rows.push(row);
+            };
+            pushParts(firstParts);
+            for (const line of nonEmpty.slice(1)) pushParts(splitLine(line));
+          }
+          return { headers, rows };
+        }
+
+        function parseRss(text) {
+          const src = String(text || "");
+          const parser = new DOMParser();
+          const doc = parser.parseFromString(src, "text/xml");
+          const items = Array.from(doc.querySelectorAll("item"));
+          const rows = [];
+          for (const item of items) {
+            const getText = (sel) => {
+              const el = item.querySelector(sel);
+              return el ? String(el.textContent || "").trim() : "";
+            };
+            const title = getText("title");
+            const link = getText("link");
+            const pubDate = getText("pubDate");
+            const guid = getText("guid");
+
+            let lat = getText("geo\\:lat") || getText("lat");
+            let lon = getText("geo\\:long") || getText("geo\\:lon") || getText("long") || getText("lon");
+            const point = getText("georss\\:point");
+            if ((!lat || !lon) && point) {
+              const parts = point.split(/\s+/).map((v) => v.trim()).filter(Boolean);
+              if (parts.length >= 2) {
+                lat = lat || parts[0];
+                lon = lon || parts[1];
+              }
+            }
+
+            rows.push({ title, link, pubDate, guid, lat, lon });
+          }
+          return { headers: ["title", "link", "pubDate", "guid", "lat", "lon"], rows };
+        }
+
+        function applySimpleFilter(rows, filterText) {
+          const f = String(filterText || "").trim();
+          if (!f) return rows;
+          const m = f.match(/^(.+?)\s+contains\s+(.+)$/i);
+          if (!m) return rows;
+          const field = String(m[1] || "").trim();
+          const needle = String(m[2] || "").trim().toLowerCase();
+          if (!field || !needle) return rows;
+          return rows.filter((r) => String(r?.[field] ?? "").toLowerCase().includes(needle));
+        }
+
+        function toNumber(v) {
+          if (v === null || v === undefined) return NaN;
+          const s = String(v).trim();
+          if (!s) return NaN;
+          return Number(s);
+        }
+
+        function rowsToGeoJsonPoints(rows, latField, lonField, maxRows) {
+          const feats = [];
+          const limit = Number(maxRows || 5000);
+          const n = Math.min(rows.length, Number.isFinite(limit) ? limit : rows.length);
+          for (let i = 0; i < n; i++) {
+            const r = rows[i];
+            const lat = toNumber(r?.[latField]);
+            const lon = toNumber(r?.[lonField]);
+            if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+            if (Math.abs(lat) > 90 || Math.abs(lon) > 1800) continue;
+            feats.push({
+              type: "Feature",
+              geometry: { type: "Point", coordinates: [lon, lat] },
+              properties: { ...r },
+            });
+          }
+          return { type: "FeatureCollection", features: feats };
+        }
+
+        function inferFormat(selected, url, contentType) {
+          const s = String(selected || "auto");
+          if (s !== "auto") return s;
+          const byUrl = guessFormatFromUrl(url);
+          if (byUrl !== "auto") return byUrl;
+          const ct = String(contentType || "").toLowerCase();
+          if (ct.includes("application/json") || ct.includes("geo+json")) return "json";
+          if (ct.includes("text/csv") || ct.includes("application/csv")) return "csv";
+          if (ct.includes("application/rss+xml") || ct.includes("application/xml") || ct.includes("text/xml")) return "rss";
+          return "csv";
+        }
+
+        async function backendFetch(path, options, timeoutMs) {
+          const base = getBackendBase();
+          if (!base) throw new Error("Backend offline");
+          const resp = await fetchWithTimeout(`${base}${path}`, options || {}, timeoutMs ?? 6_000);
+          return resp;
+        }
+
+        async function backendFetchJson(path, options, timeoutMs) {
+          const resp = await backendFetch(path, {
+            headers: {
+              "content-type": "application/json",
+              ...(options?.headers || {}),
+            },
+            ...(options || {}),
+          }, timeoutMs);
+
+          const ct = String(resp.headers.get("content-type") || "").toLowerCase();
+          const payload = ct.includes("application/json") ? await resp.json().catch(() => null) : await resp.text().catch(() => "");
+
+          if (!resp.ok) {
+            const msg = String(payload?.error || payload || `HTTP ${resp.status}`);
+            throw new Error(msg);
+          }
+          return payload;
+        }
+
+        async function serverListFeeds() {
+          const data = await backendFetchJson("/api/feeds", { method: "GET" }, 2_500);
+          return Array.isArray(data) ? data : [];
+        }
+
+        async function serverUpsertFeed(feedSpec) {
+          return await backendFetchJson("/api/feeds", { method: "POST", body: JSON.stringify(feedSpec) }, 4_000);
+        }
+
+        async function serverDeleteFeed(id) {
+          const resp = await backendFetch(`/api/feeds/${encodeURIComponent(String(id))}`, { method: "DELETE" }, 4_000);
+          if (!resp.ok) {
+            let msg = `HTTP ${resp.status}`;
+            try {
+              const j = await resp.json();
+              msg = String(j?.error || msg);
+            } catch (_) {}
+            throw new Error(msg);
+          }
+          return true;
+        }
+
+        async function serverFetchFeedById(id) {
+          return await backendFetchJson(`/api/feeds/${encodeURIComponent(String(id))}/fetch`, { method: "GET" }, 8_000);
+        }
+
+        async function serverFetchUrl(url) {
+          return await backendFetchJson("/api/feeds/fetch", { method: "POST", body: JSON.stringify({ url }) }, 8_000);
+        }
+
+        function formatFetchError(err) {
+          const msg = String(err?.message ?? err ?? "");
+          if (!navigator.onLine) return "Offline: can’t download right now.";
+          // Browsers commonly throw TypeError: Failed to fetch for CORS/blocked/handshake.
+          if (msg.toLowerCase().includes("failed to fetch") || msg.toLowerCase().includes("networkerror")) {
+            return "Download blocked (likely CORS). This host didn’t allow cross-origin requests.";
+          }
+          return msg || "Download failed.";
+        }
+
+        async function buildGeoJsonFromFeed(feed, text, contentType) {
+          const fmt = inferFormat(feed.format, feed.url, contentType);
+          if (fmt === "json") {
+            let obj;
+            try { obj = JSON.parse(text); } catch (e) { throw new Error("Invalid JSON"); }
+            // GeoJSON passthrough.
+            if (obj && obj.type === "FeatureCollection" && Array.isArray(obj.features)) {
+              return obj;
+            }
+            // Array-of-objects.
+            const rows = Array.isArray(obj) ? obj : (Array.isArray(obj?.items) ? obj.items : (Array.isArray(obj?.results) ? obj.results : []));
+            if (!Array.isArray(rows) || rows.length === 0) throw new Error("JSON must be GeoJSON or an array of objects");
+            const keys = Object.keys(rows[0] || {});
+            const detected = detectLatLonFields(keys);
+            const latField = String(feed.latField || detected.lat || "");
+            const lonField = String(feed.lonField || detected.lon || "");
+            if (!latField || !lonField) {
+              throw new Error("Could not detect latitude/longitude fields. Please specify them.");
+            }
+            const filtered = applySimpleFilter(rows, feed.filter);
+            return rowsToGeoJsonPoints(filtered, latField, lonField, feed.maxRows);
+          }
+
+          if (fmt === "rss") {
+            const { rows } = parseRss(text);
+            const keys = rows.length ? Object.keys(rows[0]) : [];
+            const detected = detectLatLonFields(keys);
+            const latField = String(feed.latField || detected.lat || "lat");
+            const lonField = String(feed.lonField || detected.lon || "lon");
+            const filtered = applySimpleFilter(rows, feed.filter);
+            return rowsToGeoJsonPoints(filtered, latField, lonField, feed.maxRows);
+          }
+
+          // CSV default
+          const { rows } = parseCsv(text, undefined, {
+            skipRows: Number(feed.csvSkipRows ?? 0),
+            skip: String(feed.csvSkip ?? ""),
+            firstRowHeader: feed.csvFirstRowHeader !== undefined ? !!feed.csvFirstRowHeader : true,
+          });
+          if (!rows.length) throw new Error("CSV appears empty");
+          const keys = Object.keys(rows[0] || {});
+          const detected = detectLatLonFields(keys);
+          const latField = String(feed.latField || detected.lat || "");
+          const lonField = String(feed.lonField || detected.lon || "");
+          if (!latField || !lonField) {
+            throw new Error("Could not detect latitude/longitude columns. Please specify them.");
+          }
+          const filtered = applySimpleFilter(rows, feed.filter);
+          return rowsToGeoJsonPoints(filtered, latField, lonField, feed.maxRows);
+        }
+
+        async function loadFeedIntoScene(feed, geojsonObj) {
+          const feedLayerId = `feed:${feed.id}`;
+          const text = JSON.stringify(geojsonObj);
+          const summary = wasm.load_geojson_feed_layer?.(feedLayerId, feed.name, text);
+          return summary;
+        }
+
+        async function refreshFeed(feed, { allowCacheOnly } = {}) {
+          const f = { ...feed };
+          const now = Date.now();
+          try {
+            if (!allowCacheOnly) {
+              setStatus(`Downloading feed: ${f.name}…`);
+              if (!isBackendOnline()) throw new Error("Backend offline");
+              const fetched = await serverFetchFeedById(f.id);
+              const text = String(fetched?.text ?? "");
+              const contentType = String(fetched?.contentType ?? "");
+              const geo = await buildGeoJsonFromFeed(f, text, contentType);
+              const summary = await loadFeedIntoScene(f, geo);
+              f.lastError = "";
+              f.lastOkAt = now;
+              // Best-effort cache snapshot (avoid giant entries)
+              const geoText = JSON.stringify(geo);
+              if (geoText.length <= 2_500_000) {
+                f.cachedGeojson = geoText;
+                f.cachedAt = now;
+              }
+              f.updatedAt = now;
+              await idbPutFeed(f);
+              renderFeeds();
+              setStatus(`Feed loaded: ${f.name} (${Number(summary?.points ?? geo.features?.length ?? 0)} pts)`);
+              return;
+            }
+
+            if (f.cachedGeojson) {
+              setStatus(`Loading cached feed: ${f.name}…`);
+              const geo = JSON.parse(f.cachedGeojson);
+              await loadFeedIntoScene(f, geo);
+              setStatus(`Feed loaded from cache: ${f.name}`);
+              return;
+            }
+            throw new Error("No cached data available");
+          } catch (err) {
+            const msg = formatFetchError(err);
+            f.lastError = msg;
+            f.updatedAt = now;
+            await idbPutFeed(f);
+            renderFeeds();
+            setStatus(`Feed error: ${f.name} (${msg})`);
+          }
+        }
+
+        async function renderFeeds() {
+          if (!feedsList || !feedsEmpty) return;
+
+          let localFeeds = [];
+          try { localFeeds = await idbGetAllFeeds(); } catch (err) { localFeeds = []; }
+
+          const online = isBackendOnline();
+          let feeds = [];
+
+          if (online) {
+            try {
+              const serverFeeds = await serverListFeeds();
+              const byId = new Map((localFeeds || []).map((f) => [String(f?.id ?? ""), f]));
+              feeds = (serverFeeds || []).map((sf) => {
+                const id = String(sf?.id ?? "");
+                const local = byId.get(id) || {};
+                const mergedUpdatedAt = Math.max(Number(local?.updatedAt ?? 0), Number(sf?.updatedAt ?? 0));
+                return {
+                  ...local,
+                  ...sf,
+                  updatedAt: mergedUpdatedAt,
+                  lastOkAt: Number(local?.lastOkAt ?? 0),
+                  lastError: String(local?.lastError ?? ""),
+                  cachedGeojson: String(local?.cachedGeojson ?? ""),
+                  cachedAt: Number(local?.cachedAt ?? 0),
+                };
+              });
+
+              // Best-effort sync to browser store (keep cached snapshots).
+              for (const f of feeds) {
+                // eslint-disable-next-line no-await-in-loop
+                await idbPutFeed(f);
+              }
+            } catch (err) {
+              console.warn("server feeds list failed; using local cache", err);
+              feeds = localFeeds;
+            }
+          } else {
+            feeds = localFeeds;
+          }
+
+          feeds.sort((a, b) => Number(b?.updatedAt ?? 0) - Number(a?.updatedAt ?? 0));
+          feedsList.innerHTML = "";
+          feedsEmpty.style.display = feeds.length ? "none" : "block";
+          if (!feeds.length) return;
+
+          for (const feed of feeds) {
+            const row = document.createElement("div");
+            row.className = "section";
+            row.style.padding = "10px";
+            const err = String(feed?.lastError ?? "").trim();
+            const okAt = Number(feed?.lastOkAt ?? 0);
+            const okText = okAt ? new Date(okAt).toLocaleString() : "—";
+            const cacheAt = Number(feed?.cachedAt ?? 0);
+            const cacheText = cacheAt ? new Date(cacheAt).toLocaleString() : "—";
+            row.innerHTML = `
+              <div style="display:flex; align-items:center; justify-content:space-between; gap:10px;">
+                <div style="font-weight:800;">${String(feed?.name ?? "Unnamed")}</div>
+                <span class="pill">${String(feed?.format ?? "auto")}</span>
+              </div>
+              <div style="font-size:12px; color:var(--muted); margin-top:6px; word-break:break-word;">${String(feed?.url ?? "")}</div>
+              <div style="font-size:12px; color:var(--muted); margin-top:6px;">Last ok: ${okText} • Cached: ${cacheText}</div>
+              ${err ? `<div style="font-size:12px; margin-top:6px; color:var(--warning);">${err}</div>` : ``}
+              <div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;">
+                <button type="button" data-action="refresh" ${!isBackendOnline() ? "disabled" : ""}>Fetch & load</button>
+                <button type="button" data-action="cache">Load cache</button>
+                <button type="button" data-action="remove" style="border-color:#7f1d1d;">Remove</button>
+              </div>
+            `;
+
+            const btnRefresh = row.querySelector('button[data-action="refresh"]');
+            const btnCache = row.querySelector('button[data-action="cache"]');
+            const btnRemove = row.querySelector('button[data-action="remove"]');
+
+            btnRefresh?.addEventListener("click", () => refreshFeed(feed, { allowCacheOnly: false }));
+            btnCache?.addEventListener("click", () => refreshFeed(feed, { allowCacheOnly: true }));
+            btnRemove?.addEventListener("click", async () => {
+              try {
+                if (isBackendOnline()) {
+                  await serverDeleteFeed(feed.id);
+                }
+                await idbDeleteFeed(feed.id);
+                try { wasm.remove_feed_layer?.(`feed:${feed.id}`); } catch (_) {}
+                renderFeeds();
+                renderFeedLayerControls();
+              } catch (err) {
+                console.error("delete feed failed", err);
+              }
+            });
+
+            feedsList.appendChild(row);
+          }
+        }
+
+        function renderFeedLayerControls() {
+          if (!feedLayerControls) return;
+          feedLayerControls.innerHTML = "";
+          if (!wasm.list_feed_layers) return;
+          let layers = [];
+          try { layers = wasm.list_feed_layers() ?? []; } catch (err) { layers = []; }
+          if (!Array.isArray(layers) || layers.length === 0) return;
+
+          for (const l of layers) {
+            const id = String(l?.id ?? "");
+            const name = String(l?.name ?? id);
+            const pts = Number(l?.points ?? 0);
+
+            const row = document.createElement("div");
+            row.className = "layer-row";
+            row.innerHTML = `
+              <label class="checkbox">
+                <input type="checkbox" data-role="visible" ${l?.visible ? "checked" : ""} />
+                <span>${name} <span class="pill">${pts} pts</span></span>
+              </label>
+              <input type="color" data-role="color" value="${String(l?.color_hex ?? "#60a5fa")}" />
+              <div>
+                <div class="mini">Opacity</div>
+                <input type="range" data-role="opacity" min="0" max="1" step="0.01" value="${String(l?.opacity ?? 0.95)}" />
+              </div>
+              <div>
+                <div class="mini">Lift</div>
+                <input type="range" data-role="lift" min="-0.02" max="0.05" step="0.001" value="${String(l?.lift ?? 0.0)}" />
+              </div>
+            `;
+
+            const vis = row.querySelector('input[data-role="visible"]');
+            const color = row.querySelector('input[data-role="color"]');
+            const opacity = row.querySelector('input[data-role="opacity"]');
+            const lift = row.querySelector('input[data-role="lift"]');
+
+            vis?.addEventListener("change", (e) => { try { wasm.set_layer_visible(id, !!e.target.checked); } catch (err) { console.error(err); } });
+            color?.addEventListener("input", (e) => { try { wasm.set_layer_color_hex(id, e.target.value); } catch (err) { console.error(err); } });
+            opacity?.addEventListener("input", (e) => { try { wasm.set_layer_opacity(id, Number(e.target.value)); } catch (err) { console.error(err); } });
+            lift?.addEventListener("input", (e) => { try { wasm.set_layer_lift(id, Number(e.target.value)); } catch (err) { console.error(err); } });
+
+            feedLayerControls.appendChild(row);
+          }
+        }
+
+        feedsRefreshAllBtn?.addEventListener("click", async () => {
+          try {
+            if (!isBackendOnline()) {
+              setStatus("Backend offline: can't refresh feeds");
+              return;
+            }
+            const feeds = await idbGetAllFeeds();
+            for (const f of feeds) {
+              // Serialize to avoid hammering the network.
+              // eslint-disable-next-line no-await-in-loop
+              await refreshFeed(f, { allowCacheOnly: false });
+            }
+          } catch (err) {
+            console.error("refresh all failed", err);
+          }
+        });
+
+        feedTestBtn?.addEventListener("click", async () => {
+          if (!isBackendOnline()) {
+            if (feedPreview) feedPreview.textContent = "Backend offline: can't test downloads.";
+            return;
+          }
+          const url = String(feedUrl?.value ?? "").trim();
+          const name = String(feedName?.value ?? "").trim() || "Untitled feed";
+          const format = String(feedFormat?.value ?? "auto");
+          const latField = String(feedLat?.value ?? "").trim();
+          const lonField = String(feedLon?.value ?? "").trim();
+          const maxRows = Number(feedMaxRows?.value ?? 5000);
+          const csvSkipRows = Math.max(0, Math.floor(Number(feedCsvSkipRows?.value ?? 0) || 0));
+          const csvFirstRowHeader = feedCsvHeader ? !!feedCsvHeader.checked : true;
+          const csvSkip = String(feedCsvSkip?.value ?? "").trim();
+          const filter = String(feedFilter?.value ?? "").trim();
+          if (!url) {
+            if (feedPreview) feedPreview.textContent = "Please provide a URL.";
+            return;
+          }
+          const tmp = { id: "_tmp", name, url, format, latField, lonField, maxRows, csvSkipRows, csvSkip, csvFirstRowHeader, filter };
+          try {
+            if (feedPreview) feedPreview.textContent = "Downloading…";
+            const fetched = await serverFetchUrl(url);
+            const text = String(fetched?.text ?? "");
+            const contentType = String(fetched?.contentType ?? "");
+            const geo = await buildGeoJsonFromFeed(tmp, text, contentType);
+            const pts = Array.isArray(geo?.features) ? geo.features.length : 0;
+            const detectedFmt = inferFormat(format, url, contentType);
+            if (feedPreview) {
+              feedPreview.innerHTML = `
+                <div><span style="color:var(--success); font-weight:700;">OK</span> <span class="pill">${detectedFmt}</span></div>
+                <div style="margin-top:6px;">Parsed points: <span style="color:var(--info); font-weight:700;">${pts}</span></div>
+                <div style="margin-top:6px; color:var(--muted);">If points look wrong, specify latitude/longitude fields.</div>
+              `;
+            }
+          } catch (err) {
+            const msg = formatFetchError(err);
+            if (feedPreview) feedPreview.innerHTML = `<div style="color:var(--warning);">${msg}</div>`;
+          }
+        });
+
+        feedSaveBtn?.addEventListener("click", async () => {
+          if (!isBackendOnline()) {
+            if (feedPreview) feedPreview.textContent = "Backend offline: can't save feeds.";
+            return;
+          }
+          const url = String(feedUrl?.value ?? "").trim();
+          const name = String(feedName?.value ?? "").trim() || "Untitled feed";
+          const format = String(feedFormat?.value ?? guessFormatFromUrl(url));
+          const latField = String(feedLat?.value ?? "").trim();
+          const lonField = String(feedLon?.value ?? "").trim();
+          const maxRows = Number(feedMaxRows?.value ?? 5000);
+          const csvSkipRows = Math.max(0, Math.floor(Number(feedCsvSkipRows?.value ?? 0) || 0));
+          const csvFirstRowHeader = feedCsvHeader ? !!feedCsvHeader.checked : true;
+          const csvSkip = String(feedCsvSkip?.value ?? "").trim();
+          const filter = String(feedFilter?.value ?? "").trim();
+
+          if (!url) {
+            if (feedPreview) feedPreview.textContent = "Please provide a URL.";
+            return;
+          }
+
+          const id = newId();
+          const feedSpec = {
+            id,
+            name,
+            url,
+            format,
+            latField,
+            lonField,
+            maxRows,
+            csvSkipRows,
+            csvSkip,
+            csvFirstRowHeader,
+            filter,
+          };
+
+          try {
+            const saved = await serverUpsertFeed(feedSpec);
+            const feed = {
+              ...saved,
+              lastOkAt: 0,
+              lastError: "",
+              cachedGeojson: "",
+              cachedAt: 0,
+            };
+            await idbPutFeed(feed);
+            closeFeedModal();
+            renderFeeds();
+            // Auto-fetch once.
+            await refreshFeed(feed, { allowCacheOnly: false });
+            renderFeedLayerControls();
+          } catch (err) {
+            console.error("save feed failed", err);
+            setStatus("Failed to save feed (see console)");
+          }
+        });
+
+        // Initial feed render.
+        syncFeedsBackendUi();
+        renderFeeds();
+        renderFeedLayerControls();
 
         if (compactTabs) {
           compactTabs.querySelectorAll("button[data-tab]").forEach((btn) => {
@@ -2036,10 +3082,14 @@
         // Initial render.
         renderCatalog();
 
-        let viewMode = "3d"; // 3d only (2d disabled)
+        let viewMode = (localStorage.getItem("atlas.viewMode") || "3d").toLowerCase();
+        if (viewMode !== "2d" && viewMode !== "3d") viewMode = "3d";
 
         function applyViewMode(next) {
-          viewMode = "3d";
+          next = String(next || "").toLowerCase();
+          if (next !== "2d" && next !== "3d") return;
+          viewMode = next;
+          try { localStorage.setItem("atlas.viewMode", viewMode); } catch (e) { /* ignore */ }
           canvas2d.classList.toggle("hidden", viewMode !== "2d");
           canvas3d.classList.toggle("hidden", viewMode !== "3d");
           mode2dBtn?.classList.toggle("active", viewMode === "2d");
@@ -2049,9 +3099,9 @@
           updateCompass();
         }
 
-        mode2dBtn?.addEventListener("click", () => applyViewMode("3d"));
+        mode2dBtn?.addEventListener("click", () => applyViewMode("2d"));
         mode3dBtn?.addEventListener("click", () => applyViewMode("3d"));
-        mapView?.addEventListener("click", () => applyViewMode("3d"));
+        mapView?.addEventListener("click", () => applyViewMode(viewMode === "2d" ? "3d" : "2d"));
 
         function activeCanvas() {
           return viewMode === "2d" ? canvas2d : canvas3d;
@@ -2652,7 +3702,7 @@
         setStatus("Controls: drag=rotate, wheel=zoom, R=reset, click=pick");
 
         // Default view mode.
-        applyViewMode("3d");
+        applyViewMode(viewMode);
       }
 
       function bootstrap() {

@@ -8,7 +8,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Path as AxumPath, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use serde::Serialize;
 use serde_json::json;
@@ -21,6 +21,7 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 mod data_sources;
+mod feeds;
 mod webhooks;
 mod ws_streaming;
 
@@ -28,6 +29,7 @@ use data_sources::{
     DataSource, DataSourceInfo, DataSourceMetadata, FallbackSource, FilesystemSource, HttpSource,
     MemorySource, PmtilesSource,
 };
+use feeds::{delete_feed, fetch_feed, fetch_url, list_feeds, upsert_feed, FeedsStore};
 use webhooks::{WebhookConfig, WebhookRegistry, WebhookSchema, WebhookSource};
 use ws_streaming::DataSourceRegistry;
 
@@ -39,6 +41,7 @@ struct AppState {
     data_sources: Arc<DataSourceRegistry>,
     webhooks: Arc<WebhookRegistry>,
     streaming_config: StreamingConfig,
+    feeds: Arc<FeedsStore>,
 }
 
 #[derive(Clone, Debug)]
@@ -162,6 +165,19 @@ async fn main() {
 
     let streaming_config = StreamingConfig::default();
 
+    let feeds_store_path = env::var("FEEDS_STORE_PATH")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| terrain_root.join("feeds.json"));
+    let feeds = Arc::new(FeedsStore::new(feeds_store_path));
+
+    if let Some(parent) = feeds.path().parent() {
+        if let Err(err) = tokio::fs::create_dir_all(parent).await {
+            warn!("failed to create feeds store directory: {err}");
+        }
+    }
+
     let state = AppState {
         terrain: Arc::new(terrain),
         surface_root,
@@ -169,6 +185,7 @@ async fn main() {
         data_sources: data_sources.clone(),
         webhooks: webhooks.clone(),
         streaming_config: streaming_config.clone(),
+        feeds,
     };
 
     if let Err(err) = tokio::fs::create_dir_all(&state.terrain.cache_root).await {
@@ -181,7 +198,13 @@ async fn main() {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_headers(Any)
-        .allow_methods([Method::GET, Method::POST, Method::OPTIONS]);
+        .allow_methods([
+            Method::GET,
+            Method::POST,
+            Method::PUT,
+            Method::DELETE,
+            Method::OPTIONS,
+        ]);
 
     let app = Router::new()
         .route("/healthz", get(healthz))
@@ -231,6 +254,11 @@ async fn main() {
         .route("/ws/realtime", get(ws_realtime_handler))
         // Webhook ingestion
         .route("/webhook/:source_id", post(webhook_handler))
+        // Online feeds (minimal JSON file store + server-side fetch to avoid browser CORS)
+        .route("/api/feeds", get(list_feeds).post(upsert_feed))
+        .route("/api/feeds/fetch", post(fetch_url))
+        .route("/api/feeds/:feed_id", delete(delete_feed))
+        .route("/api/feeds/:feed_id/fetch", get(fetch_feed))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state.clone());

@@ -8,6 +8,11 @@
 - Target: `wasm32-unknown-unknown`
 - Build: `cargo build -p web --target wasm32-unknown-unknown`
 
+### View modes (web)
+- 3D: WebGPU globe renderer.
+- 2D: Canvas renderer in Web Mercator (EPSG:3857).
+- Switch using the `2D` / `3D` buttons in the top bar (defaults to full-world in 2D).
+
 ### Built-in datasets (web)
 - Stored under `crates/apps/web/assets/` (e.g., `world.json`, `chunks/*.avc`).
 - Bundled at build time by Trunk via `copy-dir` in [crates/apps/web/index.html](crates/apps/web/index.html).
@@ -44,7 +49,7 @@ The terrain backend generates tiles on demand using GDAL CLI tools (`gdalbuildvr
 - Build and run both services:
 	- `docker compose up --build`
 
-- Web UI: http://127.0.0.1:8082/
+- Web UI: http://127.0.0.1:9103/
 - Terrain server: http://127.0.0.1:9102/
 
 The terrain server streams tiles into a container volume at `/data/terrain/cache`.

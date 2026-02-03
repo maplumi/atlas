@@ -1,6 +1,7 @@
 use gloo_net::http::Request;
 use serde::Deserialize;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::JsCast;
@@ -203,6 +204,14 @@ impl Default for CameraState {
 }
 
 #[derive(Debug)]
+struct FeedLayerState {
+    name: String,
+    centers: Vec<[f32; 3]>,
+    count_points: usize,
+    style: LayerStyle,
+}
+
+#[derive(Debug)]
 struct ViewerState {
     dataset: String,
     canvas_width: f64,
@@ -281,6 +290,9 @@ struct ViewerState {
     uploaded_count_points: usize,
     uploaded_count_lines: usize,
     uploaded_count_polys: usize,
+
+    // Online feeds (browser-fetched). For now these render as point layers.
+    feed_layers: BTreeMap<String, FeedLayerState>,
 
     base_count_polys: usize,
     cities_count_points: usize,
@@ -380,6 +392,8 @@ thread_local! {
         uploaded_count_points: 0,
         uploaded_count_lines: 0,
         uploaded_count_polys: 0,
+
+        feed_layers: BTreeMap::new(),
 
         base_count_polys: 0,
         cities_count_points: 0,
@@ -1102,9 +1116,9 @@ fn render_scene_2d() -> Result<(), JsValue> {
                 let a = tri[0];
                 let b = tri[1];
                 let c = tri[2];
-                let (lon_a, lat_a) = world_to_lon_lat_deg([a[0] as f64, a[1] as f64, a[2] as f64]);
-                let (lon_b, lat_b) = world_to_lon_lat_deg([b[0] as f64, b[1] as f64, b[2] as f64]);
-                let (lon_c, lat_c) = world_to_lon_lat_deg([c[0] as f64, c[1] as f64, c[2] as f64]);
+                let (lon_a, lat_a) = world_to_lon_lat_fast_deg(a);
+                let (lon_b, lat_b) = world_to_lon_lat_fast_deg(b);
+                let (lon_c, lat_c) = world_to_lon_lat_fast_deg(c);
 
                 let (ax, ay) = projector.project_lon_lat(lon_a, lat_a, w, h);
                 let (bx, by) = projector.project_lon_lat(lon_b, lat_b, w, h);
@@ -1169,8 +1183,8 @@ fn render_scene_2d() -> Result<(), JsValue> {
             for seg in pos.chunks_exact(2).take(250_000) {
                 let a = seg[0];
                 let b = seg[1];
-                let (lon_a, lat_a) = world_to_lon_lat_deg([a[0] as f64, a[1] as f64, a[2] as f64]);
-                let (lon_b, lat_b) = world_to_lon_lat_deg([b[0] as f64, b[1] as f64, b[2] as f64]);
+                let (lon_a, lat_a) = world_to_lon_lat_fast_deg(a);
+                let (lon_b, lat_b) = world_to_lon_lat_fast_deg(b);
                 let (ax, ay) = projector.project_lon_lat(lon_a, lat_a, w, h);
                 let (bx, by) = projector.project_lon_lat(lon_b, lat_b, w, h);
                 ctx.move_to(ax, ay);
@@ -1208,7 +1222,7 @@ fn render_scene_2d() -> Result<(), JsValue> {
             ctx_set_fill_style(ctx, &rgba_css(color));
             ctx.begin_path();
             for &c in centers.iter().take(200_000) {
-                let (lon, lat) = world_to_lon_lat_deg([c[0] as f64, c[1] as f64, c[2] as f64]);
+                let (lon, lat) = world_to_lon_lat_fast_deg(c);
                 let (x, y) = projector.project_lon_lat(lon, lat, w, h);
                 let _ = ctx.arc(x, y, radius_px, 0.0, std::f64::consts::TAU);
             }
@@ -1333,9 +1347,19 @@ fn slerp_unit(a: [f64; 3], b: [f64; 3], t: f64) -> [f64; 3] {
 }
 
 fn lon_lat_deg_from_unit(u: [f64; 3]) -> (f64, f64) {
-    let lon = u[2].atan2(u[0]).to_degrees();
+    // In viewer space, +lon (east) corresponds to -Z.
+    // unit_from_lon_lat_deg(lon, lat) => z = -cos(lat)*sin(lon)
+    // Therefore lon = atan2(-z, x).
+    let lon = (-u[2]).atan2(u[0]).to_degrees();
     let lat = u[1].clamp(-1.0, 1.0).asin().to_degrees();
     (lon, lat)
+}
+
+fn world_to_lon_lat_fast_deg(p: [f32; 3]) -> (f64, f64) {
+    // For 2D/WebMercator rendering, a fast spherical mapping is sufficient and
+    // dramatically cheaper than a full ECEF->geodetic conversion.
+    let u = vec3_normalize([p[0] as f64, p[1] as f64, p[2] as f64]);
+    lon_lat_deg_from_unit(u)
 }
 
 fn world_from_vector_chunk(
@@ -1588,6 +1612,16 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
                 s.uploaded_points_style.lift,
             ));
         }
+        for layer in s.feed_layers.values() {
+            if layer.style.visible && !layer.centers.is_empty() {
+                points.extend(build_city_vertices(
+                    &layer.centers,
+                    s.city_marker_size,
+                    layer.style.color,
+                    layer.style.lift,
+                ));
+            }
+        }
         if s.selection_style.visible
             && let Some(c) = s.selection_center
         {
@@ -1766,18 +1800,41 @@ fn init_canvas_2d_inner() -> Result<(), JsValue> {
 
 #[wasm_bindgen]
 pub fn set_view_mode(mode: &str) -> Result<(), JsValue> {
-    let mode = match ViewMode::from_str(mode) {
-        ViewMode::TwoD => ViewMode::ThreeD,
-        ViewMode::ThreeD => ViewMode::ThreeD,
-    };
+    let mode = ViewMode::from_str(mode);
     with_state(|state| {
         let mut s = state.borrow_mut();
-        s.view_mode = mode;
-        if mode == ViewMode::TwoD {
-            s.surface_positions = None;
-            s.surface_zoom = None;
-            s.base_regions_positions = None;
+
+        if s.view_mode != mode {
+            match (s.view_mode, mode) {
+                (ViewMode::ThreeD, ViewMode::TwoD) => {
+                    // Map current 3D view center to the 2D camera so toggling feels seamless.
+                    let dir = vec3_normalize([
+                        s.camera.pitch_rad.cos() * s.camera.yaw_rad.cos(),
+                        s.camera.pitch_rad.sin(),
+                        -s.camera.pitch_rad.cos() * s.camera.yaw_rad.sin(),
+                    ]);
+                    let (lon, lat) = lon_lat_deg_from_unit(dir);
+                    s.camera_2d.center_lon_deg = lon;
+                    s.camera_2d.center_lat_deg = lat;
+
+                    // Roughly preserve apparent scale: default distance 3*WGS84_A => zoom 1.
+                    let z = (3.0 * WGS84_A) / s.camera.distance.max(1.0);
+                    s.camera_2d.zoom = clamp(z, 0.2, 200.0);
+                }
+                (ViewMode::TwoD, ViewMode::ThreeD) => {
+                    // Map 2D center back to a 3D orbit camera.
+                    s.camera.yaw_rad = s.camera_2d.center_lon_deg.to_radians();
+                    s.camera.pitch_rad =
+                        clamp(s.camera_2d.center_lat_deg.to_radians(), -1.55, 1.55);
+                    let dist = (3.0 * WGS84_A) / s.camera_2d.zoom.max(1e-6);
+                    s.camera.distance = clamp(dist, 1.001 * WGS84_A, 200.0 * WGS84_A);
+                    s.camera.target = [0.0, 0.0, 0.0];
+                }
+                _ => {}
+            }
         }
+
+        s.view_mode = mode;
     });
     if mode == ViewMode::TwoD {
         ensure_surface_loaded();
@@ -2232,6 +2289,9 @@ pub fn set_globe_transparent(transparent: bool) -> Result<(), JsValue> {
 }
 
 fn layer_style_mut<'a>(s: &'a mut ViewerState, id: &str) -> Option<&'a mut LayerStyle> {
+    if let Some(feed) = s.feed_layers.get_mut(id) {
+        return Some(&mut feed.style);
+    }
     match id {
         "world_base" => Some(&mut s.base_regions_style),
         "terrain" => Some(&mut s.terrain_style),
@@ -2247,6 +2307,9 @@ fn layer_style_mut<'a>(s: &'a mut ViewerState, id: &str) -> Option<&'a mut Layer
 }
 
 fn layer_style_ref<'a>(s: &'a ViewerState, id: &str) -> Option<&'a LayerStyle> {
+    if let Some(feed) = s.feed_layers.get(id) {
+        return Some(&feed.style);
+    }
     match id {
         "world_base" => Some(&s.base_regions_style),
         "terrain" => Some(&s.terrain_style),
@@ -3766,7 +3829,7 @@ fn world_to_lon_lat_deg(p: [f64; 3]) -> (f64, f64) {
 }
 
 fn viewer_to_mercator_m(p: &[f32; 3]) -> [f32; 2] {
-    let (lon, lat) = world_to_lon_lat_deg([p[0] as f64, p[1] as f64, p[2] as f64]);
+    let (lon, lat) = world_to_lon_lat_fast_deg([p[0], p[1], p[2]]);
     let x = mercator_x_m(lon);
     let y = mercator_y_m(lat);
     [x as f32, y as f32]
@@ -3971,6 +4034,11 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
             && let Some(centers) = s.uploaded_centers.as_deref()
         {
             consider_points(centers);
+        }
+        for layer in s.feed_layers.values() {
+            if layer.style.visible && !layer.centers.is_empty() {
+                consider_points(&layer.centers);
+            }
         }
         if let Some((c, d2)) = best_point {
             // Markers are rendered at a constant screen-space size.
@@ -4181,6 +4249,11 @@ fn cursor_click_2d(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
         {
             consider(centers);
         }
+        for layer in s.feed_layers.values() {
+            if layer.style.visible && !layer.centers.is_empty() {
+                consider(&layer.centers);
+            }
+        }
 
         if let Some((c, d2)) = best
             && d2 <= r2
@@ -4213,6 +4286,136 @@ fn cursor_click_2d(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     }
 
     Ok(out.into())
+}
+
+#[wasm_bindgen]
+pub fn load_geojson_feed_layer(
+    feed_layer_id: String,
+    name: String,
+    geojson_text: String,
+) -> Result<(), JsValue> {
+    // Keep a conservative cap: feeds are user-controlled and can be huge.
+    const MAX_GEOJSON_TEXT_BYTES: usize = 8 * 1024 * 1024;
+    const MAX_FEED_POINTS: usize = 250_000;
+
+    if geojson_text.len() > MAX_GEOJSON_TEXT_BYTES {
+        return Err(JsValue::from_str(
+            "Feed payload too large for the web viewer (max 8MiB GeoJSON).",
+        ));
+    }
+
+    let mut chunk = formats::VectorChunk::from_geojson_str(&geojson_text)
+        .map_err(|e| JsValue::from_str(&e.to_string()))?;
+    let _fix_counts = normalize_chunk_coords_in_place(&mut chunk);
+
+    let mut centers: Vec<[f32; 3]> = Vec::new();
+    for f in &chunk.features {
+        use formats::VectorGeometry::*;
+        match &f.geometry {
+            Point(p) => {
+                centers.push(lon_lat_deg_to_world(p.lon_deg, p.lat_deg));
+            }
+            MultiPoint(ps) => {
+                for p in ps {
+                    centers.push(lon_lat_deg_to_world(p.lon_deg, p.lat_deg));
+                    if centers.len() >= MAX_FEED_POINTS {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if centers.len() >= MAX_FEED_POINTS {
+            break;
+        }
+    }
+
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+
+        let style = s
+            .feed_layers
+            .get(&feed_layer_id)
+            .map(|l| l.style)
+            .unwrap_or(LayerStyle {
+                visible: true,
+                color: [0.38, 0.73, 1.0, 0.95],
+                lift: 0.0,
+            });
+
+        let count_points = centers.len();
+        s.feed_layers.insert(
+            feed_layer_id.clone(),
+            FeedLayerState {
+                name,
+                centers,
+                count_points,
+                style,
+            },
+        );
+    });
+
+    let _ = rebuild_overlays_and_upload();
+    let _ = render_scene();
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn remove_feed_layer(feed_layer_id: &str) -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.feed_layers.remove(feed_layer_id);
+    });
+    let _ = rebuild_overlays_and_upload();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn list_feed_layers() -> Result<JsValue, JsValue> {
+    let arr = js_sys::Array::new();
+    with_state(|state| {
+        let s = state.borrow();
+        for (id, layer) in &s.feed_layers {
+            let o = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(&o, &JsValue::from_str("id"), &JsValue::from_str(id));
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("name"),
+                &JsValue::from_str(&layer.name),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("points"),
+                &JsValue::from_f64(layer.count_points as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("visible"),
+                &JsValue::from_bool(layer.style.visible),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("color_hex"),
+                &JsValue::from_str(&color_to_hex([
+                    layer.style.color[0],
+                    layer.style.color[1],
+                    layer.style.color[2],
+                ])),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("opacity"),
+                &JsValue::from_f64(layer.style.color[3] as f64),
+            );
+            let _ = js_sys::Reflect::set(
+                &o,
+                &JsValue::from_str("lift"),
+                &JsValue::from_f64(layer.style.lift as f64),
+            );
+            arr.push(&o);
+        }
+    });
+    Ok(arr.into())
 }
 
 #[wasm_bindgen]
