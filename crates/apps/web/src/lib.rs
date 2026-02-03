@@ -14,6 +14,16 @@ use web_sys::{CanvasRenderingContext2d, HtmlCanvasElement};
 static INITIALIZED: AtomicBool = AtomicBool::new(false);
 static PANIC_HOOK_SET: OnceLock<()> = OnceLock::new();
 
+/// Yield to the browser event loop to keep the UI responsive during heavy computation.
+/// This uses setTimeout(0) to allow repaints and input processing.
+async fn yield_now() {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        let window = web_sys::window().unwrap();
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(&resolve, 0);
+    });
+    let _ = JsFuture::from(promise).await;
+}
+
 use catalog::{CatalogEntry, CatalogStore};
 use formats::SceneManifest;
 use foundation::math::{Geodetic, WGS84_A, WGS84_B, ecef_to_geodetic, geodetic_to_ecef};
@@ -207,6 +217,7 @@ impl Default for CameraState {
 struct FeedLayerState {
     name: String,
     centers: Vec<[f32; 3]>,
+    centers_mercator: Vec<[f32; 2]>,
     count_points: usize,
     style: LayerStyle,
 }
@@ -255,8 +266,11 @@ struct ViewerState {
     base_regions_positions: Option<Vec<[f32; 3]>>,
     base_regions_mercator: Option<Vec<[f32; 2]>>,
     cities_centers: Option<Vec<[f32; 3]>>,
+    cities_mercator: Option<Vec<[f32; 2]>>,
     corridors_positions: Option<Vec<[f32; 3]>>,
+    corridors_mercator: Option<Vec<[f32; 2]>>,
     regions_positions: Option<Vec<[f32; 3]>>,
+    regions_mercator: Option<Vec<[f32; 2]>>,
 
     base_world_loading: bool,
     base_world_error: Option<String>,
@@ -285,8 +299,11 @@ struct ViewerState {
     uploaded_name: Option<String>,
     uploaded_catalog_id: Option<String>,
     uploaded_centers: Option<Vec<[f32; 3]>>,
+    uploaded_mercator: Option<Vec<[f32; 2]>>,
     uploaded_corridors_positions: Option<Vec<[f32; 3]>>,
+    uploaded_corridors_mercator: Option<Vec<[f32; 2]>>,
     uploaded_regions_positions: Option<Vec<[f32; 3]>>,
+    uploaded_regions_mercator: Option<Vec<[f32; 2]>>,
     uploaded_count_points: usize,
     uploaded_count_lines: usize,
     uploaded_count_polys: usize,
@@ -300,8 +317,20 @@ struct ViewerState {
     regions_count_polys: usize,
 
     selection_center: Option<[f32; 3]>,
+    selection_center_mercator: Option<[f32; 2]>,
     selection_line_positions: Option<Vec<[f32; 3]>>,
+    selection_line_mercator: Option<Vec<[f32; 2]>>,
     selection_poly_positions: Option<Vec<[f32; 3]>>,
+    selection_poly_mercator: Option<Vec<[f32; 2]>>,
+
+    // 2D render instrumentation (ms). Best-effort timing.
+    perf_2d_total_ms: f64,
+    perf_2d_poly_ms: f64,
+    perf_2d_line_ms: f64,
+    perf_2d_point_ms: f64,
+    perf_2d_poly_tris: u32,
+    perf_2d_line_segs: u32,
+    perf_2d_points: u32,
 
     // Combined buffers (all visible layers), uploaded into the shared GPU buffers.
     pending_cities: Option<Vec<CityVertex>>,
@@ -357,8 +386,11 @@ thread_local! {
         base_regions_positions: None,
         base_regions_mercator: None,
         cities_centers: None,
+        cities_mercator: None,
         corridors_positions: None,
+        corridors_mercator: None,
         regions_positions: None,
+        regions_mercator: None,
 
         base_world_loading: false,
         base_world_error: None,
@@ -387,8 +419,11 @@ thread_local! {
         uploaded_name: None,
         uploaded_catalog_id: None,
         uploaded_centers: None,
+        uploaded_mercator: None,
         uploaded_corridors_positions: None,
+        uploaded_corridors_mercator: None,
         uploaded_regions_positions: None,
+        uploaded_regions_mercator: None,
         uploaded_count_points: 0,
         uploaded_count_lines: 0,
         uploaded_count_polys: 0,
@@ -401,8 +436,19 @@ thread_local! {
         regions_count_polys: 0,
 
         selection_center: None,
+        selection_center_mercator: None,
         selection_line_positions: None,
+        selection_line_mercator: None,
         selection_poly_positions: None,
+        selection_poly_mercator: None,
+
+        perf_2d_total_ms: 0.0,
+        perf_2d_poly_ms: 0.0,
+        perf_2d_line_ms: 0.0,
+        perf_2d_point_ms: 0.0,
+        perf_2d_poly_tris: 0,
+        perf_2d_line_segs: 0,
+        perf_2d_points: 0,
         pending_cities: None,
         pending_corridors: None,
         pending_base_regions: None,
@@ -637,6 +683,10 @@ fn wrap_lon_deg(mut lon: f64) -> f64 {
 
 const MERCATOR_MAX_LAT_DEG: f64 = 85.05112878;
 
+fn is_mercator_lat_valid(lat_deg: f64) -> bool {
+    lat_deg.is_finite() && lat_deg >= -MERCATOR_MAX_LAT_DEG && lat_deg <= MERCATOR_MAX_LAT_DEG
+}
+
 fn mercator_x_m(lon_deg: f64) -> f64 {
     WGS84_A * lon_deg.to_radians()
 }
@@ -644,6 +694,181 @@ fn mercator_x_m(lon_deg: f64) -> f64 {
 fn mercator_y_m(lat_deg: f64) -> f64 {
     let lat = clamp(lat_deg, -MERCATOR_MAX_LAT_DEG, MERCATOR_MAX_LAT_DEG).to_radians();
     WGS84_A * (0.5 * (std::f64::consts::FRAC_PI_2 + lat)).tan().ln()
+}
+
+fn unwrap_mercator_x_m(anchor_x_m: f64, x_m: f64) -> f64 {
+    let ww = 2.0 * std::f64::consts::PI * WGS84_A;
+    let dx = (x_m - anchor_x_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
+    anchor_x_m + dx
+}
+
+fn clip_polygon_lat_band(mut poly: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    // Sutherland–Hodgman against two horizontal lines: lat <= +max, lat >= -max.
+    fn clip_against(
+        poly: Vec<(f64, f64)>,
+        keep_if: impl Fn(f64) -> bool,
+        bound_lat: f64,
+    ) -> Vec<(f64, f64)> {
+        if poly.is_empty() {
+            return poly;
+        }
+        let mut out = Vec::with_capacity(poly.len() + 2);
+        let mut prev = *poly.last().unwrap();
+        let mut prev_in = keep_if(prev.1);
+        for &cur in &poly {
+            let cur_in = keep_if(cur.1);
+            if prev_in != cur_in {
+                // Edge crosses the boundary; find t where lat == bound_lat.
+                let (lon0, lat0) = prev;
+                let (lon1, lat1) = cur;
+                let denom = lat1 - lat0;
+                if denom.abs() > 1e-12 {
+                    let t = (bound_lat - lat0) / denom;
+                    let lon = lon0 + (lon1 - lon0) * t;
+                    out.push((lon, bound_lat));
+                } else {
+                    // Degenerate: just snap.
+                    out.push((cur.0, bound_lat));
+                }
+            }
+            if cur_in {
+                out.push(cur);
+            }
+            prev = cur;
+            prev_in = cur_in;
+        }
+        out
+    }
+
+    poly = clip_against(poly, |lat| lat <= MERCATOR_MAX_LAT_DEG, MERCATOR_MAX_LAT_DEG);
+    poly = clip_against(poly, |lat| lat >= -MERCATOR_MAX_LAT_DEG, -MERCATOR_MAX_LAT_DEG);
+    poly
+}
+
+fn world_tris_to_mercator_clipped(pos: &[[f32; 3]]) -> Vec<[f32; 2]> {
+    let mut out: Vec<[f32; 2]> = Vec::with_capacity(pos.len());
+    for tri in pos.chunks_exact(3).take(2_000_000) {
+        let (lon0, lat0) = world_to_lon_lat_fast_deg(tri[0]);
+        let (lon1, lat1) = world_to_lon_lat_fast_deg(tri[1]);
+        let (lon2, lat2) = world_to_lon_lat_fast_deg(tri[2]);
+
+        // If fully valid, fast path.
+        if is_mercator_lat_valid(lat0) && is_mercator_lat_valid(lat1) && is_mercator_lat_valid(lat2)
+        {
+            let ax = mercator_x_m(lon0);
+            let ay = mercator_y_m(lat0);
+            let bx0 = mercator_x_m(lon1);
+            let by = mercator_y_m(lat1);
+            let cx0 = mercator_x_m(lon2);
+            let cy = mercator_y_m(lat2);
+
+            // Unwrap within triangle to keep it local.
+            let bx = unwrap_mercator_x_m(ax, bx0);
+            let cx = unwrap_mercator_x_m(ax, cx0);
+            out.push([ax as f32, ay as f32]);
+            out.push([bx as f32, by as f32]);
+            out.push([cx as f32, cy as f32]);
+            continue;
+        }
+
+        // Clip the triangle polygon against the Mercator latitude band.
+        let poly = clip_polygon_lat_band(vec![(lon0, lat0), (lon1, lat1), (lon2, lat2)]);
+        if poly.len() < 3 {
+            continue;
+        }
+
+        // Triangulate by fan.
+        let (fan0_lon, fan0_lat) = poly[0];
+        let fan0_x = mercator_x_m(fan0_lon);
+        let fan0_y = mercator_y_m(fan0_lat);
+        for w in poly.windows(2).skip(1) {
+            let (b_lon, b_lat) = w[0];
+            let (c_lon, c_lat) = w[1];
+            let bx0 = mercator_x_m(b_lon);
+            let by = mercator_y_m(b_lat);
+            let cx0 = mercator_x_m(c_lon);
+            let cy = mercator_y_m(c_lat);
+            let bx = unwrap_mercator_x_m(fan0_x, bx0);
+            let cx = unwrap_mercator_x_m(fan0_x, cx0);
+            out.push([fan0_x as f32, fan0_y as f32]);
+            out.push([bx as f32, by as f32]);
+            out.push([cx as f32, cy as f32]);
+        }
+    }
+    out
+}
+
+fn clip_segment_lat_band(a: (f64, f64), b: (f64, f64)) -> Option<((f64, f64), (f64, f64))> {
+    // Clip segment to lat ∈ [-max, +max].
+    let (mut lon0, mut lat0) = a;
+    let (mut lon1, mut lat1) = b;
+
+    // Quick reject if both outside on same side.
+    if lat0 < -MERCATOR_MAX_LAT_DEG && lat1 < -MERCATOR_MAX_LAT_DEG {
+        return None;
+    }
+    if lat0 > MERCATOR_MAX_LAT_DEG && lat1 > MERCATOR_MAX_LAT_DEG {
+        return None;
+    }
+
+    // Clip against +max.
+    if lat0 > MERCATOR_MAX_LAT_DEG || lat1 > MERCATOR_MAX_LAT_DEG {
+        let denom = lat1 - lat0;
+        if denom.abs() < 1e-12 {
+            return None;
+        }
+        let t = (MERCATOR_MAX_LAT_DEG - lat0) / denom;
+        let lon = lon0 + (lon1 - lon0) * t;
+        if lat0 > MERCATOR_MAX_LAT_DEG {
+            lon0 = lon;
+            lat0 = MERCATOR_MAX_LAT_DEG;
+        } else {
+            lon1 = lon;
+            lat1 = MERCATOR_MAX_LAT_DEG;
+        }
+    }
+
+    // Clip against -max.
+    if lat0 < -MERCATOR_MAX_LAT_DEG || lat1 < -MERCATOR_MAX_LAT_DEG {
+        let denom = lat1 - lat0;
+        if denom.abs() < 1e-12 {
+            return None;
+        }
+        let t = (-MERCATOR_MAX_LAT_DEG - lat0) / denom;
+        let lon = lon0 + (lon1 - lon0) * t;
+        if lat0 < -MERCATOR_MAX_LAT_DEG {
+            lon0 = lon;
+            lat0 = -MERCATOR_MAX_LAT_DEG;
+        } else {
+            lon1 = lon;
+            lat1 = -MERCATOR_MAX_LAT_DEG;
+        }
+    }
+
+    Some(((lon0, lat0), (lon1, lat1)))
+}
+
+fn world_segs_to_mercator_clipped(pos: &[[f32; 3]]) -> Vec<[f32; 2]> {
+    let mut out: Vec<[f32; 2]> = Vec::with_capacity(pos.len());
+    for seg in pos.chunks_exact(2).take(3_000_000) {
+        let (lon0, lat0) = world_to_lon_lat_fast_deg(seg[0]);
+        let (lon1, lat1) = world_to_lon_lat_fast_deg(seg[1]);
+        let Some(((clon0, clat0), (clon1, clat1))) =
+            clip_segment_lat_band((lon0, lat0), (lon1, lat1))
+        else {
+            continue;
+        };
+
+        let ax = mercator_x_m(clon0);
+        let ay = mercator_y_m(clat0);
+        let bx0 = mercator_x_m(clon1);
+        let by = mercator_y_m(clat1);
+        let bx = unwrap_mercator_x_m(ax, bx0);
+
+        out.push([ax as f32, ay as f32]);
+        out.push([bx as f32, by as f32]);
+    }
+    out
 }
 
 fn inverse_mercator_lon_deg(x_m: f64) -> f64 {
@@ -740,6 +965,62 @@ fn pan_camera_2d(
         ),
         ..cam
     }
+}
+
+#[wasm_bindgen]
+pub fn camera_zoom_at(x_px: f64, y_px: f64, wheel_delta_y: f64) -> Result<(), JsValue> {
+    if !x_px.is_finite() || !y_px.is_finite() || !wheel_delta_y.is_finite() {
+        return Err(JsValue::from_str("camera_zoom_at args must be finite"));
+    }
+
+    let mode = with_state(|state| state.borrow().view_mode);
+    if mode != ViewMode::TwoD {
+        return camera_zoom(wheel_delta_y);
+    }
+
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.auto_rotate_last_user_time_s = wall_clock_seconds();
+
+        let w = s.canvas_width.max(1.0);
+        let h = s.canvas_height.max(1.0);
+        let cam = s.camera_2d;
+        let projector = MercatorProjector::new(cam, w, h);
+
+        // Mercator point under the cursor (in meters).
+        let dx_m = (x_px - w * 0.5) / projector.scale_px_per_m;
+        let dy_m = (h * 0.5 - y_px) / projector.scale_px_per_m;
+        let p_x_m = projector.center_x + dx_m;
+        let p_y_m = projector.center_y + dy_m;
+
+        // Zoom.
+        let zoom_factor = (-wheel_delta_y * 0.0015).exp();
+        // Minimum zoom 1.0 = whole world fits in viewport; prevents zooming out beyond world extent.
+        let next_zoom = clamp(cam.zoom * zoom_factor, 1.0, 200.0);
+
+        // Adjust center so the cursor stays anchored on the same mercator point.
+        let next_cam = Camera2DState {
+            zoom: next_zoom,
+            ..cam
+        };
+        let next_scale = camera2d_scale_px_per_m(next_cam, w, h);
+        let next_dx_m = (x_px - w * 0.5) / next_scale;
+        let next_dy_m = (h * 0.5 - y_px) / next_scale;
+        let next_center_x = p_x_m - next_dx_m;
+        let next_center_y = p_y_m - next_dy_m;
+
+        s.camera_2d = Camera2DState {
+            center_lon_deg: wrap_lon_deg(inverse_mercator_lon_deg(next_center_x)),
+            center_lat_deg: clamp(
+                inverse_mercator_lat_deg(next_center_y),
+                -MERCATOR_MAX_LAT_DEG,
+                MERCATOR_MAX_LAT_DEG,
+            ),
+            zoom: next_zoom,
+        };
+    });
+
+    render_scene()
 }
 
 fn rgba_css(c: [f32; 4]) -> String {
@@ -1047,12 +1328,26 @@ fn render_scene() -> Result<(), JsValue> {
     }
 }
 
+/// Perf stats collected during a 2D render pass.
+struct Render2DStats {
+    total_ms: f64,
+    poly_ms: f64,
+    line_ms: f64,
+    point_ms: f64,
+    poly_tris: u32,
+    line_segs: u32,
+    points: u32,
+}
+
 fn render_scene_2d() -> Result<(), JsValue> {
-    match STATE.try_with(|state_ref| {
+    // First pass: render and collect stats (immutable borrow).
+    let stats_opt: Option<Render2DStats> = STATE.try_with(|state_ref| {
         let state = state_ref.borrow();
         let Some(ctx) = state.ctx_2d.as_ref() else {
-            return Ok(());
+            return None;
         };
+
+        let t0 = now_ms();
 
         let w = state.canvas_width.max(1.0);
         let h = state.canvas_height.max(1.0);
@@ -1108,44 +1403,112 @@ fn render_scene_2d() -> Result<(), JsValue> {
 
         let projector = MercatorProjector::new(state.camera_2d, w, h);
 
+        let mut poly_tris: u32 = 0;
+        let mut line_segs: u32 = 0;
+        let mut points: u32 = 0;
+
+        let tp0 = now_ms();
+
         // Polygons first (fills).
         let draw_poly_tris = |pos: &[[f32; 3]], color: [f32; 4]| {
+            // Chunking avoids extremely large paths causing browser rasterization artifacts.
+            const TRI_CHUNK: usize = 10_000;
+            let ww = projector.world_width_m;
+            let cx = projector.center_x;
+            let cy = projector.center_y;
+            let s = projector.scale_px_per_m;
+
             ctx_set_fill_style(ctx, &rgba_css(color));
             ctx.begin_path();
-            for tri in pos.chunks_exact(3).take(200_000) {
+
+            for (i, tri) in pos.chunks_exact(3).take(2_000_000).enumerate() {
+                if i > 0 && (i % TRI_CHUNK) == 0 {
+                    ctx.fill();
+                    ctx.begin_path();
+                }
+
                 let a = tri[0];
                 let b = tri[1];
                 let c = tri[2];
+
                 let (lon_a, lat_a) = world_to_lon_lat_fast_deg(a);
                 let (lon_b, lat_b) = world_to_lon_lat_fast_deg(b);
                 let (lon_c, lat_c) = world_to_lon_lat_fast_deg(c);
 
-                let (ax, ay) = projector.project_lon_lat(lon_a, lat_a, w, h);
-                let (bx, by) = projector.project_lon_lat(lon_b, lat_b, w, h);
-                let (cx, cy) = projector.project_lon_lat(lon_c, lat_c, w, h);
+                let ax_m = mercator_x_m(lon_a);
+                let ay_m = mercator_y_m(lat_a);
+                let bx_m = mercator_x_m(lon_b);
+                let by_m = mercator_y_m(lat_b);
+                let cx_m = mercator_x_m(lon_c);
+                let cy_m = mercator_y_m(lat_c);
+
+                // Unwrap mercator X per-triangle to avoid seam-spanning triangles.
+                let ax_adj = {
+                    let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
+                    cx + dx0
+                };
+                let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+                let cx_adj = ax_adj + ((cx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+
+                let ax = w * 0.5 + (ax_adj - cx) * s;
+                let bx = w * 0.5 + (bx_adj - cx) * s;
+                let cxp = w * 0.5 + (cx_adj - cx) * s;
+                let ay = h * 0.5 - (ay_m - cy) * s;
+                let by = h * 0.5 - (by_m - cy) * s;
+                let cyy = h * 0.5 - (cy_m - cy) * s;
 
                 ctx.move_to(ax, ay);
                 ctx.line_to(bx, by);
-                ctx.line_to(cx, cy);
+                ctx.line_to(cxp, cyy);
                 ctx.close_path();
             }
             ctx.fill();
         };
 
         let draw_poly_tris_mercator = |pos: &[[f32; 2]], color: [f32; 4]| {
+            const TRI_CHUNK: usize = 10_000;
+            let ww = projector.world_width_m;
+            let cx = projector.center_x;
+            let cy = projector.center_y;
+            let s = projector.scale_px_per_m;
+
             ctx_set_fill_style(ctx, &rgba_css(color));
             ctx.begin_path();
-            for tri in pos.chunks_exact(3).take(200_000) {
+            for (i, tri) in pos.chunks_exact(3).take(2_000_000).enumerate() {
+                if i > 0 && (i % TRI_CHUNK) == 0 {
+                    ctx.fill();
+                    ctx.begin_path();
+                }
+
                 let a = tri[0];
                 let b = tri[1];
                 let c = tri[2];
-                let (ax, ay) = projector.project_mercator_m(a[0] as f64, a[1] as f64, w, h);
-                let (bx, by) = projector.project_mercator_m(b[0] as f64, b[1] as f64, w, h);
-                let (cx, cy) = projector.project_mercator_m(c[0] as f64, c[1] as f64, w, h);
+
+                let ax_m = a[0] as f64;
+                let ay_m = a[1] as f64;
+                let bx_m = b[0] as f64;
+                let by_m = b[1] as f64;
+                let cx_m = c[0] as f64;
+                let cy_m = c[1] as f64;
+
+                // Unwrap mercator X per-triangle to avoid seam-spanning triangles.
+                let ax_adj = {
+                    let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
+                    cx + dx0
+                };
+                let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+                let cx_adj = ax_adj + ((cx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+
+                let ax = w * 0.5 + (ax_adj - cx) * s;
+                let bx = w * 0.5 + (bx_adj - cx) * s;
+                let cxp = w * 0.5 + (cx_adj - cx) * s;
+                let ay = h * 0.5 - (ay_m - cy) * s;
+                let by = h * 0.5 - (by_m - cy) * s;
+                let cyy = h * 0.5 - (cy_m - cy) * s;
 
                 ctx.move_to(ax, ay);
                 ctx.line_to(bx, by);
-                ctx.line_to(cx, cy);
+                ctx.line_to(cxp, cyy);
                 ctx.close_path();
             }
             ctx.fill();
@@ -1153,75 +1516,186 @@ fn render_scene_2d() -> Result<(), JsValue> {
 
         if state.base_regions_style.visible {
             if let Some(pos) = state.base_regions_mercator.as_deref() {
+                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
                 draw_poly_tris_mercator(pos, state.base_regions_style.color);
             } else if let Some(pos) = state.base_regions_positions.as_deref() {
+                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
                 draw_poly_tris(pos, state.base_regions_style.color);
             }
         }
-        if state.regions_style.visible
-            && let Some(pos) = state.regions_positions.as_deref()
-        {
-            draw_poly_tris(pos, state.regions_style.color);
+        if state.regions_style.visible {
+            if let Some(pos) = state.regions_mercator.as_deref() {
+                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                draw_poly_tris_mercator(pos, state.regions_style.color);
+            } else if let Some(pos) = state.regions_positions.as_deref() {
+                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                draw_poly_tris(pos, state.regions_style.color);
+            }
         }
-        if state.uploaded_regions_style.visible
-            && let Some(pos) = state.uploaded_regions_positions.as_deref()
-        {
-            draw_poly_tris(pos, state.uploaded_regions_style.color);
+        if state.uploaded_regions_style.visible {
+            if let Some(pos) = state.uploaded_regions_mercator.as_deref() {
+                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                draw_poly_tris_mercator(pos, state.uploaded_regions_style.color);
+            } else if let Some(pos) = state.uploaded_regions_positions.as_deref() {
+                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                draw_poly_tris(pos, state.uploaded_regions_style.color);
+            }
         }
-        if state.selection_style.visible
-            && let Some(pos) = state.selection_poly_positions.as_deref()
-        {
-            draw_poly_tris(pos, state.selection_style.color);
+        if state.selection_style.visible {
+            if let Some(pos) = state.selection_poly_mercator.as_deref() {
+                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                draw_poly_tris_mercator(pos, state.selection_style.color);
+            } else if let Some(pos) = state.selection_poly_positions.as_deref() {
+                poly_tris = poly_tris.saturating_add((pos.len() / 3).min(2_000_000) as u32);
+                draw_poly_tris(pos, state.selection_style.color);
+            }
         }
 
+        let tp1 = now_ms();
+
         // Lines.
+        let tl0 = now_ms();
         let draw_lines = |pos: &[[f32; 3]], color: [f32; 4], width_px: f64| {
+            const SEG_CHUNK: usize = 25_000;
+            let ww = projector.world_width_m;
+            let cx = projector.center_x;
+            let cy = projector.center_y;
+            let s = projector.scale_px_per_m;
+
             ctx_set_stroke_style(ctx, &rgba_css(color));
             ctx.set_line_width(width_px.max(1.0));
             ctx.set_line_cap("round");
             ctx.begin_path();
-            for seg in pos.chunks_exact(2).take(250_000) {
+
+            for (i, seg) in pos.chunks_exact(2).take(1_500_000).enumerate() {
+                if i > 0 && (i % SEG_CHUNK) == 0 {
+                    ctx.stroke();
+                    ctx.begin_path();
+                }
+
                 let a = seg[0];
                 let b = seg[1];
                 let (lon_a, lat_a) = world_to_lon_lat_fast_deg(a);
                 let (lon_b, lat_b) = world_to_lon_lat_fast_deg(b);
-                let (ax, ay) = projector.project_lon_lat(lon_a, lat_a, w, h);
-                let (bx, by) = projector.project_lon_lat(lon_b, lat_b, w, h);
+
+                let ax_m = mercator_x_m(lon_a);
+                let ay_m = mercator_y_m(lat_a);
+                let bx_m = mercator_x_m(lon_b);
+                let by_m = mercator_y_m(lat_b);
+
+                // Unwrap mercator X per-segment.
+                let ax_adj = {
+                    let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
+                    cx + dx0
+                };
+                let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+
+                let ax = w * 0.5 + (ax_adj - cx) * s;
+                let bx = w * 0.5 + (bx_adj - cx) * s;
+                let ay = h * 0.5 - (ay_m - cy) * s;
+                let by = h * 0.5 - (by_m - cy) * s;
+
                 ctx.move_to(ax, ay);
                 ctx.line_to(bx, by);
             }
             ctx.stroke();
         };
 
-        if state.corridors_style.visible
-            && let Some(pos) = state.corridors_positions.as_deref()
-        {
-            draw_lines(pos, state.corridors_style.color, state.line_width_px as f64);
+        let draw_lines_mercator = |pos: &[[f32; 2]], color: [f32; 4], width_px: f64| {
+            const SEG_CHUNK: usize = 25_000;
+            let ww = projector.world_width_m;
+            let cx = projector.center_x;
+            let cy = projector.center_y;
+            let s = projector.scale_px_per_m;
+
+            ctx_set_stroke_style(ctx, &rgba_css(color));
+            ctx.set_line_width(width_px.max(1.0));
+            ctx.set_line_cap("round");
+            ctx.begin_path();
+
+            for (i, seg) in pos.chunks_exact(2).take(1_500_000).enumerate() {
+                if i > 0 && (i % SEG_CHUNK) == 0 {
+                    ctx.stroke();
+                    ctx.begin_path();
+                }
+
+                let a = seg[0];
+                let b = seg[1];
+                let ax_m = a[0] as f64;
+                let ay_m = a[1] as f64;
+                let bx_m = b[0] as f64;
+                let by_m = b[1] as f64;
+
+                // Unwrap mercator X per-segment.
+                let ax_adj = {
+                    let dx0 = (ax_m - cx + 0.5 * ww).rem_euclid(ww) - 0.5 * ww;
+                    cx + dx0
+                };
+                let bx_adj = ax_adj + ((bx_m - ax_m + 0.5 * ww).rem_euclid(ww) - 0.5 * ww);
+
+                let ax = w * 0.5 + (ax_adj - cx) * s;
+                let bx = w * 0.5 + (bx_adj - cx) * s;
+                let ay = h * 0.5 - (ay_m - cy) * s;
+                let by = h * 0.5 - (by_m - cy) * s;
+
+                ctx.move_to(ax, ay);
+                ctx.line_to(bx, by);
+            }
+            ctx.stroke();
+        };
+
+        if state.corridors_style.visible {
+            if let Some(pos) = state.corridors_mercator.as_deref() {
+                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                draw_lines_mercator(pos, state.corridors_style.color, state.line_width_px as f64);
+            } else if let Some(pos) = state.corridors_positions.as_deref() {
+                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                draw_lines(pos, state.corridors_style.color, state.line_width_px as f64);
+            }
         }
-        if state.uploaded_corridors_style.visible
-            && let Some(pos) = state.uploaded_corridors_positions.as_deref()
-        {
-            draw_lines(
-                pos,
-                state.uploaded_corridors_style.color,
-                state.line_width_px as f64,
-            );
+        if state.uploaded_corridors_style.visible {
+            if let Some(pos) = state.uploaded_corridors_mercator.as_deref() {
+                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                draw_lines_mercator(
+                    pos,
+                    state.uploaded_corridors_style.color,
+                    state.line_width_px as f64,
+                );
+            } else if let Some(pos) = state.uploaded_corridors_positions.as_deref() {
+                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                draw_lines(
+                    pos,
+                    state.uploaded_corridors_style.color,
+                    state.line_width_px as f64,
+                );
+            }
         }
-        if state.selection_style.visible
-            && let Some(pos) = state.selection_line_positions.as_deref()
-        {
-            draw_lines(
-                pos,
-                state.selection_style.color,
-                (state.line_width_px * 1.6) as f64,
-            );
+        if state.selection_style.visible {
+            if let Some(pos) = state.selection_line_mercator.as_deref() {
+                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                draw_lines_mercator(
+                    pos,
+                    state.selection_style.color,
+                    (state.line_width_px * 1.6) as f64,
+                );
+            } else if let Some(pos) = state.selection_line_positions.as_deref() {
+                line_segs = line_segs.saturating_add((pos.len() / 2).min(250_000) as u32);
+                draw_lines(
+                    pos,
+                    state.selection_style.color,
+                    (state.line_width_px * 1.6) as f64,
+                );
+            }
         }
 
+        let tl1 = now_ms();
+
         // Points.
+        let tpt0 = now_ms();
         let draw_points = |centers: &[[f32; 3]], color: [f32; 4], radius_px: f64| {
             ctx_set_fill_style(ctx, &rgba_css(color));
             ctx.begin_path();
-            for &c in centers.iter().take(200_000) {
+            for &c in centers.iter().take(2_000_000) {
                 let (lon, lat) = world_to_lon_lat_fast_deg(c);
                 let (x, y) = projector.project_lon_lat(lon, lat, w, h);
                 let _ = ctx.arc(x, y, radius_px, 0.0, std::f64::consts::TAU);
@@ -1229,20 +1703,45 @@ fn render_scene_2d() -> Result<(), JsValue> {
             ctx.fill();
         };
 
+        let draw_points_mercator = |centers: &[[f32; 2]], color: [f32; 4], radius_px: f64| {
+            ctx_set_fill_style(ctx, &rgba_css(color));
+            ctx.begin_path();
+            for &c in centers.iter().take(2_000_000) {
+                let (x, y) = projector.project_mercator_m(c[0] as f64, c[1] as f64, w, h);
+                let _ = ctx.arc(x, y, radius_px, 0.0, std::f64::consts::TAU);
+            }
+            ctx.fill();
+        };
+
         let r = (state.city_marker_size as f64).clamp(1.0, 32.0);
-        if state.cities_style.visible
-            && let Some(centers) = state.cities_centers.as_deref()
-        {
-            draw_points(centers, state.cities_style.color, r);
+        if state.cities_style.visible {
+            if let Some(centers) = state.cities_mercator.as_deref() {
+                points = points.saturating_add(centers.len().min(2_000_000) as u32);
+                draw_points_mercator(centers, state.cities_style.color, r);
+            } else if let Some(centers) = state.cities_centers.as_deref() {
+                points = points.saturating_add(centers.len().min(2_000_000) as u32);
+                draw_points(centers, state.cities_style.color, r);
+            }
         }
-        if state.uploaded_points_style.visible
-            && let Some(centers) = state.uploaded_centers.as_deref()
-        {
-            draw_points(centers, state.uploaded_points_style.color, r);
+        if state.uploaded_points_style.visible {
+            if let Some(centers) = state.uploaded_mercator.as_deref() {
+                points = points.saturating_add(centers.len().min(2_000_000) as u32);
+                draw_points_mercator(centers, state.uploaded_points_style.color, r);
+            } else if let Some(centers) = state.uploaded_centers.as_deref() {
+                points = points.saturating_add(centers.len().min(2_000_000) as u32);
+                draw_points(centers, state.uploaded_points_style.color, r);
+            }
+        }
+        for layer in state.feed_layers.values() {
+            if layer.style.visible && !layer.centers_mercator.is_empty() {
+                points = points.saturating_add(layer.centers_mercator.len().min(2_000_000) as u32);
+                draw_points_mercator(&layer.centers_mercator, layer.style.color, r);
+            }
         }
         if state.selection_style.visible
             && let Some(c) = state.selection_center
         {
+            points = points.saturating_add(1);
             draw_points(
                 std::slice::from_ref(&c),
                 state.selection_style.color,
@@ -1250,11 +1749,59 @@ fn render_scene_2d() -> Result<(), JsValue> {
             );
         }
 
-        Ok(())
-    }) {
-        Ok(res) => res,
-        Err(_) => Ok(()),
+        let tpt1 = now_ms();
+
+        let t1 = now_ms();
+        Some(Render2DStats {
+            total_ms: (t1 - t0).max(0.0),
+            poly_ms: (tp1 - tp0).max(0.0),
+            line_ms: (tl1 - tl0).max(0.0),
+            point_ms: (tpt1 - tpt0).max(0.0),
+            poly_tris,
+            line_segs,
+            points,
+        })
+    }).ok().flatten();
+
+    // Second pass: write stats (mutable borrow, after the immutable borrow is released).
+    if let Some(stats) = stats_opt {
+        let _ = STATE.try_with(|state_ref| {
+            let mut s = state_ref.borrow_mut();
+            s.perf_2d_total_ms = stats.total_ms;
+            s.perf_2d_poly_ms = stats.poly_ms;
+            s.perf_2d_line_ms = stats.line_ms;
+            s.perf_2d_point_ms = stats.point_ms;
+            s.perf_2d_poly_tris = stats.poly_tris;
+            s.perf_2d_line_segs = stats.line_segs;
+            s.perf_2d_points = stats.points;
+        });
     }
+    Ok(())
+}
+
+#[wasm_bindgen]
+pub fn get_2d_perf_stats() -> Result<JsValue, JsValue> {
+    let out = js_sys::Object::new();
+    let (total, poly, line, point, tris, segs, pts) = with_state(|state| {
+        let s = state.borrow();
+        (
+            s.perf_2d_total_ms,
+            s.perf_2d_poly_ms,
+            s.perf_2d_line_ms,
+            s.perf_2d_point_ms,
+            s.perf_2d_poly_tris,
+            s.perf_2d_line_segs,
+            s.perf_2d_points,
+        )
+    });
+    js_sys::Reflect::set(&out, &JsValue::from_str("total_ms"), &JsValue::from_f64(total))?;
+    js_sys::Reflect::set(&out, &JsValue::from_str("poly_ms"), &JsValue::from_f64(poly))?;
+    js_sys::Reflect::set(&out, &JsValue::from_str("line_ms"), &JsValue::from_f64(line))?;
+    js_sys::Reflect::set(&out, &JsValue::from_str("point_ms"), &JsValue::from_f64(point))?;
+    js_sys::Reflect::set(&out, &JsValue::from_str("poly_tris"), &JsValue::from_f64(tris as f64))?;
+    js_sys::Reflect::set(&out, &JsValue::from_str("line_segs"), &JsValue::from_f64(segs as f64))?;
+    js_sys::Reflect::set(&out, &JsValue::from_str("points"), &JsValue::from_f64(pts as f64))?;
+    Ok(out.into())
 }
 
 fn build_city_vertices(
@@ -1414,10 +1961,10 @@ fn build_corridor_vertices(
         out.extend([v00, v01, v11, v00, v11, v10]);
     };
 
-    const MAX_SEGMENTS: usize = 250_000;
+    const MAX_SEGMENTS: usize = 1_500_000;
     let mut emitted_segments = 0usize;
 
-    for seg in positions_line_list.chunks_exact(2).take(250_000) {
+    for seg in positions_line_list.chunks_exact(2).take(1_500_000) {
         let a = seg[0];
         let b = seg[1];
 
@@ -1471,10 +2018,10 @@ fn build_corridor_vertices(
 
 fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
     // Budget guardrails: the web viewer will trap on extremely large GPU buffers.
-    // Keep these conservative; we can revisit once we stream + chunk uploads.
-    const MAX_UPLOADED_POINTS: usize = 100_000;
-    const MAX_UPLOADED_LINE_SEGMENTS: usize = 150_000;
-    const MAX_UPLOADED_POLY_VERTS: usize = 600_000;
+    // Increased limits to support larger datasets; JS-side validation can still apply lower limits.
+    const MAX_UPLOADED_POINTS: usize = 2_000_000;
+    const MAX_UPLOADED_LINE_SEGMENTS: usize = 3_000_000;
+    const MAX_UPLOADED_POLY_VERTS: usize = 6_000_000;
 
     match STATE.try_with(|state| {
         let mut s = state.borrow_mut();
@@ -1486,9 +2033,11 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
         // Built-ins
         if let Some(pos) = s.surface_positions.as_ref() {
             let pos_vec = pos.clone();
-            let mercator = pos_vec.iter().map(viewer_to_mercator_m).collect();
             s.base_regions_positions = Some(pos_vec);
-            s.base_regions_mercator = Some(mercator);
+            s.base_regions_mercator = s
+                .base_regions_positions
+                .as_ref()
+                .map(|pos| world_tris_to_mercator_clipped(pos));
         } else {
             s.base_regions_positions = s.base_world.as_ref().map(|w| {
                 let snap = layer.extract(w);
@@ -1500,7 +2049,7 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
             s.base_regions_mercator = s
                 .base_regions_positions
                 .as_ref()
-                .map(|pos| pos.iter().map(viewer_to_mercator_m).collect());
+                .map(|pos| world_tris_to_mercator_clipped(pos));
         }
         s.cities_centers = s.cities_world.as_ref().map(|w| {
             let snap = layer.extract(w);
@@ -1509,6 +2058,10 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
                 .map(ecef_vec3_to_viewer_f32)
                 .collect::<Vec<_>>()
         });
+        s.cities_mercator = s
+            .cities_centers
+            .as_ref()
+            .map(|centers| centers.iter().map(viewer_to_mercator_m).collect());
 
         s.corridors_positions = s.corridors_world.as_ref().map(|w| {
             let snap = layer.extract(w);
@@ -1521,6 +2074,10 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
             }
             out
         });
+        s.corridors_mercator = s
+            .corridors_positions
+            .as_ref()
+            .map(|pos| world_segs_to_mercator_clipped(pos));
 
         s.regions_positions = s.regions_world.as_ref().map(|w| {
             let snap = layer.extract(w);
@@ -1529,6 +2086,10 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
                 .map(ecef_vec3_to_viewer_f32)
                 .collect::<Vec<_>>()
         });
+        s.regions_mercator = s
+            .regions_positions
+            .as_ref()
+            .map(|pos| world_tris_to_mercator_clipped(pos));
 
         // Uploaded
         if let Some(w) = s.uploaded_world.as_ref() {
@@ -1564,6 +2125,10 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
                     .map(ecef_vec3_to_viewer_f32)
                     .collect::<Vec<_>>(),
             );
+            s.uploaded_mercator = s
+                .uploaded_centers
+                .as_ref()
+                .map(|centers| centers.iter().map(viewer_to_mercator_m).collect());
             s.uploaded_corridors_positions = Some({
                 let mut out: Vec<[f32; 3]> = Vec::with_capacity(uploaded_line_segments * 2);
                 for line in snap.lines {
@@ -1574,17 +2139,46 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
                 }
                 out
             });
+            s.uploaded_corridors_mercator = s
+                .uploaded_corridors_positions
+                .as_ref()
+                .map(|pos| world_segs_to_mercator_clipped(pos));
             s.uploaded_regions_positions = Some(
                 snap.area_triangles
                     .into_iter()
                     .map(ecef_vec3_to_viewer_f32)
                     .collect::<Vec<_>>(),
             );
+            s.uploaded_regions_mercator = s
+                .uploaded_regions_positions
+                .as_ref()
+                .map(|pos| world_tris_to_mercator_clipped(pos));
         } else {
             s.uploaded_centers = None;
+            s.uploaded_mercator = None;
             s.uploaded_corridors_positions = None;
+            s.uploaded_corridors_mercator = None;
             s.uploaded_regions_positions = None;
+            s.uploaded_regions_mercator = None;
         }
+
+        // Feed layers (points).
+        for layer in s.feed_layers.values_mut() {
+            if layer.centers_mercator.len() != layer.centers.len() {
+                layer.centers_mercator = layer.centers.iter().map(viewer_to_mercator_m).collect();
+            }
+        }
+
+        // Selection caches.
+        s.selection_center_mercator = s.selection_center.map(|c| viewer_to_mercator_m(&c));
+        s.selection_line_mercator = s
+            .selection_line_positions
+            .as_ref()
+            .map(|pos| world_segs_to_mercator_clipped(pos));
+        s.selection_poly_mercator = s
+            .selection_poly_positions
+            .as_ref()
+            .map(|pos| world_tris_to_mercator_clipped(pos));
 
         let mut points: Vec<CityVertex> = Vec::new();
         let mut lines: Vec<CorridorVertex> = Vec::new();
@@ -1807,19 +2401,10 @@ pub fn set_view_mode(mode: &str) -> Result<(), JsValue> {
         if s.view_mode != mode {
             match (s.view_mode, mode) {
                 (ViewMode::ThreeD, ViewMode::TwoD) => {
-                    // Map current 3D view center to the 2D camera so toggling feels seamless.
-                    let dir = vec3_normalize([
-                        s.camera.pitch_rad.cos() * s.camera.yaw_rad.cos(),
-                        s.camera.pitch_rad.sin(),
-                        -s.camera.pitch_rad.cos() * s.camera.yaw_rad.sin(),
-                    ]);
-                    let (lon, lat) = lon_lat_deg_from_unit(dir);
-                    s.camera_2d.center_lon_deg = lon;
-                    s.camera_2d.center_lat_deg = lat;
-
-                    // Roughly preserve apparent scale: default distance 3*WGS84_A => zoom 1.
-                    let z = (3.0 * WGS84_A) / s.camera.distance.max(1.0);
-                    s.camera_2d.zoom = clamp(z, 0.2, 200.0);
+                    // Start 2D mode with the default whole-world view (lon=0, lat=0, zoom=1)
+                    // rather than mapping from the 3D camera position.
+                    // This ensures a clean, predictable initial 2D view.
+                    s.camera_2d = Camera2DState::default();
                 }
                 (ViewMode::TwoD, ViewMode::ThreeD) => {
                     // Map 2D center back to a 3D orbit camera.
@@ -4013,7 +4598,7 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
         // 1) Points
         let mut best_point: Option<([f32; 3], f32)> = None;
         let mut consider_points = |centers: &[[f32; 3]]| {
-            for &c in centers.iter().take(150_000) {
+            for &c in centers.iter().take(2_000_000) {
                 let Some((sx, sy)) = project(c) else {
                     continue;
                 };
@@ -4051,7 +4636,7 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
         // 2) Lines (distance to segment)
         let mut best_line: Option<([f32; 3], [f32; 3], f32)> = None;
         let mut consider_lines = |pos: &[[f32; 3]]| {
-            for seg in pos.chunks_exact(2).take(200_000) {
+            for seg in pos.chunks_exact(2).take(1_500_000) {
                 let a = seg[0];
                 let b = seg[1];
                 let Some((ax, ay)) = project(a) else {
@@ -4135,7 +4720,7 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
         }
 
         let consider_polys = |pos: &[[f32; 3]]| -> Option<Vec<[f32; 3]>> {
-            for tri in pos.chunks_exact(3).take(60_000) {
+            for tri in pos.chunks_exact(3).take(500_000) {
                 let a = tri[0];
                 let b = tri[1];
                 let c = tri[2];
@@ -4224,39 +4809,111 @@ fn cursor_click_2d(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
         let r2 = radius_px * radius_px;
         let (lon_click, lat_click) = projector.screen_to_lon_lat(x_px, y_px, w, h);
 
-        let mut best: Option<([f32; 3], f64)> = None; // (center, d2)
+        let mut best_center: Option<[f32; 3]> = None;
+        let mut best_d2: f64 = f64::INFINITY;
 
-        let mut consider = |centers: &[[f32; 3]]| {
-            for &c in centers.iter().take(250_000) {
-                let (lon, lat) = world_to_lon_lat_deg([c[0] as f64, c[1] as f64, c[2] as f64]);
-                let (sx, sy) = projector.project_lon_lat(lon, lat, w, h);
-                let dx = sx - x_px;
-                let dy = sy - y_px;
-                let d2 = dx * dx + dy * dy;
-                if best.map(|(_, bd2)| d2 < bd2).unwrap_or(true) {
-                    best = Some((c, d2));
+        if s.cities_style.visible {
+            if let (Some(world), Some(merc)) =
+                (s.cities_centers.as_deref(), s.cities_mercator.as_deref())
+            {
+                for (i, m) in merc.iter().take(2_000_000).enumerate() {
+                    let (sx, sy) =
+                        projector.project_mercator_m(m[0] as f64, m[1] as f64, w, h);
+                    let dx = sx - x_px;
+                    let dy = sy - y_px;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < best_d2 {
+                        if let Some(&c) = world.get(i) {
+                            best_center = Some(c);
+                            best_d2 = d2;
+                        }
+                    }
+                }
+            } else if let Some(world) = s.cities_centers.as_deref() {
+                for &c in world.iter().take(2_000_000) {
+                    let (lon, lat) = world_to_lon_lat_fast_deg(c);
+                    let (sx, sy) = projector.project_lon_lat(lon, lat, w, h);
+                    let dx = sx - x_px;
+                    let dy = sy - y_px;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < best_d2 {
+                        best_center = Some(c);
+                        best_d2 = d2;
+                    }
                 }
             }
-        };
-
-        if s.cities_style.visible
-            && let Some(centers) = s.cities_centers.as_deref()
-        {
-            consider(centers);
         }
-        if s.uploaded_points_style.visible
-            && let Some(centers) = s.uploaded_centers.as_deref()
-        {
-            consider(centers);
+        if s.uploaded_points_style.visible {
+            if let (Some(world), Some(merc)) =
+                (s.uploaded_centers.as_deref(), s.uploaded_mercator.as_deref())
+            {
+                for (i, m) in merc.iter().take(2_000_000).enumerate() {
+                    let (sx, sy) =
+                        projector.project_mercator_m(m[0] as f64, m[1] as f64, w, h);
+                    let dx = sx - x_px;
+                    let dy = sy - y_px;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < best_d2 {
+                        if let Some(&c) = world.get(i) {
+                            best_center = Some(c);
+                            best_d2 = d2;
+                        }
+                    }
+                }
+            } else if let Some(world) = s.uploaded_centers.as_deref() {
+                for &c in world.iter().take(2_000_000) {
+                    let (lon, lat) = world_to_lon_lat_fast_deg(c);
+                    let (sx, sy) = projector.project_lon_lat(lon, lat, w, h);
+                    let dx = sx - x_px;
+                    let dy = sy - y_px;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < best_d2 {
+                        best_center = Some(c);
+                        best_d2 = d2;
+                    }
+                }
+            }
         }
         for layer in s.feed_layers.values() {
-            if layer.style.visible && !layer.centers.is_empty() {
-                consider(&layer.centers);
+            if !layer.style.visible || layer.centers.is_empty() {
+                continue;
+            }
+            if !layer.centers_mercator.is_empty() {
+                for (i, m) in layer
+                    .centers_mercator
+                    .iter()
+                    .take(2_000_000)
+                    .enumerate()
+                {
+                    let (sx, sy) =
+                        projector.project_mercator_m(m[0] as f64, m[1] as f64, w, h);
+                    let dx = sx - x_px;
+                    let dy = sy - y_px;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < best_d2 {
+                        if let Some(&c) = layer.centers.get(i) {
+                            best_center = Some(c);
+                            best_d2 = d2;
+                        }
+                    }
+                }
+            } else {
+                for &c in layer.centers.iter().take(2_000_000) {
+                    let (lon, lat) = world_to_lon_lat_fast_deg(c);
+                    let (sx, sy) = projector.project_lon_lat(lon, lat, w, h);
+                    let dx = sx - x_px;
+                    let dy = sy - y_px;
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < best_d2 {
+                        best_center = Some(c);
+                        best_d2 = d2;
+                    }
+                }
             }
         }
 
-        if let Some((c, d2)) = best
-            && d2 <= r2
+        if let Some(c) = best_center
+            && best_d2 <= r2
         {
             s.selection_center = Some(c);
             s.selection_line_positions = None;
@@ -4294,13 +4951,14 @@ pub fn load_geojson_feed_layer(
     name: String,
     geojson_text: String,
 ) -> Result<(), JsValue> {
-    // Keep a conservative cap: feeds are user-controlled and can be huge.
-    const MAX_GEOJSON_TEXT_BYTES: usize = 8 * 1024 * 1024;
-    const MAX_FEED_POINTS: usize = 250_000;
+    // Keep a configurable cap: feeds are user-controlled and can be huge.
+    // Default to 200MB to match upload settings.
+    const MAX_GEOJSON_TEXT_BYTES: usize = 200 * 1024 * 1024;
+    const MAX_FEED_POINTS: usize = 1_000_000;
 
     if geojson_text.len() > MAX_GEOJSON_TEXT_BYTES {
         return Err(JsValue::from_str(
-            "Feed payload too large for the web viewer (max 8MiB GeoJSON).",
+            "Feed payload too large for the web viewer (max 200MiB GeoJSON).",
         ));
     }
 
@@ -4344,11 +5002,13 @@ pub fn load_geojson_feed_layer(
             });
 
         let count_points = centers.len();
+        let centers_mercator = centers.iter().map(viewer_to_mercator_m).collect();
         s.feed_layers.insert(
             feed_layer_id.clone(),
             FeedLayerState {
                 name,
                 centers,
+                centers_mercator,
                 count_points,
                 style,
             },
@@ -4419,19 +5079,25 @@ pub fn list_feed_layers() -> Result<JsValue, JsValue> {
 }
 
 #[wasm_bindgen]
-pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsValue, JsValue> {
+pub async fn load_geojson_file(name: String, geojson_text: String, max_size_mb: Option<u32>) -> Result<JsValue, JsValue> {
     // Guardrails: large uploads can exceed wasm memory or browser storage limits.
     // (We currently persist catalog entries via LocalStorage; IndexedDB/DuckDB comes next.)
-    const MAX_GEOJSON_TEXT_BYTES: usize = 8 * 1024 * 1024;
+    // Default 200MB, can be reduced by JS-side settings.
+    let max_bytes = max_size_mb.unwrap_or(200) as usize * 1024 * 1024;
     // NOTE: catalog persistence is best-effort. We store AVC in chunked LocalStorage keys.
 
-    if geojson_text.len() > MAX_GEOJSON_TEXT_BYTES {
-        return Err(JsValue::from_str(
-            "Upload too large for the web viewer (max 8MiB GeoJSON).",
-        ));
+    if geojson_text.len() > max_bytes {
+        let max_mb = max_size_mb.unwrap_or(200);
+        return Err(JsValue::from_str(&format!(
+            "Upload too large for the web viewer (max {}MiB GeoJSON).",
+            max_mb
+        )));
     }
 
     web_sys::console::error_1(&JsValue::from_str("upload: parsing GeoJSON"));
+
+    // Yield before heavy parsing to allow status update to render.
+    yield_now().await;
 
     let mut chunk = formats::VectorChunk::from_geojson_str(&geojson_text)
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
@@ -4441,6 +5107,9 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
     let fix_counts = normalize_chunk_coords_in_place(&mut chunk);
 
     web_sys::console::error_1(&JsValue::from_str("upload: parsed GeoJSON"));
+
+    // Yield after heavy parsing to keep UI responsive.
+    yield_now().await;
 
     // Count primitives for UI + bounds for camera fit.
     let mut count_points = 0usize;
@@ -4472,10 +5141,17 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
     // If the payload is too large for the current LocalStorage-based store, we still load it
     // into the scene but skip persistence (avoids wasm memory traps).
     web_sys::console::error_1(&JsValue::from_str("upload: encoding AVC"));
+
+    // Yield before AVC encoding (CPU-intensive).
+    yield_now().await;
+
     let avc_bytes = chunk
         .to_avc_bytes()
         .map_err(|e| JsValue::from_str(&e.to_string()))?;
     web_sys::console::error_1(&JsValue::from_str("upload: encoded AVC"));
+
+    // Yield after AVC encoding.
+    yield_now().await;
 
     web_sys::console::error_1(&JsValue::from_str("upload: computing now_ms"));
     let now_ms = js_sys::Date::now().max(0.0) as u64;
@@ -4587,9 +5263,15 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
         )));
     }
 
+    // Yield before world ingestion (triangulation is CPU-intensive).
+    yield_now().await;
+
     let world = world_from_vector_chunk(&chunk, None);
 
     web_sys::console::error_1(&JsValue::from_str("upload: ingested world"));
+
+    // Yield after world ingestion.
+    yield_now().await;
 
     match STATE.try_with(|state| {
         let mut s = state.borrow_mut();
@@ -4626,8 +5308,16 @@ pub async fn load_geojson_file(name: String, geojson_text: String) -> Result<JsV
     }
 
     web_sys::console::error_1(&JsValue::from_str("upload: rebuilding overlays"));
+
+    // Yield before overlay rebuild (mercator projection is CPU-intensive).
+    yield_now().await;
+
     rebuild_overlays_and_upload()?;
     web_sys::console::error_1(&JsValue::from_str("upload: rebuilt overlays"));
+
+    // Final yield before render.
+    yield_now().await;
+
     let _ = render_scene();
 
     let summary = js_sys::Object::new();
@@ -4847,6 +5537,13 @@ pub fn advance_frame() -> Result<f64, JsValue> {
         s.base_regions_style.visible && s.frame_index % 180 == 0
     }) {
         ensure_surface_loaded();
+    }
+
+    // 2D rendering is driven by user input handlers (camera pan/zoom), and
+    // re-rendered explicitly when async loads complete. Avoid doing a full
+    // redraw every RAF tick in 2D.
+    if with_state(|state| state.borrow().view_mode == ViewMode::TwoD) {
+        return Ok(with_state(|state| state.borrow().time_s));
     }
 
     render_scene()?;

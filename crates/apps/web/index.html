@@ -815,6 +815,22 @@
               <span id="auto-rotate-speed-value" class="value">0.15</span>
             </div>
           </div>
+          <div class="section">
+            <h3>File Upload</h3>
+            <label for="upload-size-limit">Max upload size (MB)</label>
+            <div class="row">
+              <input id="upload-size-limit" type="range" min="1" max="200" step="1" value="8" />
+              <span id="upload-size-limit-value" class="value">8</span>
+            </div>
+            <label for="max-coord-pairs" style="margin-top:8px;">Max coordinates (thousands)</label>
+            <div class="row">
+              <input id="max-coord-pairs" type="range" min="100" max="5000" step="100" value="1000" />
+              <span id="max-coord-pairs-value" class="value">1000k</span>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.35; margin-top:4px;">
+              Limits for GeoJSON/CSV uploads. Larger values may slow down the browser.
+            </div>
+          </div>
         </div>
       </div>
       <div id="map-area">
@@ -979,6 +995,35 @@
       </div>
     </div>
     <script type="module">
+      // Global view mode state (initialized early so status functions can read it).
+      let viewMode = "3d";
+      try {
+        const saved = (localStorage.getItem("atlas.viewMode") || "3d").toLowerCase();
+        viewMode = (saved === "2d" || saved === "3d") ? saved : "3d";
+      } catch (_) {}
+
+      // File upload size limit in bytes (default 8MB, max 200MB).
+      const MAX_UPLOAD_SIZE_MB_LIMIT = 200;
+      const DEFAULT_UPLOAD_SIZE_MB = 8;
+      let uploadSizeLimitMB = DEFAULT_UPLOAD_SIZE_MB;
+      try {
+        const saved = parseInt(localStorage.getItem("atlas.uploadSizeMB") || "", 10);
+        if (Number.isFinite(saved) && saved >= 1 && saved <= MAX_UPLOAD_SIZE_MB_LIMIT) {
+          uploadSizeLimitMB = saved;
+        }
+      } catch (_) {}
+
+      // Max coordinate pairs for GeoJSON uploads (default 1M, max 5M).
+      const MAX_COORD_PAIRS_LIMIT = 5_000_000;
+      const DEFAULT_MAX_COORD_PAIRS = 1_000_000;
+      let maxCoordPairs = DEFAULT_MAX_COORD_PAIRS;
+      try {
+        const saved = parseInt(localStorage.getItem("atlas.maxCoordPairs") || "", 10);
+        if (Number.isFinite(saved) && saved >= 100_000 && saved <= MAX_COORD_PAIRS_LIMIT) {
+          maxCoordPairs = saved;
+        }
+      } catch (_) {}
+
       function normalizeTheme(theme) {
         const t = String(theme || "").trim().toLowerCase();
         if (t === "deep-dark" || t === "deep" || t === "black") return "deep-dark";
@@ -1480,6 +1525,7 @@
         wasm.init_canvas_2d();
         wasm.init_wgpu();
         startSurfaceStatusPolling(wasm);
+        start2DPerfPolling(wasm);
         startTerrainClientStatusPolling(wasm);
         startAnimation(wasm);
 
@@ -1608,6 +1654,32 @@
         window.requestAnimationFrame(loop);
       }
 
+      function start2DPerfPolling(wasm) {
+        function poll() {
+          if (document.hidden) return;
+          try {
+            if (viewMode !== "2d") return;
+            if (!wasm.get_2d_perf_stats) return;
+            const s = wasm.get_2d_perf_stats();
+            if (!s) return;
+            const total = Number(s.total_ms || 0).toFixed(1);
+            const poly = Number(s.poly_ms || 0).toFixed(1);
+            const line = Number(s.line_ms || 0).toFixed(1);
+            const pt = Number(s.point_ms || 0).toFixed(1);
+            const tris = Math.round(Number(s.poly_tris || 0));
+            const segs = Math.round(Number(s.line_segs || 0));
+            const pts = Math.round(Number(s.points || 0));
+            setSurfacePerfStatus(
+              `2D ${total}ms (poly ${poly}/${tris} tri • line ${line}/${segs} seg • pt ${pt}/${pts})`
+            );
+          } catch (_) {
+            // ignore
+          }
+        }
+        poll();
+        window.setInterval(poll, 700);
+      }
+
       function isCompactLayout() {
         return window.matchMedia("(max-width: 900px)").matches;
       }
@@ -1638,11 +1710,26 @@
         el.textContent = text;
       }
 
-      function setSurfaceStatus(text) {
+      let surfaceStatusBase = "";
+      let surfaceStatusPerf = "";
+
+      function updateSurfaceStatusDisplay() {
         const el = document.getElementById("surface-status-text");
         if (!el) return;
+        const showPerf = viewMode === "2d" && !!surfaceStatusPerf;
+        const text = showPerf ? `${surfaceStatusBase} • ${surfaceStatusPerf}` : surfaceStatusBase;
         if (el.textContent === text) return;
         el.textContent = text;
+      }
+
+      function setSurfaceStatus(text) {
+        surfaceStatusBase = text;
+        updateSurfaceStatusDisplay();
+      }
+
+      function setSurfacePerfStatus(text) {
+        surfaceStatusPerf = text;
+        updateSurfaceStatusDisplay();
       }
 
       function setTerrainClientStatus(text) {
@@ -3082,8 +3169,12 @@
         // Initial render.
         renderCatalog();
 
-        let viewMode = (localStorage.getItem("atlas.viewMode") || "3d").toLowerCase();
-        if (viewMode !== "2d" && viewMode !== "3d") viewMode = "3d";
+        // Use the global viewMode (initialized at module top).
+        // Re-validate from localStorage here if needed.
+        {
+          const saved = (localStorage.getItem("atlas.viewMode") || "3d").toLowerCase();
+          viewMode = (saved === "2d" || saved === "3d") ? saved : "3d";
+        }
 
         function applyViewMode(next) {
           next = String(next || "").toLowerCase();
@@ -3151,6 +3242,66 @@
         let pendingDy = 0;
         let dragRaf = 0;
 
+        // Kinetic panning (2D): track drag velocity and continue panning on release.
+        let panVelX = 0; // px per ms
+        let panVelY = 0; // px per ms
+        let panLastT = 0;
+        let panLastX = 0;
+        let panLastY = 0;
+        let panInertiaRaf = 0;
+        let panInertiaLastT = 0;
+
+        function cancelPanInertia() {
+          if (panInertiaRaf) {
+            try { window.cancelAnimationFrame(panInertiaRaf); } catch (e) {}
+          }
+          panInertiaRaf = 0;
+          panInertiaLastT = 0;
+          panVelX = 0;
+          panVelY = 0;
+        }
+
+        function startPanInertia() {
+          if (viewMode !== "2d") return;
+          if (!wasm || !wasm.camera_pan) return;
+
+          const speed = Math.hypot(panVelX, panVelY);
+          if (speed < 0.02) return; // too slow to bother
+
+          if (panInertiaRaf) cancelPanInertia();
+          panInertiaLastT = performance.now();
+
+          const tick = (t) => {
+            const dt = Math.min(50, Math.max(0, t - panInertiaLastT));
+            panInertiaLastT = t;
+
+            // Exponential-ish decay to feel smooth across frame rates.
+            const decay = Math.pow(0.90, dt / 16.666);
+            panVelX *= decay;
+            panVelY *= decay;
+
+            const s = Math.hypot(panVelX, panVelY);
+            if (s < 0.005) {
+              panInertiaRaf = 0;
+              return;
+            }
+
+            const dx = panVelX * dt;
+            const dy = panVelY * dt;
+            try {
+              wasm.camera_pan(dx, dy);
+              updateCompass();
+            } catch (err) {
+              // If wasm is mid-reload, just stop.
+              panInertiaRaf = 0;
+              return;
+            }
+            panInertiaRaf = window.requestAnimationFrame(tick);
+          };
+
+          panInertiaRaf = window.requestAnimationFrame(tick);
+        }
+
         // Touch pinch-zoom support (pointer events).
         const activePointers = new Map(); // pointerId -> { x, y, type }
         let pinching = false;
@@ -3185,6 +3336,9 @@
           const canvas = activeCanvas();
           canvas.setPointerCapture(e.pointerId);
 
+          // Any new interaction cancels inertia.
+          cancelPanInertia();
+
           if (e.pointerType === "touch") {
             // Track touch pointers for pinch.
             activePointers.set(e.pointerId, { x: e.clientX, y: e.clientY, type: "touch" });
@@ -3218,6 +3372,13 @@
           // Arcball-style grab-to-rotate (and 2D pan) initialization.
           try {
             const { x, y } = canvasXYFromClient(canvas, e.clientX, e.clientY);
+            if (viewMode === "2d") {
+              panLastT = performance.now();
+              panLastX = x;
+              panLastY = y;
+              panVelX = 0;
+              panVelY = 0;
+            }
             wasm.camera_drag_begin(x, y);
           } catch (err) {
             // ignore
@@ -3238,7 +3399,15 @@
               // Scale to feel reasonable; negative delta => pinch out => zoom in.
               const wheelLike = delta * 2.0;
               try {
-                wasm.camera_zoom(wheelLike);
+                if (viewMode === "2d" && wasm.camera_zoom_at) {
+                  const canvas = activeCanvas();
+                  const midClientX = (pts[0].x + pts[1].x) * 0.5;
+                  const midClientY = (pts[0].y + pts[1].y) * 0.5;
+                  const { x, y } = canvasXYFromClient(canvas, midClientX, midClientY);
+                  wasm.camera_zoom_at(x, y, wheelLike);
+                } else {
+                  wasm.camera_zoom(wheelLike);
+                }
                 updateCompass();
               } catch (err) {
                 console.error("pinch zoom failed", err);
@@ -3268,6 +3437,25 @@
             }
           }
           if (!dragging) return;
+
+          // Update 2D pan velocity estimate for kinetic panning.
+          if (viewMode === "2d" && !pinching) {
+            const canvas = activeCanvas();
+            const { x, y } = canvasXYFromClient(canvas, e.clientX, e.clientY);
+            const now = performance.now();
+            const dt = now - (panLastT || now);
+            if (dt > 0 && dt < 100) {
+              const vx = (x - panLastX) / dt;
+              const vy = (y - panLastY) / dt;
+              // Low-pass filter to reduce jitter.
+              panVelX = panVelX * 0.75 + vx * 0.25;
+              panVelY = panVelY * 0.75 + vy * 0.25;
+            }
+            panLastT = now;
+            panLastX = x;
+            panLastY = y;
+          }
+
           // Coalesce moves into one RAF.
           {
             const canvas = activeCanvas();
@@ -3295,6 +3483,8 @@
           dragging = false;
           pinching = false;
           activePointers.clear();
+
+          panLastT = 0;
 
           try {
             wasm.camera_drag_end();
@@ -3332,27 +3522,53 @@
             } catch (err) {
               console.error("pick failed", err);
             }
+            stopDrag();
+            return;
           }
+
+          // End drag, then allow kinetic pan to continue (2D only).
           stopDrag();
+          startPanInertia();
         }
 
         function onWheel(e) {
           e.preventDefault();
           markUserInput();
-          // Wheel events can fire at very high rates; coalesce into one RAF.
-          window.__atlasWheelDy = (window.__atlasWheelDy || 0) + e.deltaY;
+          cancelPanInertia();
+          // Wheel events can fire at very high rates; smooth them over a few RAFs.
+          const canvas = activeCanvas();
+          const { x, y } = canvasXYFromClient(canvas, e.clientX, e.clientY);
+          window.__atlasWheelTargetX = x;
+          window.__atlasWheelTargetY = y;
+          window.__atlasWheelVel = (window.__atlasWheelVel || 0) + e.deltaY;
+
           if (!window.__atlasWheelRaf) {
-            window.__atlasWheelRaf = window.requestAnimationFrame(() => {
-              window.__atlasWheelRaf = 0;
-              const dy = window.__atlasWheelDy || 0;
-              window.__atlasWheelDy = 0;
+            const tick = () => {
+              const v = window.__atlasWheelVel || 0;
+              // Stop when velocity is tiny.
+              if (Math.abs(v) < 0.05) {
+                window.__atlasWheelVel = 0;
+                window.__atlasWheelRaf = 0;
+                return;
+              }
+
+              // Apply a fraction each frame and decay (critically damped-ish feel).
+              const dy = v * 0.35;
+              window.__atlasWheelVel = v - dy;
+
               try {
-                wasm.camera_zoom(dy);
+                if (viewMode === "2d" && wasm.camera_zoom_at) {
+                  wasm.camera_zoom_at(window.__atlasWheelTargetX || 0, window.__atlasWheelTargetY || 0, dy);
+                } else {
+                  wasm.camera_zoom(dy);
+                }
                 updateCompass();
               } catch (err) {
                 console.error("camera_zoom failed", err);
               }
-            });
+              window.__atlasWheelRaf = window.requestAnimationFrame(tick);
+            };
+            window.__atlasWheelRaf = window.requestAnimationFrame(tick);
           }
         }
 
@@ -3415,11 +3631,11 @@
           const file = fileGeoJson.files && fileGeoJson.files[0];
           if (!file) return;
 
-          const MAX_GEOJSON_BYTES = 8 * 1024 * 1024;
-          if (file.size > MAX_GEOJSON_BYTES) {
-            setStatus(`Upload too large (max 8MiB): ${file.name}`);
+          const maxBytes = uploadSizeLimitMB * 1024 * 1024;
+          if (file.size > maxBytes) {
+            setStatus(`Upload too large (max ${uploadSizeLimitMB}MB): ${file.name}`);
             setUploadedInfo({
-              error: `Upload too large for the web viewer (max 8MiB). File is ${file.size} bytes.`,
+              error: `Upload too large (max ${uploadSizeLimitMB}MB). File is ${(file.size / 1024 / 1024).toFixed(1)}MB.`,
             });
             // allow re-uploading the same file
             fileGeoJson.value = "";
@@ -3433,7 +3649,7 @@
             // Preflight in JS to avoid trapping the wasm module on overly complex GeoJSON.
             // This is intentionally conservative; the web viewer isn't meant for massive uploads.
             const MAX_FEATURES = 20_000;
-            const MAX_COORD_PAIRS = 500_000;
+            const currentMaxCoords = maxCoordPairs;
             try {
               const geo = JSON.parse(text);
               if (geo && geo.type === "FeatureCollection" && Array.isArray(geo.features)) {
@@ -3474,9 +3690,9 @@
 
                 for (const f of geo.features) {
                   countGeometry(f && f.geometry);
-                  if (coordPairs > MAX_COORD_PAIRS) {
+                  if (coordPairs > currentMaxCoords) {
                     throw new Error(
-                      `Too many coordinates (${coordPairs}). Max is ${MAX_COORD_PAIRS}.`
+                      `Too many coordinates (${coordPairs}). Max is ${currentMaxCoords.toLocaleString()}.`
                     );
                   }
                 }
@@ -3491,7 +3707,7 @@
               return;
             }
 
-            const summary = await wasm.load_geojson_file(file.name, text);
+            const summary = await wasm.load_geojson_file(file.name, text, uploadSizeLimitMB);
 
             // Refresh catalog (upload is persisted in AVC form when it fits local storage).
             renderCatalog();
@@ -3583,6 +3799,37 @@
             console.error("set_auto_rotate_speed_deg_per_s failed", err);
           }
         });
+
+        // Upload size limit setting
+        const uploadSizeLimit = document.getElementById("upload-size-limit");
+        const uploadSizeLimitValue = document.getElementById("upload-size-limit-value");
+        if (uploadSizeLimit) {
+          uploadSizeLimit.value = String(uploadSizeLimitMB);
+          if (uploadSizeLimitValue) uploadSizeLimitValue.textContent = String(uploadSizeLimitMB);
+
+          uploadSizeLimit.addEventListener("input", (e) => {
+            const v = Math.max(1, Math.min(MAX_UPLOAD_SIZE_MB_LIMIT, Math.round(Number(e.target.value))));
+            uploadSizeLimitMB = v;
+            if (uploadSizeLimitValue) uploadSizeLimitValue.textContent = String(v);
+            try { localStorage.setItem("atlas.uploadSizeMB", String(v)); } catch (_) {}
+          });
+        }
+
+        // Max coordinates limit setting
+        const maxCoordPairsSlider = document.getElementById("max-coord-pairs");
+        const maxCoordPairsValue = document.getElementById("max-coord-pairs-value");
+        if (maxCoordPairsSlider) {
+          const initialK = Math.round(maxCoordPairs / 1000);
+          maxCoordPairsSlider.value = String(initialK);
+          if (maxCoordPairsValue) maxCoordPairsValue.textContent = `${initialK}k`;
+
+          maxCoordPairsSlider.addEventListener("input", (e) => {
+            const k = Math.max(100, Math.min(5000, Math.round(Number(e.target.value))));
+            maxCoordPairs = k * 1000;
+            if (maxCoordPairsValue) maxCoordPairsValue.textContent = `${k}k`;
+            try { localStorage.setItem("atlas.maxCoordPairs", String(maxCoordPairs)); } catch (_) {}
+          });
+        }
 
         function applyCitySize() {
           const v = Number(citySize.value);

@@ -44,8 +44,8 @@ impl VectorLayer {
 }
 
 fn triangulate_area_rings(rings: &[Vec<Vec3>]) -> Vec<Vec3> {
-    const MAX_RING_VERTICES: usize = 50_000;
-    const MAX_TOTAL_VERTICES: usize = 200_000;
+    const MAX_RING_VERTICES: usize = 100_000;
+    const MAX_TOTAL_VERTICES: usize = 500_000;
 
     fn is_finite_vec3(v: Vec3) -> bool {
         v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
@@ -132,7 +132,9 @@ fn triangulate_area_rings(rings: &[Vec<Vec3>]) -> Vec<Vec3> {
         }
 
         if vertices_3d.len().saturating_add(tmp_vertices.len()) > MAX_TOTAL_VERTICES {
-            return Vec::new();
+            // Skip this ring if adding it would exceed the limit, but continue processing.
+            // This is better than returning nothing for large polygons.
+            continue;
         }
 
         if have_outer {
