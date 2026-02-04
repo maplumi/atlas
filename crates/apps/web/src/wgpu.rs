@@ -282,7 +282,8 @@ fn mercator_to_clip_from_anchor(x_m: f32, y_m: f32, anchor_x_m: f32) -> vec4<f32
     let dy_px = (y_m - center_y) * globals2d.scale_px_per_m;
 
     let ndc_x = dx_px / (globals2d.viewport_px.x * 0.5);
-    let ndc_y = -dy_px / (globals2d.viewport_px.y * 0.5);
+    // Positive Mercator Y is north; positive NDC Y is up -> same sign for north-up orientation
+    let ndc_y = dy_px / (globals2d.viewport_px.y * 0.5);
     return vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
 }
 

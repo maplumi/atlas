@@ -1661,6 +1661,8 @@ fn pan_camera_2d(
 ) -> Camera2DState {
     let projector = MercatorProjector::new(cam, w, h);
     let dx_m = -delta_x_px / projector.scale_px_per_m;
+    // Dragging up (negative delta_y_px) should move the view south (decrease center Y)
+    // for intuitive "grab and drag" behavior where the map follows the pointer.
     let dy_m = delta_y_px / projector.scale_px_per_m;
     let center_x = projector.center_x + dx_m;
     let center_y = projector.center_y + dy_m;
@@ -3976,6 +3978,8 @@ pub fn set_canvas_sizes(width: f64, height: f64) {
             resize_wgpu(ctx, width as u32, height as u32);
         }
     });
+    // Re-render after resize to update the visible content.
+    let _ = render_scene();
 }
 
 #[wasm_bindgen]
