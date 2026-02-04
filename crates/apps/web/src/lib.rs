@@ -3947,12 +3947,20 @@ pub fn set_view_mode(mode: &str) -> Result<(), JsValue> {
                 }
                 (ViewMode::TwoD, ViewMode::ThreeD) => {
                     // Map 2D center back to a 3D orbit camera.
-                    s.camera.yaw_rad = s.camera_2d.center_lon_deg.to_radians();
-                    s.camera.pitch_rad =
-                        clamp(s.camera_2d.center_lat_deg.to_radians(), -1.55, 1.55);
+                    let yaw_rad = s.camera_2d.center_lon_deg.to_radians();
+                    let pitch_rad = clamp(s.camera_2d.center_lat_deg.to_radians(), -1.55, 1.55);
                     let dist = (3.0 * WGS84_A) / s.camera_2d.zoom.max(1e-6);
-                    s.camera.distance = clamp(dist, 1.001 * WGS84_A, 200.0 * WGS84_A);
+                    let distance = clamp(dist, 1.001 * WGS84_A, 200.0 * WGS84_A);
+
+                    // Update legacy camera state
+                    s.camera.yaw_rad = yaw_rad;
+                    s.camera.pitch_rad = pitch_rad;
+                    s.camera.distance = distance;
                     s.camera.target = [0.0, 0.0, 0.0];
+
+                    // Sync globe controller with the new camera state
+                    s.globe_controller.set_from_yaw_pitch(yaw_rad, pitch_rad);
+                    s.globe_controller.set_distance(distance);
                 }
                 _ => {}
             }

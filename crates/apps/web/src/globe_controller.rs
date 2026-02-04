@@ -337,6 +337,13 @@ impl GlobeController {
         self.orientation = quat_from_yaw_pitch(yaw_rad, pitch_rad);
     }
 
+    /// Set the camera distance directly (used when syncing from 2D view).
+    pub fn set_distance(&mut self, distance: f64) {
+        let clamped = distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
+        self.distance = clamped;
+        self.target_distance = clamped;
+    }
+
     /// Reset to default view.
     #[allow(dead_code)]
     pub fn reset(&mut self) {
