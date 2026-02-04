@@ -3961,6 +3961,9 @@ pub fn set_view_mode(mode: &str) -> Result<(), JsValue> {
                     // Sync globe controller with the new camera state
                     s.globe_controller.set_from_yaw_pitch(yaw_rad, pitch_rad);
                     s.globe_controller.set_distance(distance);
+
+                    // Reset frame time so dt calculation is clean on first 3D frame
+                    s.last_frame_time_s = 0.0;
                 }
                 _ => {}
             }

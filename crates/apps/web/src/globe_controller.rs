@@ -335,6 +335,9 @@ impl GlobeController {
     /// Set orientation from yaw/pitch angles (for compatibility).
     pub fn set_from_yaw_pitch(&mut self, yaw_rad: f64, pitch_rad: f64) {
         self.orientation = quat_from_yaw_pitch(yaw_rad, pitch_rad);
+        // Stop any active inertia when orientation is set externally
+        self.inertia_active = false;
+        self.angular_velocity = [0.0, 0.0, 0.0, 1.0];
     }
 
     /// Set the camera distance directly (used when syncing from 2D view).
@@ -342,6 +345,14 @@ impl GlobeController {
         let clamped = distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
         self.distance = clamped;
         self.target_distance = clamped;
+    }
+
+    /// Stop any active inertia animation.
+    #[allow(dead_code)]
+    pub fn stop_inertia(&mut self) {
+        self.inertia_active = false;
+        self.angular_velocity = [0.0, 0.0, 0.0, 1.0];
+        self.velocity_history.clear();
     }
 
     /// Reset to default view.
