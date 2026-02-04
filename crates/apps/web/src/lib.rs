@@ -7142,25 +7142,22 @@ pub fn advance_frame() -> Result<f64, JsValue> {
                 s.dt_s
             };
             s.last_frame_time_s = now;
+
+            // Apply auto-rotate before globe controller update if idle
+            if s.auto_rotate_enabled {
+                let idle = now - s.auto_rotate_last_user_time_s;
+                if idle >= s.auto_rotate_resume_delay_s {
+                    let speed_rad = s.auto_rotate_speed_deg_per_s.to_radians();
+                    s.globe_controller.apply_yaw_delta(speed_rad * dt);
+                }
+            }
+
             s.globe_controller.update(dt);
 
             // Keep legacy camera state in sync
             s.camera.yaw_rad = s.globe_controller.yaw_rad();
             s.camera.pitch_rad = s.globe_controller.pitch_rad();
             s.camera.distance = s.globe_controller.distance();
-        }
-
-        if s.view_mode == ViewMode::ThreeD && s.auto_rotate_enabled {
-            let idle = wall_clock_seconds() - s.auto_rotate_last_user_time_s;
-            if idle >= s.auto_rotate_resume_delay_s {
-                let speed_rad = s.auto_rotate_speed_deg_per_s.to_radians();
-                s.camera.yaw_rad =
-                    (s.camera.yaw_rad + speed_rad * s.dt_s).rem_euclid(2.0 * std::f64::consts::PI);
-                // Sync back to globe controller after auto-rotate
-                let yaw = s.camera.yaw_rad;
-                let pitch = s.camera.pitch_rad;
-                s.globe_controller.set_from_yaw_pitch(yaw, pitch);
-            }
         }
     });
 

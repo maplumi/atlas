@@ -340,6 +340,17 @@ impl GlobeController {
         self.angular_velocity = [0.0, 0.0, 0.0, 1.0];
     }
 
+    /// Apply a yaw rotation delta (for auto-rotate feature).
+    /// This doesn't stop inertia since it's a continuous animation.
+    pub fn apply_yaw_delta(&mut self, delta_rad: f64) {
+        // Create a rotation quaternion around the Y axis (up)
+        let half_angle = delta_rad * 0.5;
+        let yaw_quat = [0.0, half_angle.sin(), 0.0, half_angle.cos()];
+        // Apply rotation: new_orientation = yaw_quat * orientation
+        self.orientation = quat_mul(yaw_quat, self.orientation);
+        self.orientation = quat_normalize(self.orientation);
+    }
+
     /// Set the camera distance directly (used when syncing from 2D view).
     pub fn set_distance(&mut self, distance: f64) {
         let clamped = distance.clamp(MIN_DISTANCE, MAX_DISTANCE);
