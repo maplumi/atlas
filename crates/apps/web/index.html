@@ -3594,7 +3594,12 @@
               panVelX = 0;
               panVelY = 0;
             }
-            wasm.camera_drag_begin(x, y);
+            // Pass mouse button (0=left, 1=middle, 2=right) for globe controller
+            if (wasm.camera_drag_begin_with_button) {
+              wasm.camera_drag_begin_with_button(x, y, e.button);
+            } else {
+              wasm.camera_drag_begin(x, y);
+            }
           } catch (err) {
             // ignore
           }

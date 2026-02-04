@@ -30,6 +30,10 @@ use foundation::math::{Geodetic, WGS84_A, WGS84_B, ecef_to_geodetic, geodetic_to
 use layers::symbology::LayerStyle;
 use layers::vector::VectorLayer;
 use scene::components::VectorGeometryKind;
+
+mod globe_controller;
+use globe_controller::GlobeController;
+
 mod wgpu;
 use wgpu::{
     CityVertex, CorridorVertex, Globals2D, Overlay2DVertex, OverlayVertex, Point2DInstance,
@@ -467,6 +471,11 @@ struct ViewerState {
     camera: CameraState,
     camera_2d: Camera2DState,
 
+    // Quaternion-based globe controller for 3D view.
+    globe_controller: GlobeController,
+    /// Last frame time for globe controller updates.
+    last_frame_time_s: f64,
+
     // Pointer drag state shared by 2D + 3D camera interactions.
     drag_last_x_px: f64,
     drag_last_y_px: f64,
@@ -614,6 +623,9 @@ thread_local! {
         time_end_s: 10.0,
         camera: CameraState::default(),
         camera_2d: Camera2DState::default(),
+
+        globe_controller: GlobeController::default(),
+        last_frame_time_s: 0.0,
 
         drag_last_x_px: 0.0,
         drag_last_y_px: 0.0,
@@ -1780,6 +1792,7 @@ fn vec3_normalize(a: [f64; 3]) -> [f64; 3] {
     }
 }
 
+#[allow(dead_code)]
 fn quat_from_unit_vectors(a: [f64; 3], b: [f64; 3]) -> [f64; 4] {
     // Returns a unit quaternion rotating `a` to `b`.
     let a = vec3_normalize(a);
@@ -1809,10 +1822,12 @@ fn quat_from_unit_vectors(a: [f64; 3], b: [f64; 3]) -> [f64; 4] {
     q
 }
 
+#[allow(dead_code)]
 fn quat_conjugate(q: [f64; 4]) -> [f64; 4] {
     [-q[0], -q[1], -q[2], q[3]]
 }
 
+#[allow(dead_code)]
 fn quat_rotate_vec3(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
     // Assumes q is unit.
     let qv = [q[0], q[1], q[2]];
@@ -1841,6 +1856,7 @@ fn arcball_unit_from_screen(canvas_w: f64, canvas_h: f64, x_px: f64, y_px: f64) 
     trackball_unit_from_screen(x_px, y_px, canvas_w, canvas_h)
 }
 
+#[allow(dead_code)]
 fn mat4_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     // Column-major matrix multiply: c = a * b
     let mut c = [[0.0f32; 4]; 4];
@@ -1855,6 +1871,7 @@ fn mat4_mul(a: [[f32; 4]; 4], b: [[f32; 4]; 4]) -> [[f32; 4]; 4] {
     c
 }
 
+#[allow(dead_code)]
 fn mat4_perspective_rh_z0(fov_y_rad: f64, aspect: f64, near: f64, far: f64) -> [[f32; 4]; 4] {
     let f = 1.0 / (0.5 * fov_y_rad).tan();
     let m00 = (f / aspect) as f32;
@@ -1871,6 +1888,7 @@ fn mat4_perspective_rh_z0(fov_y_rad: f64, aspect: f64, near: f64, far: f64) -> [
     ]
 }
 
+#[allow(dead_code)]
 fn mat4_look_at_rh(eye: [f64; 3], target: [f64; 3], up: [f64; 3]) -> [[f32; 4]; 4] {
     let f = vec3_normalize(vec3_sub(target, eye));
     let s = vec3_normalize(vec3_cross(f, up));
@@ -1889,6 +1907,7 @@ fn mat4_look_at_rh(eye: [f64; 3], target: [f64; 3], up: [f64; 3]) -> [[f32; 4]; 
     ]
 }
 
+#[allow(dead_code)]
 fn camera_view_proj(camera: CameraState, canvas_width: f64, canvas_height: f64) -> [[f32; 4]; 4] {
     let aspect = if canvas_height <= 0.0 {
         1.0
@@ -1913,6 +1932,21 @@ fn camera_view_proj(camera: CameraState, canvas_width: f64, canvas_height: f64) 
     let far = (camera.distance * 4.0 + 4.0 * WGS84_A).max(near + 1.0);
     let proj = mat4_perspective_rh_z0(45f64.to_radians(), aspect, near, far);
     mat4_mul(proj, view)
+}
+
+/// Returns the view-projection matrix from the globe controller (quaternion-based).
+fn globe_controller_view_proj(
+    gc: &GlobeController,
+    canvas_width: f64,
+    canvas_height: f64,
+) -> [[f32; 4]; 4] {
+    let aspect = if canvas_height <= 0.0 {
+        1.0
+    } else {
+        (canvas_width / canvas_height).max(1e-6)
+    };
+    let fov_y_rad = 45f64.to_radians();
+    gc.view_proj_matrix(aspect, fov_y_rad)
 }
 
 fn current_sun_direction_world() -> Option<[f32; 3]> {
@@ -1991,8 +2025,11 @@ fn render_scene() -> Result<(), JsValue> {
                 let state = state_ref.borrow();
                 if let Some(ctx) = &state.wgpu {
                     perf_reset(ctx);
-                    let view_proj =
-                        camera_view_proj(state.camera, state.canvas_width, state.canvas_height);
+                    let view_proj = globe_controller_view_proj(
+                        &state.globe_controller,
+                        state.canvas_width,
+                        state.canvas_height,
+                    );
 
                     let light_dir = if state.sun_follow_real_time {
                         current_sun_direction_world().unwrap_or([0.4, 0.7, 0.2])
@@ -2092,7 +2129,8 @@ fn render_labels_overlay_3d() {
             return;
         }
 
-        let view_proj = camera_view_proj(s.camera, s.canvas_width, s.canvas_height);
+        let view_proj =
+            globe_controller_view_proj(&s.globe_controller, s.canvas_width, s.canvas_height);
         let wf = w as f32;
         let hf = h as f32;
 
@@ -3977,9 +4015,37 @@ pub fn set_camera_yaw_deg(yaw_deg: f64) -> Result<(), JsValue> {
         let mut s = state.borrow_mut();
         if s.view_mode == ViewMode::ThreeD {
             s.camera.yaw_rad = yaw_rad;
+            // Sync to globe controller
+            let yaw = s.camera.yaw_rad;
+            let pitch = s.camera.pitch_rad;
+            s.globe_controller.set_from_yaw_pitch(yaw, pitch);
         }
     });
     render_scene()
+}
+
+/// Get debug info about the globe controller state.
+#[wasm_bindgen]
+pub fn get_globe_controller_debug() -> String {
+    with_state(|state| {
+        let s = state.borrow();
+        format!(
+            "orientation: {:?}, distance: {:.1}, inertia_active: {}, angular_velocity: {:?}",
+            s.globe_controller.orientation(),
+            s.globe_controller.distance(),
+            s.globe_controller.is_inertia_active(),
+            s.globe_controller.angular_velocity()
+        )
+    })
+}
+
+/// Returns true if globe inertia animation is currently active.
+#[wasm_bindgen]
+pub fn is_globe_inertia_active() -> bool {
+    with_state(|state| {
+        let s = state.borrow();
+        s.globe_controller.is_inertia_active()
+    })
 }
 
 /// Orbit around the globe.
@@ -4030,6 +4096,14 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
 /// In 2D, this sets the reference position for pan deltas.
 #[wasm_bindgen]
 pub fn camera_drag_begin(x_px: f64, y_px: f64) -> Result<(), JsValue> {
+    camera_drag_begin_with_button(x_px, y_px, 0)
+}
+
+/// Begin a pointer drag with specified mouse button.
+///
+/// button: 0 = left, 1 = middle, 2 = right (standard MouseEvent.button values)
+#[wasm_bindgen]
+pub fn camera_drag_begin_with_button(x_px: f64, y_px: f64, button: i32) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.auto_rotate_last_user_time_s = wall_clock_seconds();
@@ -4038,12 +4112,14 @@ pub fn camera_drag_begin(x_px: f64, y_px: f64) -> Result<(), JsValue> {
         match s.view_mode {
             ViewMode::ThreeD => {
                 s.camera.target = [0.0, 0.0, 0.0];
-                s.arcball_last_unit = Some(arcball_unit_from_screen(
-                    s.canvas_width,
-                    s.canvas_height,
-                    x_px,
-                    y_px,
-                ));
+                // Extract values before mutable borrow
+                let canvas_w = s.canvas_width;
+                let canvas_h = s.canvas_height;
+                // Set canvas size and call pointer down with pixel coords and button
+                s.globe_controller.set_canvas_size(canvas_w, canvas_h);
+                s.globe_controller.on_pointer_down([x_px, y_px], button);
+                s.arcball_last_unit =
+                    Some(arcball_unit_from_screen(canvas_w, canvas_h, x_px, y_px));
             }
             ViewMode::TwoD => {
                 s.arcball_last_unit = None;
@@ -4065,26 +4141,17 @@ pub fn camera_drag_move(x_px: f64, y_px: f64) -> Result<(), JsValue> {
         match s.view_mode {
             ViewMode::ThreeD => {
                 s.camera.target = [0.0, 0.0, 0.0];
+                s.globe_controller.on_pointer_move([x_px, y_px]);
+
+                // Keep legacy camera state in sync for compatibility
+                let yaw = s.globe_controller.yaw_rad();
+                let pitch = s.globe_controller.pitch_rad();
+                s.camera.yaw_rad = yaw;
+                s.camera.pitch_rad = pitch;
+                s.camera.distance = s.globe_controller.distance();
+
+                // Also update arcball_last_unit for legacy code paths
                 let next_u = arcball_unit_from_screen(s.canvas_width, s.canvas_height, x_px, y_px);
-                if let Some(prev_u) = s.arcball_last_unit {
-                    let q = quat_from_unit_vectors(prev_u, next_u);
-                    let q_inv = quat_conjugate(q);
-
-                    let dir_cam = [
-                        s.camera.pitch_rad.cos() * s.camera.yaw_rad.cos(),
-                        s.camera.pitch_rad.sin(),
-                        -s.camera.pitch_rad.cos() * s.camera.yaw_rad.sin(),
-                    ];
-                    let dir_cam = vec3_normalize(dir_cam);
-                    let dir2 = quat_rotate_vec3(q_inv, dir_cam);
-                    let pitch = clamp(dir2[1], -1.0, 1.0).asin();
-                    let yaw = (-dir2[2]).atan2(dir2[0]);
-
-                    s.camera.pitch_rad = clamp(pitch, -1.55, 1.55);
-                    s.camera.yaw_rad = (yaw + std::f64::consts::PI)
-                        .rem_euclid(2.0 * std::f64::consts::PI)
-                        - std::f64::consts::PI;
-                }
                 s.arcball_last_unit = Some(next_u);
             }
             ViewMode::TwoD => {
@@ -4105,6 +4172,9 @@ pub fn camera_drag_end() -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.arcball_last_unit = None;
+        if matches!(s.view_mode, ViewMode::ThreeD) {
+            s.globe_controller.on_pointer_up();
+        }
     });
     Ok(())
 }
@@ -4154,45 +4224,11 @@ pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
         s.auto_rotate_last_user_time_s = wall_clock_seconds();
         match s.view_mode {
             ViewMode::ThreeD => {
-                let cam = s.camera;
-                let zoom = (wheel_delta_y * 0.0015).exp();
+                // Use globe controller for smooth zoom with clamping
+                s.globe_controller.on_wheel(wheel_delta_y);
 
-                // Keep this a soft clamp (mostly for UX), but also ensure the *camera eye*
-                // cannot go inside the globe when orbiting around/near it.
-                let min_dist = 10.0;
-                let max_dist = 200.0 * WGS84_A;
-                let mut dist = clamp(cam.distance * zoom, min_dist, max_dist);
-
-                let dir_cam = [
-                    cam.pitch_rad.cos() * cam.yaw_rad.cos(),
-                    cam.pitch_rad.sin(),
-                    -cam.pitch_rad.cos() * cam.yaw_rad.sin(),
-                ];
-                let dir_cam = vec3_normalize(dir_cam);
-                let eye = vec3_add(cam.target, vec3_mul(dir_cam, dist));
-
-                // Conservative: enforce the camera is outside a sphere of radius WGS84_A.
-                // (Good enough to prevent pathological inside-the-globe behavior, even
-                // though the visual globe is an ellipsoid.)
-                let min_eye_r = 1.001 * WGS84_A;
-                let eye_r = vec3_dot(eye, eye).sqrt();
-                if eye_r < min_eye_r {
-                    // Solve |target + dir*t| = min_eye_r for t, and move to the exiting root.
-                    let b = 2.0 * vec3_dot(cam.target, dir_cam);
-                    let c = vec3_dot(cam.target, cam.target) - min_eye_r * min_eye_r;
-                    let disc = b * b - 4.0 * c;
-                    if disc >= 0.0 {
-                        let sdisc = disc.sqrt();
-                        let t0 = (-b - sdisc) / 2.0;
-                        let t1 = (-b + sdisc) / 2.0;
-                        let t = t0.max(t1);
-                        if t.is_finite() && t > 0.0 {
-                            dist = clamp(t, min_dist, max_dist);
-                        }
-                    }
-                }
-
-                s.camera.distance = dist;
+                // Keep legacy camera state in sync for compatibility
+                s.camera.distance = s.globe_controller.distance();
             }
             ViewMode::TwoD => {
                 let zoom = (-wheel_delta_y * 0.0015).exp();
@@ -6145,7 +6181,8 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     // Prefer: point (near) -> line (near) -> polygon (inside).
     let picked = with_state(|state| {
         let s = state.borrow();
-        let view_proj = camera_view_proj(s.camera, s.canvas_width, s.canvas_height);
+        let view_proj =
+            globe_controller_view_proj(&s.globe_controller, s.canvas_width, s.canvas_height);
         let w = s.canvas_width.max(1.0) as f32;
         let h = s.canvas_height.max(1.0) as f32;
         let px = x_px as f32;
@@ -7081,12 +7118,33 @@ pub fn advance_frame() -> Result<f64, JsValue> {
             s.frame_index = 0;
         }
 
+        // Update globe controller (inertia + smooth zoom)
+        if s.view_mode == ViewMode::ThreeD {
+            let now = wall_clock_seconds();
+            let dt = if s.last_frame_time_s > 0.0 {
+                (now - s.last_frame_time_s).clamp(0.001, 0.1)
+            } else {
+                s.dt_s
+            };
+            s.last_frame_time_s = now;
+            s.globe_controller.update(dt);
+
+            // Keep legacy camera state in sync
+            s.camera.yaw_rad = s.globe_controller.yaw_rad();
+            s.camera.pitch_rad = s.globe_controller.pitch_rad();
+            s.camera.distance = s.globe_controller.distance();
+        }
+
         if s.view_mode == ViewMode::ThreeD && s.auto_rotate_enabled {
             let idle = wall_clock_seconds() - s.auto_rotate_last_user_time_s;
             if idle >= s.auto_rotate_resume_delay_s {
                 let speed_rad = s.auto_rotate_speed_deg_per_s.to_radians();
                 s.camera.yaw_rad =
                     (s.camera.yaw_rad + speed_rad * s.dt_s).rem_euclid(2.0 * std::f64::consts::PI);
+                // Sync back to globe controller after auto-rotate
+                let yaw = s.camera.yaw_rad;
+                let pitch = s.camera.pitch_rad;
+                s.globe_controller.set_from_yaw_pitch(yaw, pitch);
             }
         }
     });
