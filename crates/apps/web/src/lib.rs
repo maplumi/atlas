@@ -1454,6 +1454,11 @@ fn clip_polygon_lat_band(mut poly: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
 }
 
 fn world_tris_to_mercator_clipped(pos: &[[f32; 3]]) -> Vec<[f32; 2]> {
+    // World width in Mercator meters.
+    let ww = 2.0 * std::f64::consts::PI * WGS84_A;
+    // Threshold: if a triangle spans more than this fraction of world width, it crosses the antimeridian.
+    let span_threshold = ww * 0.5; // 180° in meters
+
     let mut out: Vec<[f32; 2]> = Vec::with_capacity(pos.len());
     for tri in pos.chunks_exact(3).take(2_000_000) {
         let (lon0, lat0) = world_to_lon_lat_fast_deg(tri[0]);
@@ -1473,9 +1478,33 @@ fn world_tris_to_mercator_clipped(pos: &[[f32; 3]]) -> Vec<[f32; 2]> {
             // Unwrap within triangle to keep it local.
             let bx = unwrap_mercator_x_m(ax, bx0);
             let cx = unwrap_mercator_x_m(ax, cx0);
-            out.push([ax as f32, ay as f32]);
-            out.push([bx as f32, by as f32]);
-            out.push([cx as f32, cy as f32]);
+
+            // Check if this triangle spans the antimeridian (i.e., spans > 180°).
+            // If so, we need to split it or emit on both sides.
+            let min_x = ax.min(bx).min(cx);
+            let max_x = ax.max(bx).max(cx);
+            let span = max_x - min_x;
+
+            if span > span_threshold {
+                // Triangle crosses antimeridian. Emit on both sides of the world.
+                // Left copy (shift entire triangle left by world width)
+                out.push([(ax - ww) as f32, ay as f32]);
+                out.push([(bx - ww) as f32, by as f32]);
+                out.push([(cx - ww) as f32, cy as f32]);
+                // Right copy (original position, but we need the version that's on the right)
+                // Re-unwrap with anchor at the rightmost point
+                let right_anchor = ax.max(bx0).max(cx0);
+                let ax_r = unwrap_mercator_x_m(right_anchor, ax);
+                let bx_r = unwrap_mercator_x_m(right_anchor, bx0);
+                let cx_r = unwrap_mercator_x_m(right_anchor, cx0);
+                out.push([ax_r as f32, ay as f32]);
+                out.push([bx_r as f32, by as f32]);
+                out.push([cx_r as f32, cy as f32]);
+            } else {
+                out.push([ax as f32, ay as f32]);
+                out.push([bx as f32, by as f32]);
+                out.push([cx as f32, cy as f32]);
+            }
             continue;
         }
 
@@ -1498,9 +1527,30 @@ fn world_tris_to_mercator_clipped(pos: &[[f32; 3]]) -> Vec<[f32; 2]> {
             let cy = mercator_y_m(c_lat);
             let bx = unwrap_mercator_x_m(fan0_x, bx0);
             let cx = unwrap_mercator_x_m(fan0_x, cx0);
-            out.push([fan0_x as f32, fan0_y as f32]);
-            out.push([bx as f32, by as f32]);
-            out.push([cx as f32, cy as f32]);
+
+            // Check for antimeridian crossing in clipped triangles too.
+            let min_x = fan0_x.min(bx).min(cx);
+            let max_x = fan0_x.max(bx).max(cx);
+            let span = max_x - min_x;
+
+            if span > span_threshold {
+                // Emit on both sides
+                out.push([(fan0_x - ww) as f32, fan0_y as f32]);
+                out.push([(bx - ww) as f32, by as f32]);
+                out.push([(cx - ww) as f32, cy as f32]);
+
+                let right_anchor = fan0_x.max(bx0).max(cx0);
+                let f0_r = unwrap_mercator_x_m(right_anchor, fan0_x);
+                let bx_r = unwrap_mercator_x_m(right_anchor, bx0);
+                let cx_r = unwrap_mercator_x_m(right_anchor, cx0);
+                out.push([f0_r as f32, fan0_y as f32]);
+                out.push([bx_r as f32, by as f32]);
+                out.push([cx_r as f32, cy as f32]);
+            } else {
+                out.push([fan0_x as f32, fan0_y as f32]);
+                out.push([bx as f32, by as f32]);
+                out.push([cx as f32, cy as f32]);
+            }
         }
     }
     out
@@ -1592,8 +1642,26 @@ fn camera2d_scale_px_per_m(cam: Camera2DState, w: f64, h: f64) -> f64 {
     let world_width_m = 2.0 * std::f64::consts::PI * WGS84_A;
     let max_y = mercator_y_m(MERCATOR_MAX_LAT_DEG);
     let world_height_m = 2.0 * max_y;
-    let base = (w / world_width_m).min(h / world_height_m);
+    // Use max() so the world FILLS the viewport (no edges visible at zoom=1).
+    // At minimum zoom, either width or height will exactly match, the other will overflow.
+    let base = (w / world_width_m).max(h / world_height_m);
     (base * cam.zoom).max(1e-6)
+}
+
+/// Clamp center_y so the visible extent doesn't exceed the Mercator bounds.
+fn clamp_center_y_for_extent(center_y: f64, half_h_m: f64) -> f64 {
+    let max_y = mercator_y_m(MERCATOR_MAX_LAT_DEG);
+    // The visible top edge is center_y + half_h_m, bottom is center_y - half_h_m.
+    // We need: center_y + half_h_m <= max_y  AND  center_y - half_h_m >= -max_y
+    // Rearranging: center_y <= max_y - half_h_m  AND  center_y >= -max_y + half_h_m
+    let max_center = max_y - half_h_m;
+    let min_center = -max_y + half_h_m;
+    if min_center > max_center {
+        // Viewport is taller than the world - center at 0
+        0.0
+    } else {
+        clamp(center_y, min_center, max_center)
+    }
 }
 
 struct MercatorProjector {
@@ -1666,13 +1734,14 @@ fn pan_camera_2d(
     let dy_m = delta_y_px / projector.scale_px_per_m;
     let center_x = projector.center_x + dx_m;
     let center_y = projector.center_y + dy_m;
+
+    // Clamp Y so visible extent stays within Mercator bounds.
+    let half_h_m = 0.5 * h / projector.scale_px_per_m;
+    let clamped_center_y = clamp_center_y_for_extent(center_y, half_h_m);
+
     Camera2DState {
         center_lon_deg: wrap_lon_deg(inverse_mercator_lon_deg(center_x)),
-        center_lat_deg: clamp(
-            inverse_mercator_lat_deg(center_y),
-            -MERCATOR_MAX_LAT_DEG,
-            MERCATOR_MAX_LAT_DEG,
-        ),
+        center_lat_deg: inverse_mercator_lat_deg(clamped_center_y),
         ..cam
     }
 }
@@ -1705,7 +1774,7 @@ pub fn camera_zoom_at(x_px: f64, y_px: f64, wheel_delta_y: f64) -> Result<(), Js
 
         // Zoom.
         let zoom_factor = (-wheel_delta_y * 0.0015).exp();
-        // Minimum zoom 1.0 = whole world fits in viewport; prevents zooming out beyond world extent.
+        // Minimum zoom 1.0 = whole world fills viewport; prevents zooming out beyond world extent.
         let next_zoom = clamp(cam.zoom * zoom_factor, 1.0, 200.0);
 
         // Adjust center so the cursor stays anchored on the same mercator point.
@@ -1719,13 +1788,13 @@ pub fn camera_zoom_at(x_px: f64, y_px: f64, wheel_delta_y: f64) -> Result<(), Js
         let next_center_x = p_x_m - next_dx_m;
         let next_center_y = p_y_m - next_dy_m;
 
+        // Clamp Y so visible extent stays within Mercator bounds.
+        let next_half_h_m = 0.5 * h / next_scale;
+        let clamped_center_y = clamp_center_y_for_extent(next_center_y, next_half_h_m);
+
         s.camera_2d = Camera2DState {
             center_lon_deg: wrap_lon_deg(inverse_mercator_lon_deg(next_center_x)),
-            center_lat_deg: clamp(
-                inverse_mercator_lat_deg(next_center_y),
-                -MERCATOR_MAX_LAT_DEG,
-                MERCATOR_MAX_LAT_DEG,
-            ),
+            center_lat_deg: inverse_mercator_lat_deg(clamped_center_y),
             zoom: next_zoom,
         };
     });

@@ -228,6 +228,7 @@
         backdrop-filter: none;
         border-radius: 0;
         user-select: none;
+        z-index: 10;
       }
       .map-controls-row {
         display: flex;
@@ -966,13 +967,7 @@
           <button id="map-mode" class="btn small" type="button" title="Lock drag mode">Auto</button>
           <button id="map-graticule" class="btn small" type="button" title="Toggle graticule">Grid</button>
           <button id="map-sun" class="btn small" type="button" title="Toggle real-time sun">Sun</button>
-          <button id="map-help" class="btn small" type="button" title="Show controls">?</button>
-          <div id="map-help-text" class="hint hidden">
-            3D: LMB drag orbit • RMB/Shift pan<br />
-            2D: drag pan<br />
-            Wheel / Pinch: zoom • Click: pick<br />
-            R: reset
-          </div>
+          <button id="map-help" class="btn small" type="button" title="About Atlas">?</button>
         </div>
       </div>
 
@@ -1058,6 +1053,55 @@
           <div class="modal-footer">
             <button id="feed-test-btn" type="button" class="btn">Test download</button>
             <button id="feed-save-btn" type="button">Save</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- About modal -->
+      <div id="about-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="About Atlas">
+        <div class="modal" style="max-width: 480px;">
+          <div class="modal-header">
+            <h3>About Atlas</h3>
+            <button id="about-modal-close" type="button" class="btn" title="Close">✕</button>
+          </div>
+
+          <div class="grid" style="gap: 14px;">
+            <p style="margin: 0; line-height: 1.5;">
+              <strong>Atlas</strong> is a high-performance geospatial visualization engine built with 
+              Rust and WebGPU. It renders 2D maps and 3D globes with real-time data overlays.
+            </p>
+
+            <div>
+              <h4 style="margin: 0 0 8px 0; font-size: 14px;">Features</h4>
+              <ul style="margin: 0; padding-left: 20px; line-height: 1.6;">
+                <li>3D globe with smooth arcball navigation</li>
+                <li>2D Mercator map view</li>
+                <li>Real-time data feeds (CSV, JSON, RSS)</li>
+                <li>GeoJSON file upload support</li>
+                <li>Time-enabled playback controls</li>
+                <li>Layer filtering and search</li>
+                <li>Real-time sun positioning</li>
+                <li>Multiple color themes</li>
+              </ul>
+            </div>
+
+            <div>
+              <h4 style="margin: 0 0 8px 0; font-size: 14px;">Controls</h4>
+              <div style="font-size: 13px; line-height: 1.6;">
+                <strong>3D Mode:</strong> Drag to orbit • Right-click/Shift+drag to pan<br/>
+                <strong>2D Mode:</strong> Drag to pan<br/>
+                <strong>Zoom:</strong> Scroll wheel or pinch<br/>
+                <strong>Reset:</strong> Press R key
+              </div>
+            </div>
+
+            <div class="muted" style="font-size: 12px; text-align: center; padding-top: 8px; border-top: 1px solid var(--controls-border);">
+              Built with Rust, WebGPU & WebAssembly
+            </div>
+          </div>
+
+          <div class="modal-footer">
+            <button id="about-modal-ok" type="button">OK</button>
           </div>
         </div>
       </div>
@@ -2112,6 +2156,10 @@
         const feedTestBtn = document.getElementById("feed-test-btn");
         const feedSaveBtn = document.getElementById("feed-save-btn");
 
+        const aboutModal = document.getElementById("about-modal");
+        const aboutModalClose = document.getElementById("about-modal-close");
+        const aboutModalOk = document.getElementById("about-modal-ok");
+
         const catalogList = document.getElementById("catalog-list");
         const catalogEmpty = document.getElementById("catalog-empty");
 
@@ -2185,7 +2233,6 @@
         const mapGraticule = document.getElementById("map-graticule");
         const mapSun = document.getElementById("map-sun");
         const mapHelp = document.getElementById("map-help");
-        const mapHelpText = document.getElementById("map-help-text");
 
         const cursorText = document.getElementById("cursor-text");
         const pickText = document.getElementById("pick-text");
@@ -3844,7 +3891,19 @@
           syncMapToggles();
         });
         mapHelp?.addEventListener("click", () => {
-          mapHelpText?.classList.toggle("hidden");
+          aboutModal?.classList.remove("hidden");
+        });
+        aboutModalClose?.addEventListener("click", () => {
+          aboutModal?.classList.add("hidden");
+        });
+        aboutModalOk?.addEventListener("click", () => {
+          aboutModal?.classList.add("hidden");
+        });
+        // Close about modal when clicking outside
+        aboutModal?.addEventListener("click", (e) => {
+          if (e.target === aboutModal) {
+            aboutModal.classList.add("hidden");
+          }
         });
 
         fileGeoJson.addEventListener("change", async () => {
