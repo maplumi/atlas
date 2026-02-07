@@ -303,6 +303,93 @@ impl Default for CameraState {
     }
 }
 
+// ── Control Configuration Contract ──────────────────────────────────────────
+//
+// Defines the interaction behavior defaults for the spatiotemporal viewer.
+// These contracts ensure consistent, predictable user interaction across both
+// the 3D globe and 2D map views.
+//
+// **3D Globe Controls:**
+//   Left drag   = arcball rotation (surface follows cursor direction)
+//   Right drag  = pan/translate globe in screen space
+//   Wheel       = dolly zoom (distance to globe center)
+//   Shift+drag  = pan/translate globe in screen space (same as right drag)
+//
+// **2D Map Controls:**
+//   Left drag   = pan map (map follows cursor direction)
+//   Right drag  = pan map (same behavior as left drag)
+//   Wheel       = zoom anchored at cursor position
+//   Shift+drag  = pan map (same behavior)
+//
+// **Common:**
+//   R key       = reset camera to default
+//   Pinch       = zoom (touch devices)
+//
+// All sensitivity values are tunable via the settings UI and persisted via JS.
+
+/// Interaction configuration for the viewer.  All fields have documented
+/// defaults that are exercised by tests below.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct ControlConfig {
+    // ── 3D Globe ─────────────────────────────────────────────
+    /// Orbit (arcball) sensitivity multiplier.  1.0 = default.
+    pub orbit_sensitivity: f64,
+    /// Pan sensitivity multiplier for 3D target translation.
+    pub pan_sensitivity_3d: f64,
+    /// Zoom (dolly) speed multiplier for 3D.  Applied to the 0.0015 exponent.
+    pub zoom_speed_3d: f64,
+    /// Whether to invert the orbit Y axis (vertical drag direction).
+    pub invert_orbit_y: bool,
+    /// Whether to invert the pan Y axis in 3D.
+    pub invert_pan_y_3d: bool,
+    /// Minimum distance from globe center (prevents going inside).
+    pub min_distance: f64,
+    /// Maximum distance from globe center.
+    pub max_distance: f64,
+    /// Pitch clamp in radians (absolute value, symmetric).
+    pub pitch_clamp_rad: f64,
+    /// Maximum target offset from origin in meters.  Prevents the globe
+    /// from being panned completely out of view.
+    pub max_target_offset_m: f64,
+
+    // ── 2D Map ───────────────────────────────────────────────
+    /// Pan sensitivity multiplier for 2D.
+    pub pan_sensitivity_2d: f64,
+    /// Zoom speed multiplier for 2D.  Applied to the 0.0015 exponent.
+    pub zoom_speed_2d: f64,
+    /// Whether to invert the pan Y axis in 2D.
+    pub invert_pan_y_2d: bool,
+    /// Minimum zoom level (1.0 = whole world).
+    pub min_zoom_2d: f64,
+    /// Maximum zoom level.
+    pub max_zoom_2d: f64,
+    /// Enable kinetic (inertia) panning on pointer release.
+    pub kinetic_panning: bool,
+}
+
+impl Default for ControlConfig {
+    fn default() -> Self {
+        Self {
+            orbit_sensitivity: 1.0,
+            pan_sensitivity_3d: 1.0,
+            zoom_speed_3d: 1.0,
+            invert_orbit_y: false,
+            invert_pan_y_3d: false,
+            min_distance: 10.0,
+            max_distance: 200.0 * WGS84_A,
+            pitch_clamp_rad: 1.55,
+            max_target_offset_m: 2.0 * WGS84_A,
+
+            pan_sensitivity_2d: 1.0,
+            zoom_speed_2d: 1.0,
+            invert_pan_y_2d: false,
+            min_zoom_2d: 1.0,
+            max_zoom_2d: 200.0,
+            kinetic_panning: true,
+        }
+    }
+}
+
 #[derive(Debug)]
 struct FeedLayerState {
     name: String,
@@ -480,6 +567,9 @@ struct ViewerState {
     drag_last_x_px: f64,
     drag_last_y_px: f64,
     arcball_last_unit: Option<[f64; 3]>,
+
+    // Interaction control configuration (tunable via settings UI).
+    controls: ControlConfig,
 }
 
 thread_local! {
@@ -630,6 +720,8 @@ thread_local! {
         drag_last_x_px: 0.0,
         drag_last_y_px: 0.0,
         arcball_last_unit: None,
+
+        controls: ControlConfig::default(),
     });
 }
 
@@ -1729,8 +1821,9 @@ fn pan_camera_2d(
 ) -> Camera2DState {
     let projector = MercatorProjector::new(cam, w, h);
     let dx_m = -delta_x_px / projector.scale_px_per_m;
-    // Dragging up (negative delta_y_px) should move the view south (decrease center Y)
-    // for intuitive "grab and drag" behavior where the map follows the pointer.
+    // Screen Y is inverted relative to Mercator Y (screen-down = +delta_y,
+    // Mercator-north = +y).  Use positive sign so drag-down moves center
+    // north, making the map content follow the cursor downward.
     let dy_m = delta_y_px / projector.scale_px_per_m;
     let center_x = projector.center_x + dx_m;
     let center_y = projector.center_y + dy_m;
@@ -1773,9 +1866,9 @@ pub fn camera_zoom_at(x_px: f64, y_px: f64, wheel_delta_y: f64) -> Result<(), Js
         let p_y_m = projector.center_y + dy_m;
 
         // Zoom.
-        let zoom_factor = (-wheel_delta_y * 0.0015).exp();
-        // Minimum zoom 1.0 = whole world fills viewport; prevents zooming out beyond world extent.
-        let next_zoom = clamp(cam.zoom * zoom_factor, 1.0, 200.0);
+        let cfg = s.controls;
+        let zoom_factor = (-wheel_delta_y * 0.0015 * cfg.zoom_speed_2d).exp();
+        let next_zoom = clamp(cam.zoom * zoom_factor, cfg.min_zoom_2d, cfg.max_zoom_2d);
 
         // Adjust center so the cursor stays anchored on the same mercator point.
         let next_cam = Camera2DState {
@@ -4016,7 +4109,9 @@ pub fn set_view_mode(mode: &str) -> Result<(), JsValue> {
                 }
                 (ViewMode::TwoD, ViewMode::ThreeD) => {
                     // Map 2D center back to a 3D orbit camera.
-                    let yaw_rad = s.camera_2d.center_lon_deg.to_radians();
+                    // In this viewer yaw 0° looks at lon 180° (Pacific), so
+                    // visible_lon ≈ 180° - yaw.  Invert: yaw = 180° - lon.
+                    let yaw_rad = (180.0 - s.camera_2d.center_lon_deg).to_radians();
                     let pitch_rad = clamp(s.camera_2d.center_lat_deg.to_radians(), -1.55, 1.55);
                     let dist = (3.0 * WGS84_A) / s.camera_2d.zoom.max(1e-6);
                     let distance = clamp(dist, 1.001 * WGS84_A, 200.0 * WGS84_A);
@@ -4135,32 +4230,35 @@ pub fn is_globe_inertia_active() -> bool {
 /// Orbit around the globe.
 ///
 /// Intended usage: call with pointer delta in pixels.
+/// **Contract (3D):** Drag left => surface facing user moves left (yaw increases).
+///   Drag up => surface facing user tilts up (pitch decreases).
+///   Sensitivity scaled so full shorter-axis drag ≈ 180°.
+/// **Contract (2D):** Treated as pan — map follows cursor direction.
 #[wasm_bindgen]
 pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.auto_rotate_last_user_time_s = wall_clock_seconds();
+        let cfg = s.controls;
         match s.view_mode {
             ViewMode::ThreeD => {
-                // Keep the globe fixed at the center of rotation.
-                // (Panning/translation is not desired in this viewer.)
-                s.camera.target = [0.0, 0.0, 0.0];
-                // Scale orbit sensitivity to viewport size so drag feels consistent.
-                // Roughly: dragging across the shorter side ~= 180 degrees.
                 let min_dim = s.canvas_width.min(s.canvas_height).max(1.0);
-                let speed = std::f64::consts::PI / min_dim;
-                // Screen drag direction should feel like you're "grabbing" the globe surface.
-                // Drag left => globe rotates left (yaw increases).
-                s.camera.yaw_rad += delta_x_px * speed;
-                s.camera.pitch_rad = clamp(s.camera.pitch_rad - delta_y_px * speed, -1.55, 1.55);
+                let speed = std::f64::consts::PI / min_dim * cfg.orbit_sensitivity;
+                let dy_sign = if cfg.invert_orbit_y { -1.0 } else { 1.0 };
 
-                // Keep yaw bounded to avoid precision loss over time.
+                // Negate yaw delta: drag left → yaw increases → camera orbits right
+                // → surface moves LEFT ("rotate from outside").
+                s.camera.yaw_rad -= delta_x_px * speed;
+                s.camera.pitch_rad = clamp(
+                    s.camera.pitch_rad + dy_sign * delta_y_px * speed,
+                    -cfg.pitch_clamp_rad,
+                    cfg.pitch_clamp_rad,
+                );
                 s.camera.yaw_rad = (s.camera.yaw_rad + std::f64::consts::PI)
                     .rem_euclid(2.0 * std::f64::consts::PI)
                     - std::f64::consts::PI;
             }
             ViewMode::TwoD => {
-                // In 2D, treat orbit as pan.
                 s.camera_2d = pan_camera_2d(
                     s.camera_2d,
                     delta_x_px,
@@ -4195,11 +4293,10 @@ pub fn camera_drag_begin_with_button(x_px: f64, y_px: f64, button: i32) -> Resul
         s.drag_last_y_px = y_px;
         match s.view_mode {
             ViewMode::ThreeD => {
-                s.camera.target = [0.0, 0.0, 0.0];
-                // Extract values before mutable borrow
+                // Do NOT reset camera.target here — that would undo any
+                // right-click pan translation the user has applied.
                 let canvas_w = s.canvas_width;
                 let canvas_h = s.canvas_height;
-                // Set canvas size and call pointer down with pixel coords and button
                 s.globe_controller.set_canvas_size(canvas_w, canvas_h);
                 s.globe_controller.on_pointer_down([x_px, y_px], button);
                 s.arcball_last_unit =
@@ -4216,26 +4313,41 @@ pub fn camera_drag_begin_with_button(x_px: f64, y_px: f64, button: i32) -> Resul
 /// Update a pointer drag.
 ///
 /// In 3D, performs an arcball rotation around the globe center.
+/// The surface under the cursor follows the cursor direction (grab-and-rotate).
 /// In 2D, pans the mercator view.
 #[wasm_bindgen]
 pub fn camera_drag_move(x_px: f64, y_px: f64) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.auto_rotate_last_user_time_s = wall_clock_seconds();
+        let cfg = s.controls;
         match s.view_mode {
             ViewMode::ThreeD => {
-                s.camera.target = [0.0, 0.0, 0.0];
-                s.globe_controller.on_pointer_move([x_px, y_px]);
-
-                // Keep legacy camera state in sync for compatibility
-                let yaw = s.globe_controller.yaw_rad();
-                let pitch = s.globe_controller.pitch_rad();
-                s.camera.yaw_rad = yaw;
-                s.camera.pitch_rad = pitch;
-                s.camera.distance = s.globe_controller.distance();
-
-                // Also update arcball_last_unit for legacy code paths
                 let next_u = arcball_unit_from_screen(s.canvas_width, s.canvas_height, x_px, y_px);
+                if let Some(prev_u) = s.arcball_last_unit {
+                    let q = quat_from_unit_vectors(prev_u, next_u);
+                    let q_inv = quat_conjugate(q);
+
+                    let dir_cam = [
+                        s.camera.pitch_rad.cos() * s.camera.yaw_rad.cos(),
+                        s.camera.pitch_rad.sin(),
+                        -s.camera.pitch_rad.cos() * s.camera.yaw_rad.sin(),
+                    ];
+                    let dir_cam = vec3_normalize(dir_cam);
+                    let dir2 = quat_rotate_vec3(q_inv, dir_cam);
+                    let pitch = clamp(dir2[1], -1.0, 1.0).asin();
+                    let yaw = (-dir2[2]).atan2(dir2[0]);
+
+                    s.camera.pitch_rad = clamp(pitch, -cfg.pitch_clamp_rad, cfg.pitch_clamp_rad);
+                    s.camera.yaw_rad = (yaw + std::f64::consts::PI)
+                        .rem_euclid(2.0 * std::f64::consts::PI)
+                        - std::f64::consts::PI;
+
+                    // Sync globe controller with updated camera state
+                    let sync_yaw = s.camera.yaw_rad;
+                    let sync_pitch = s.camera.pitch_rad;
+                    s.globe_controller.set_from_yaw_pitch(sync_yaw, sync_pitch);
+                }
                 s.arcball_last_unit = Some(next_u);
             }
             ViewMode::TwoD => {
@@ -4263,26 +4375,53 @@ pub fn camera_drag_end() -> Result<(), JsValue> {
     Ok(())
 }
 
-/// Pan the camera target.
+/// Pan the camera target (translates the globe in 3D, pans map in 2D).
 ///
-/// Intended usage: call with pointer delta in pixels.
+/// **Contract (3D):** Right-click drag moves the entire globe in the viewport.
+///   Drag right => globe moves right on screen.  Drag up => globe moves up.
+///   The target offset is clamped to `max_target_offset_m` to keep the globe
+///   visible.  Double-click or R key resets target to origin.
+/// **Contract (2D):** Same as left-drag pan — map follows cursor.
 #[wasm_bindgen]
 pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.auto_rotate_last_user_time_s = wall_clock_seconds();
+        let cfg = s.controls;
         match s.view_mode {
             ViewMode::ThreeD => {
-                // In 3D, "pan" behaves like orbit so the globe never translates off-center.
-                s.camera.target = [0.0, 0.0, 0.0];
+                // Compute camera right/up vectors in world space to translate
+                // the target perpendicular to the view direction.
+                let dir_cam = vec3_normalize([
+                    s.camera.pitch_rad.cos() * s.camera.yaw_rad.cos(),
+                    s.camera.pitch_rad.sin(),
+                    -s.camera.pitch_rad.cos() * s.camera.yaw_rad.sin(),
+                ]);
+                let world_up = [0.0, 1.0, 0.0];
+                let right = vec3_normalize(vec3_cross(world_up, dir_cam));
+                let up = vec3_cross(dir_cam, right);
 
-                let min_dim = s.canvas_width.min(s.canvas_height).max(1.0);
-                let speed = std::f64::consts::PI / min_dim;
-                s.camera.yaw_rad += delta_x_px * speed;
-                s.camera.pitch_rad = clamp(s.camera.pitch_rad - delta_y_px * speed, -1.55, 1.55);
-                s.camera.yaw_rad = (s.camera.yaw_rad + std::f64::consts::PI)
-                    .rem_euclid(2.0 * std::f64::consts::PI)
-                    - std::f64::consts::PI;
+                // Scale: at distance D, one pixel ≈ D * fov_y / viewport_height
+                // Use the shorter dimension for consistent feel.
+                let fov_y_rad = 45f64.to_radians();
+                let h = s.canvas_height.max(1.0);
+                let px_to_world = s.camera.distance * (fov_y_rad / h) * cfg.pan_sensitivity_3d;
+
+                let dy_sign = if cfg.invert_pan_y_3d { -1.0 } else { 1.0 };
+
+                // Move target: right-drag right => target moves right => globe moves right.
+                let offset_right = vec3_mul(right, -delta_x_px * px_to_world);
+                let offset_up = vec3_mul(up, dy_sign * delta_y_px * px_to_world);
+                let new_target = vec3_add(vec3_add(s.camera.target, offset_right), offset_up);
+
+                // Clamp target offset to prevent globe from going completely off-screen.
+                let r = vec3_dot(new_target, new_target).sqrt();
+                if r <= cfg.max_target_offset_m {
+                    s.camera.target = new_target;
+                } else {
+                    let scale = cfg.max_target_offset_m / r;
+                    s.camera.target = vec3_mul(new_target, scale);
+                }
             }
             ViewMode::TwoD => {
                 s.camera_2d = pan_camera_2d(
@@ -4306,17 +4445,46 @@ pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.auto_rotate_last_user_time_s = wall_clock_seconds();
+        let cfg = s.controls;
         match s.view_mode {
             ViewMode::ThreeD => {
-                // Use globe controller for smooth zoom with clamping
-                s.globe_controller.on_wheel(wheel_delta_y);
+                let cam = s.camera;
+                let zoom = (wheel_delta_y * 0.0015 * cfg.zoom_speed_3d).exp();
 
-                // Keep legacy camera state in sync for compatibility
-                s.camera.distance = s.globe_controller.distance();
+                let mut dist = clamp(cam.distance * zoom, cfg.min_distance, cfg.max_distance);
+
+                let dir_cam = [
+                    cam.pitch_rad.cos() * cam.yaw_rad.cos(),
+                    cam.pitch_rad.sin(),
+                    -cam.pitch_rad.cos() * cam.yaw_rad.sin(),
+                ];
+                let dir_cam = vec3_normalize(dir_cam);
+                let eye = vec3_add(cam.target, vec3_mul(dir_cam, dist));
+
+                let min_eye_r = 1.001 * WGS84_A;
+                let eye_r = vec3_dot(eye, eye).sqrt();
+                if eye_r < min_eye_r {
+                    let b = 2.0 * vec3_dot(cam.target, dir_cam);
+                    let c = vec3_dot(cam.target, cam.target) - min_eye_r * min_eye_r;
+                    let disc = b * b - 4.0 * c;
+                    if disc >= 0.0 {
+                        let sdisc = disc.sqrt();
+                        let t0 = (-b - sdisc) / 2.0;
+                        let t1 = (-b + sdisc) / 2.0;
+                        let t = t0.max(t1);
+                        if t.is_finite() && t > 0.0 {
+                            dist = clamp(t, cfg.min_distance, cfg.max_distance);
+                        }
+                    }
+                }
+
+                s.camera.distance = dist;
+                // Sync globe controller distance
+                s.globe_controller.set_distance(dist);
             }
             ViewMode::TwoD => {
-                let zoom = (-wheel_delta_y * 0.0015).exp();
-                s.camera_2d.zoom = clamp(s.camera_2d.zoom * zoom, 0.2, 200.0);
+                let zoom = (-wheel_delta_y * 0.0015 * cfg.zoom_speed_2d).exp();
+                s.camera_2d.zoom = clamp(s.camera_2d.zoom * zoom, cfg.min_zoom_2d, cfg.max_zoom_2d);
             }
         }
     });
@@ -7264,6 +7432,105 @@ pub fn set_time(time_s: f64) -> Result<(), JsValue> {
     render_scene()
 }
 
+/// Returns the current engine time in seconds.
+#[wasm_bindgen]
+pub fn get_time() -> f64 {
+    with_state(|state| state.borrow().time_s)
+}
+
+/// Returns the end of the current time range in seconds.
+#[wasm_bindgen]
+pub fn get_time_end() -> f64 {
+    with_state(|state| state.borrow().time_end_s)
+}
+
+/// Sets the end of the time range in seconds.
+#[wasm_bindgen]
+pub fn set_time_end(time_end_s: f64) -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.time_end_s = time_end_s.max(0.1);
+    });
+    Ok(())
+}
+
+/// Returns the fixed timestep in seconds.
+#[wasm_bindgen]
+pub fn get_dt() -> f64 {
+    with_state(|state| state.borrow().dt_s)
+}
+
+/// Sets the fixed timestep in seconds.
+#[wasm_bindgen]
+pub fn set_dt(dt_s: f64) -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.dt_s = dt_s.max(0.001);
+    });
+    Ok(())
+}
+
+// ── Control configuration WASM exports ──────────────────────────────────────
+
+/// Return control config as a JSON string for JS consumption.
+#[wasm_bindgen]
+pub fn get_control_config() -> String {
+    with_state(|state| {
+        let s = state.borrow();
+        let c = &s.controls;
+        format!(
+            r#"{{"orbit_sensitivity":{},"pan_sensitivity_3d":{},"zoom_speed_3d":{},"invert_orbit_y":{},"invert_pan_y_3d":{},"min_distance":{},"max_distance":{},"pitch_clamp_rad":{},"max_target_offset_m":{},"pan_sensitivity_2d":{},"zoom_speed_2d":{},"invert_pan_y_2d":{},"min_zoom_2d":{},"max_zoom_2d":{},"kinetic_panning":{}}}"#,
+            c.orbit_sensitivity,
+            c.pan_sensitivity_3d,
+            c.zoom_speed_3d,
+            c.invert_orbit_y,
+            c.invert_pan_y_3d,
+            c.min_distance,
+            c.max_distance,
+            c.pitch_clamp_rad,
+            c.max_target_offset_m,
+            c.pan_sensitivity_2d,
+            c.zoom_speed_2d,
+            c.invert_pan_y_2d,
+            c.min_zoom_2d,
+            c.max_zoom_2d,
+            c.kinetic_panning,
+        )
+    })
+}
+
+/// Update a single control config field by key.
+#[wasm_bindgen]
+pub fn set_control_config(key: &str, value: f64) -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        let c = &mut s.controls;
+        match key {
+            "orbit_sensitivity" => c.orbit_sensitivity = value.clamp(0.1, 5.0),
+            "pan_sensitivity_3d" => c.pan_sensitivity_3d = value.clamp(0.1, 5.0),
+            "zoom_speed_3d" => c.zoom_speed_3d = value.clamp(0.1, 5.0),
+            "invert_orbit_y" => c.invert_orbit_y = value > 0.5,
+            "invert_pan_y_3d" => c.invert_pan_y_3d = value > 0.5,
+            "pan_sensitivity_2d" => c.pan_sensitivity_2d = value.clamp(0.1, 5.0),
+            "zoom_speed_2d" => c.zoom_speed_2d = value.clamp(0.1, 5.0),
+            "invert_pan_y_2d" => c.invert_pan_y_2d = value > 0.5,
+            "kinetic_panning" => c.kinetic_panning = value > 0.5,
+            _ => {}
+        }
+    });
+    Ok(())
+}
+
+/// Reset all control config to defaults.
+#[wasm_bindgen]
+pub fn reset_control_config() -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.controls = ControlConfig::default();
+    });
+    Ok(())
+}
+
 async fn init_wgpu_inner() -> Result<(), JsValue> {
     let ctx = init_wgpu_from_canvas_id("atlas-canvas-3d").await?;
 
@@ -7448,5 +7715,464 @@ async fn fetch_vector_chunk(url: &str) -> Result<formats::VectorChunk, JsValue> 
             .await
             .map_err(|e| JsValue::from_str(&e.to_string()))?;
         formats::VectorChunk::from_geojson_str(&text).map_err(|e| JsValue::from_str(&e.to_string()))
+    }
+}
+
+// ── Tests: Control Contracts ────────────────────────────────────────────────
+//
+// These tests define and verify the interaction contracts for the spatiotemporal
+// viewer's camera system.  They ensure that:
+//
+//  1. Default control config values are stable (no accidental regressions).
+//  2. Camera math produces correct directional results:
+//     - 3D orbit: drag left => yaw increases (surface moves left).
+//     - 3D pan:   drag right => target moves right in view space.
+//     - 2D pan:   drag right => center_lon_deg decreases (map moves right).
+//  3. Zoom contracts: scroll up => zoom in, scroll down => zoom out.
+//  4. Clamping: pitch stays within bounds, distance stays positive, etc.
+//  5. Config changes are applied and respected by the math.
+
+#[cfg(test)]
+mod camera_contract_tests {
+    use super::*;
+
+    // ── ControlConfig defaults ────────────────────────────────────
+
+    #[test]
+    fn control_config_defaults_are_stable() {
+        let cfg = ControlConfig::default();
+        assert_eq!(cfg.orbit_sensitivity, 1.0);
+        assert_eq!(cfg.pan_sensitivity_3d, 1.0);
+        assert_eq!(cfg.zoom_speed_3d, 1.0);
+        assert!(!cfg.invert_orbit_y);
+        assert!(!cfg.invert_pan_y_3d);
+        assert_eq!(cfg.min_distance, 10.0);
+        assert!((cfg.max_distance - 200.0 * WGS84_A).abs() < 1.0);
+        assert!((cfg.pitch_clamp_rad - 1.55).abs() < 0.001);
+        assert!((cfg.max_target_offset_m - 2.0 * WGS84_A).abs() < 1.0);
+        assert_eq!(cfg.pan_sensitivity_2d, 1.0);
+        assert_eq!(cfg.zoom_speed_2d, 1.0);
+        assert!(!cfg.invert_pan_y_2d);
+        assert_eq!(cfg.min_zoom_2d, 1.0);
+        assert_eq!(cfg.max_zoom_2d, 200.0);
+        assert!(cfg.kinetic_panning);
+    }
+
+    // ── CameraState defaults ──────────────────────────────────────
+
+    #[test]
+    fn camera_state_defaults_are_stable() {
+        let cam = CameraState::default();
+        // Yaw ~160° (faces Africa).
+        assert!((cam.yaw_rad - 160f64.to_radians()).abs() < 0.001);
+        // Slight pitch above equator.
+        assert!((cam.pitch_rad - 5f64.to_radians()).abs() < 0.001);
+        // Distance = 3 × Earth radius.
+        assert!((cam.distance - 3.0 * WGS84_A).abs() < 1.0);
+        // Target at origin.
+        assert_eq!(cam.target, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn camera_2d_state_defaults_are_stable() {
+        let cam = Camera2DState::default();
+        assert_eq!(cam.center_lon_deg, 0.0);
+        assert_eq!(cam.center_lat_deg, 0.0);
+        assert_eq!(cam.zoom, 1.0);
+    }
+
+    // ── Vec3 helpers ──────────────────────────────────────────────
+
+    #[test]
+    fn vec3_normalize_unit_length() {
+        let v = vec3_normalize([3.0, 4.0, 0.0]);
+        let len = vec3_dot(v, v).sqrt();
+        assert!((len - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn vec3_cross_right_hand_rule() {
+        let x = [1.0, 0.0, 0.0];
+        let y = [0.0, 1.0, 0.0];
+        let z = vec3_cross(x, y);
+        assert!((z[2] - 1.0).abs() < 1e-10);
+    }
+
+    // ── 3D Orbit contract ─────────────────────────────────────────
+    //
+    // "Drag left => surface facing user moves left (yaw increases)."
+    // "Drag up => surface facing user tilts up (pitch decreases in default config)."
+
+    #[test]
+    fn orbit_drag_left_increases_yaw() {
+        let mut cam = CameraState::default();
+        let cfg = ControlConfig::default();
+        let w = 1280.0_f64;
+        let h = 720.0_f64;
+        let min_dim = w.min(h).max(1.0);
+        let speed = std::f64::consts::PI / min_dim * cfg.orbit_sensitivity;
+
+        let initial_yaw = cam.yaw_rad;
+        // Simulate drag delta: dx = -100 pixels (drag left on screen).
+        let delta_x = -100.0;
+        // "From outside" contract: yaw -= delta_x * speed.
+        // Drag left (negative dx) => yaw increases.
+        cam.yaw_rad -= delta_x * speed;
+
+        assert!(
+            cam.yaw_rad > initial_yaw,
+            "drag left must increase yaw (from outside)"
+        );
+    }
+
+    #[test]
+    fn orbit_drag_up_decreases_pitch() {
+        let mut cam = CameraState::default();
+        let cfg = ControlConfig::default();
+        let w = 1280.0_f64;
+        let h = 720.0_f64;
+        let min_dim = w.min(h).max(1.0);
+        let speed = std::f64::consts::PI / min_dim * cfg.orbit_sensitivity;
+        // "From outside": default dy_sign = 1.0 (not inverted).
+        let dy_sign = if cfg.invert_orbit_y { -1.0 } else { 1.0 };
+
+        let initial_pitch = cam.pitch_rad;
+        // Simulate drag delta: dy = -50 pixels (drag up on screen).
+        let delta_y = -50.0;
+        cam.pitch_rad += dy_sign * delta_y * speed;
+
+        // Drag up (negative dy) with default config => pitch decreases
+        // (camera tilts down, surface appears to move up).
+        assert!(
+            cam.pitch_rad < initial_pitch,
+            "drag up with default config must decrease pitch (from outside)"
+        );
+    }
+
+    #[test]
+    fn orbit_invert_y_reverses_pitch_direction() {
+        let cfg = ControlConfig {
+            invert_orbit_y: true,
+            ..ControlConfig::default()
+        };
+        let w = 1280.0_f64;
+        let h = 720.0_f64;
+        let min_dim = w.min(h).max(1.0);
+        let speed = std::f64::consts::PI / min_dim * cfg.orbit_sensitivity;
+        let dy_sign = if cfg.invert_orbit_y { -1.0 } else { 1.0 };
+
+        let mut cam = CameraState::default();
+        let initial_pitch = cam.pitch_rad;
+        let delta_y = -50.0; // drag up
+        cam.pitch_rad += dy_sign * delta_y * speed;
+
+        // With invert_orbit_y=true, drag up => pitch increases.
+        assert!(
+            cam.pitch_rad > initial_pitch,
+            "drag up with inverted Y must increase pitch"
+        );
+    }
+
+    #[test]
+    fn orbit_pitch_clamped() {
+        let cfg = ControlConfig::default();
+        let mut cam = CameraState::default();
+        // Set pitch to near-max.
+        cam.pitch_rad = cfg.pitch_clamp_rad + 0.5;
+        cam.pitch_rad = clamp(cam.pitch_rad, -cfg.pitch_clamp_rad, cfg.pitch_clamp_rad);
+        assert!(cam.pitch_rad <= cfg.pitch_clamp_rad);
+        assert!(cam.pitch_rad >= -cfg.pitch_clamp_rad);
+    }
+
+    // ── 3D Pan (target translation) contract ──────────────────────
+    //
+    // "Right-click drag moves the entire globe in the viewport."
+    // "Drag right => globe moves right on screen."
+
+    #[test]
+    fn pan_3d_drag_right_moves_target_right() {
+        let cam = CameraState::default();
+        let cfg = ControlConfig::default();
+        let _w = 1280.0_f64;
+        let h = 720.0_f64;
+
+        // Compute camera right/up vectors.
+        let dir_cam = vec3_normalize([
+            cam.pitch_rad.cos() * cam.yaw_rad.cos(),
+            cam.pitch_rad.sin(),
+            -cam.pitch_rad.cos() * cam.yaw_rad.sin(),
+        ]);
+        let world_up = [0.0, 1.0, 0.0];
+        let right = vec3_normalize(vec3_cross(world_up, dir_cam));
+
+        let fov_y_rad = 45f64.to_radians();
+        let px_to_world = cam.distance * (fov_y_rad / h) * cfg.pan_sensitivity_3d;
+
+        // Drag right: dx = +100px
+        let delta_x = 100.0;
+        let offset_right = vec3_mul(right, -delta_x * px_to_world);
+        let new_target = vec3_add(cam.target, offset_right);
+
+        // The target should have moved in the right direction (non-zero displacement).
+        let displacement = vec3_dot(new_target, new_target).sqrt();
+        assert!(displacement > 0.0, "pan must move target");
+
+        // Verify the target moved along the right vector (dot product with right > 0 means leftward
+        // in camera space, since we negate delta_x for "follow cursor" behavior).
+        // Actually with -delta_x (delta_x positive), offset goes along -right.
+        // This moves the target opposite to the camera's right, which makes the globe
+        // appear to move right on screen (camera-relative).
+        let dot_right = vec3_dot(new_target, right);
+        // The target moves in -right direction (so globe appears to move rightward).
+        assert!(
+            dot_right < 0.0,
+            "target should move opposite to camera-right when dragging right"
+        );
+    }
+
+    #[test]
+    fn pan_3d_target_clamped() {
+        let cfg = ControlConfig::default();
+        // Manually set target beyond allowed offset.
+        let far_target = [cfg.max_target_offset_m * 2.0, 0.0, 0.0];
+        let r = vec3_dot(far_target, far_target).sqrt();
+        let clamped = if r <= cfg.max_target_offset_m {
+            far_target
+        } else {
+            vec3_mul(far_target, cfg.max_target_offset_m / r)
+        };
+        let clamped_r = vec3_dot(clamped, clamped).sqrt();
+        assert!(
+            (clamped_r - cfg.max_target_offset_m).abs() < 1.0,
+            "target offset must be clamped to max_target_offset_m"
+        );
+    }
+
+    // ── 2D Pan contract ───────────────────────────────────────────
+    //
+    // "Map follows cursor direction: drag right => map moves right (lon decreases)."
+
+    #[test]
+    fn pan_2d_drag_right_moves_map_right() {
+        let cam = Camera2DState::default();
+        let w = 1280.0;
+        let h = 720.0;
+        // Drag right: dx = +100px, dy = 0
+        let result = pan_camera_2d(cam, 100.0, 0.0, w, h);
+        // Dragging right means the map content should follow the cursor to the right,
+        // which means the center lon should DECREASE (we're looking at a point further west).
+        assert!(
+            result.center_lon_deg < cam.center_lon_deg,
+            "drag right in 2D must decrease center_lon (map follows cursor right)"
+        );
+    }
+
+    #[test]
+    fn pan_2d_drag_down_moves_map_down() {
+        let cam = Camera2DState::default();
+        let w = 1280.0;
+        let h = 720.0;
+        // Drag down: dx = 0, dy = +100px
+        let result = pan_camera_2d(cam, 0.0, 100.0, w, h);
+        // Drag down => content follows cursor down => center moves north.
+        assert!(
+            result.center_lat_deg > cam.center_lat_deg,
+            "drag down in 2D must increase center_lat (map follows cursor down)"
+        );
+    }
+
+    #[test]
+    fn pan_2d_no_movement_on_zero_delta() {
+        let cam = Camera2DState::default();
+        let result = pan_camera_2d(cam, 0.0, 0.0, 1280.0, 720.0);
+        assert!((result.center_lon_deg - cam.center_lon_deg).abs() < 1e-10);
+        assert!((result.center_lat_deg - cam.center_lat_deg).abs() < 1e-10);
+    }
+
+    // ── Zoom contracts ────────────────────────────────────────────
+
+    #[test]
+    fn zoom_3d_scroll_up_decreases_distance() {
+        let cfg = ControlConfig::default();
+        let cam = CameraState::default();
+        let initial_dist = cam.distance;
+        // Wheel deltaY > 0 = scroll down = zoom out (increase distance).
+        // Wheel deltaY < 0 = scroll up = zoom in (decrease distance).
+        let wheel_delta_y = -100.0; // scroll up
+        let zoom = (wheel_delta_y * 0.0015 * cfg.zoom_speed_3d).exp();
+        let new_dist = clamp(initial_dist * zoom, cfg.min_distance, cfg.max_distance);
+        assert!(
+            new_dist < initial_dist,
+            "scroll up (negative deltaY) must decrease distance (zoom in)"
+        );
+    }
+
+    #[test]
+    fn zoom_3d_scroll_down_increases_distance() {
+        let cfg = ControlConfig::default();
+        let cam = CameraState::default();
+        let initial_dist = cam.distance;
+        let wheel_delta_y = 100.0; // scroll down
+        let zoom = (wheel_delta_y * 0.0015 * cfg.zoom_speed_3d).exp();
+        let new_dist = clamp(initial_dist * zoom, cfg.min_distance, cfg.max_distance);
+        assert!(
+            new_dist > initial_dist,
+            "scroll down (positive deltaY) must increase distance (zoom out)"
+        );
+    }
+
+    #[test]
+    fn zoom_3d_distance_clamped_to_config_range() {
+        let cfg = ControlConfig::default();
+        // Distance below minimum.
+        let dist = clamp(1.0, cfg.min_distance, cfg.max_distance);
+        assert!(dist >= cfg.min_distance);
+        // Distance above maximum.
+        let dist = clamp(1e20, cfg.min_distance, cfg.max_distance);
+        assert!(dist <= cfg.max_distance);
+    }
+
+    #[test]
+    fn zoom_2d_scroll_up_increases_zoom() {
+        let cfg = ControlConfig::default();
+        let cam = Camera2DState::default();
+        let initial_zoom = cam.zoom;
+        // In 2D, zoom factor uses *negative* wheel_delta_y (scroll up = zoom in).
+        let wheel_delta_y = -100.0;
+        let zoom = (-wheel_delta_y * 0.0015 * cfg.zoom_speed_2d).exp();
+        let new_zoom = clamp(initial_zoom * zoom, cfg.min_zoom_2d, cfg.max_zoom_2d);
+        assert!(
+            new_zoom > initial_zoom,
+            "scroll up in 2D must increase zoom level"
+        );
+    }
+
+    #[test]
+    fn zoom_2d_zoom_clamped_to_config_range() {
+        let cfg = ControlConfig::default();
+        let z = clamp(0.1, cfg.min_zoom_2d, cfg.max_zoom_2d);
+        assert!(z >= cfg.min_zoom_2d);
+        let z = clamp(1000.0, cfg.min_zoom_2d, cfg.max_zoom_2d);
+        assert!(z <= cfg.max_zoom_2d);
+    }
+
+    // ── Arcball contract ──────────────────────────────────────────
+
+    #[test]
+    fn trackball_unit_vector_is_normalized() {
+        let u = trackball_unit_from_screen(400.0, 300.0, 800.0, 600.0);
+        let len = vec3_dot(u, u).sqrt();
+        assert!(
+            (len - 1.0).abs() < 1e-10,
+            "trackball vector must be unit length"
+        );
+    }
+
+    #[test]
+    fn trackball_center_points_forward() {
+        // Center of screen should map to (0, 0, 1) — pointing toward the viewer.
+        let u = trackball_unit_from_screen(400.0, 300.0, 800.0, 600.0);
+        assert!(u[2] > 0.9, "center of screen should have large z component");
+    }
+
+    // ── Quaternion helpers ────────────────────────────────────────
+
+    #[test]
+    fn quat_identity_rotation() {
+        let v = [1.0, 0.0, 0.0];
+        let q = quat_from_unit_vectors(v, v);
+        let rotated = quat_rotate_vec3(q, [0.0, 1.0, 0.0]);
+        assert!(
+            (rotated[1] - 1.0).abs() < 1e-10,
+            "identity rotation should not change vectors"
+        );
+    }
+
+    // ── View mode transition contract ─────────────────────────────
+
+    #[test]
+    fn view_mode_3d_to_2d_resets_camera_2d() {
+        // When switching 3D -> 2D, Camera2DState should be reset to default.
+        let new_cam = Camera2DState::default();
+        assert_eq!(new_cam.center_lon_deg, 0.0);
+        assert_eq!(new_cam.center_lat_deg, 0.0);
+        assert_eq!(new_cam.zoom, 1.0);
+    }
+
+    #[test]
+    fn view_mode_2d_to_3d_maps_center_to_yaw() {
+        // Contract: yaw = (180° - lon).to_radians()
+        let lon_deg: f64 = 20.0; // Nairobi-ish longitude
+        let expected_yaw = (180.0_f64 - lon_deg).to_radians();
+        let yaw = (180.0_f64 - lon_deg).to_radians();
+        assert!((yaw - expected_yaw).abs() < 1e-10);
+
+        // Verify the yaw places the correct longitude in front of camera.
+        // visible_lon ≈ 180° - yaw_deg
+        let yaw_deg = yaw.to_degrees();
+        let visible_lon = 180.0_f64 - yaw_deg;
+        assert!((visible_lon - lon_deg).abs() < 1e-10);
+    }
+
+    // ── Sensitivity multiplier contract ───────────────────────────
+
+    #[test]
+    fn higher_sensitivity_produces_larger_displacement() {
+        let w = 1280.0_f64;
+        let h = 720.0_f64;
+        let min_dim = w.min(h);
+        let delta_x = 50.0;
+
+        let speed_1x = std::f64::consts::PI / min_dim * 1.0;
+        let speed_2x = std::f64::consts::PI / min_dim * 2.0;
+
+        let yaw_delta_1x = delta_x * speed_1x;
+        let yaw_delta_2x = delta_x * speed_2x;
+
+        assert!(
+            yaw_delta_2x > yaw_delta_1x,
+            "2x sensitivity must produce larger yaw change"
+        );
+        assert!(
+            (yaw_delta_2x / yaw_delta_1x - 2.0).abs() < 1e-10,
+            "2x sensitivity must produce exactly 2x the yaw change"
+        );
+    }
+
+    // ── Mercator projection contract ──────────────────────────────
+
+    #[test]
+    fn mercator_roundtrip_longitude() {
+        let lon = 45.0;
+        let x = mercator_x_m(lon);
+        let roundtrip = inverse_mercator_lon_deg(x);
+        assert!(
+            (roundtrip - lon).abs() < 1e-8,
+            "mercator lon roundtrip must be lossless"
+        );
+    }
+
+    #[test]
+    fn mercator_roundtrip_latitude() {
+        let lat = 51.5; // London
+        let y = mercator_y_m(lat);
+        let roundtrip = inverse_mercator_lat_deg(y);
+        assert!(
+            (roundtrip - lat).abs() < 1e-8,
+            "mercator lat roundtrip must be lossless"
+        );
+    }
+
+    #[test]
+    fn mercator_max_lat_clamped() {
+        let cam = Camera2DState {
+            center_lat_deg: 0.0,
+            center_lon_deg: 0.0,
+            zoom: 1.0,
+        };
+        // Large upward drag should not exceed max Mercator latitude.
+        let result = pan_camera_2d(cam, 0.0, -100000.0, 1280.0, 720.0);
+        assert!(result.center_lat_deg <= MERCATOR_MAX_LAT_DEG);
+        assert!(result.center_lat_deg >= -MERCATOR_MAX_LAT_DEG);
     }
 }

@@ -219,6 +219,7 @@
         top: 12px;
         left: 12px;
         right: auto;
+        z-index: 30;
         display: flex;
         flex-direction: column;
         gap: 8px;
@@ -546,6 +547,230 @@
         overflow: hidden;
         text-overflow: ellipsis;
       }
+
+      /* ── Time Dial ────────────────────────────────────────────── */
+      .time-dial {
+        position: fixed;
+        top: 8px;
+        left: 50vw;
+        transform: translateX(-50%);
+        z-index: 25;
+        display: flex;
+        align-items: center;
+        gap: 0;
+        height: 30px;
+        background: var(--controls-bg);
+        border: 1px solid var(--controls-border);
+        backdrop-filter: blur(10px);
+        border-radius: 10px;
+        box-shadow: 0 4px 16px var(--shadow);
+        user-select: none;
+        padding: 0;
+        min-width: 380px;
+        max-width: min(720px, calc(100vw - 100px));
+        overflow: visible;
+        pointer-events: auto;
+      }
+      .time-dial.hidden { display: none; }
+
+      .time-dial-playback {
+        display: flex;
+        align-items: center;
+        gap: 2px;
+        padding: 0 4px;
+        flex-shrink: 0;
+      }
+      .time-dial-playback .td-btn {
+        width: 22px;
+        height: 22px;
+        padding: 0;
+        border-radius: 6px;
+        border: 1px solid var(--btn-border);
+        background: var(--btn-bg);
+        color: var(--btn-fg);
+        cursor: pointer;
+        display: grid;
+        place-items: center;
+        font-size: 11px;
+        line-height: 1;
+      }
+      .time-dial-playback .td-btn:hover {
+        border-color: var(--accent-border);
+      }
+      .time-dial-playback .td-btn.active {
+        background: var(--accent);
+        border-color: var(--accent-border);
+      }
+
+      .time-dial-track-wrapper {
+        position: relative;
+        flex: 1;
+        height: 100%;
+        overflow: hidden;
+        cursor: grab;
+      }
+      .time-dial-track-wrapper:active { cursor: grabbing; }
+      .time-dial-track {
+        position: relative;
+        width: 100%;
+        height: 100%;
+      }
+      .time-dial-canvas {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+
+      /* Center needle */
+      .time-dial-needle {
+        position: absolute;
+        top: 3px;
+        bottom: 3px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 2px;
+        background: var(--accent-border);
+        border-radius: 2px;
+        pointer-events: none;
+        z-index: 2;
+      }
+      .time-dial-needle::after {
+        content: '';
+        position: absolute;
+        top: -2px;
+        left: 50%;
+        transform: translateX(-50%);
+        width: 0;
+        height: 0;
+        border-left: 4px solid transparent;
+        border-right: 4px solid transparent;
+        border-top: 4px solid var(--accent-border);
+      }
+
+      .time-dial-label {
+        position: absolute;
+        bottom: -16px;
+        left: 50%;
+        transform: translateX(-50%);
+        font-size: 10px;
+        font-weight: 700;
+        color: var(--accent-border);
+        white-space: nowrap;
+        pointer-events: none;
+        text-shadow: 0 1px 4px var(--shadow);
+        z-index: 3;
+      }
+
+      .time-dial-settings-btn {
+        width: 24px;
+        height: 24px;
+        padding: 0;
+        border-radius: 6px;
+        border: 1px solid var(--btn-border);
+        background: var(--btn-bg);
+        color: var(--btn-fg);
+        cursor: pointer;
+        display: grid;
+        place-items: center;
+        margin: 0 4px;
+        flex-shrink: 0;
+      }
+      .time-dial-settings-btn:hover {
+        border-color: var(--accent-border);
+      }
+      .time-dial-settings-btn svg {
+        width: 13px;
+        height: 13px;
+      }
+      .time-dial-settings-btn svg * { stroke: currentColor; }
+
+      /* Speed label inside the dial */
+      .time-dial-speed {
+        font-size: 9px;
+        font-weight: 700;
+        color: var(--muted);
+        padding: 0 3px;
+        flex-shrink: 0;
+        white-space: nowrap;
+      }
+
+      /* Responsive: shrink on narrow viewports */
+      @media (max-width: 900px) {
+        .time-dial {
+          min-width: 300px;
+          max-width: min(600px, calc(100vw - 100px));
+        }
+      }
+      @media (max-width: 600px) {
+        .time-dial {
+          min-width: 240px;
+          max-width: calc(100vw - 24px);
+          top: 6px;
+          height: 28px;
+          border-radius: 8px;
+        }
+        .time-dial-playback .td-btn {
+          width: 20px;
+          height: 20px;
+          font-size: 10px;
+        }
+        .time-dial-settings-btn {
+          width: 20px;
+          height: 20px;
+        }
+      }
+
+      /* Time settings modal extends the existing .modal style */
+      .time-settings-modal .ts-grid {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 10px;
+      }
+      .time-settings-modal .ts-grid.full {
+        grid-template-columns: 1fr;
+      }
+      .time-settings-modal label {
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 2px;
+      }
+      .time-settings-modal input[type="text"],
+      .time-settings-modal input[type="number"],
+      .time-settings-modal input[type="datetime-local"],
+      .time-settings-modal select {
+        width: 100%;
+        padding: 6px 8px;
+        border-radius: 6px;
+        border: 1px solid var(--btn-border);
+        background: var(--btn-bg);
+        color: var(--btn-fg);
+        font-size: 13px;
+      }
+      .time-settings-modal .layer-time-list {
+        max-height: 220px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+        margin-top: 8px;
+      }
+      .time-settings-modal .layer-time-row {
+        display: grid;
+        grid-template-columns: auto 1fr auto;
+        gap: 8px;
+        align-items: center;
+        padding: 6px 8px;
+        border-radius: 6px;
+        background: rgba(2, 6, 23, 0.25);
+        border: 1px solid rgba(148, 163, 184, 0.10);
+      }
+      .time-settings-modal .layer-time-row .lt-name {
+        font-size: 12px;
+        font-weight: 600;
+      }
+      .time-settings-modal .layer-time-row select {
+        max-width: 160px;
+      }
     </style>
     <script>
       // Apply theme as early as possible to avoid a flash.
@@ -839,6 +1064,10 @@
               <input id="toggle-globe-transparent" type="checkbox" />
               <span>Transparent globe</span>
             </label>
+            <label class="checkbox" style="margin-top:8px;">
+              <input id="toggle-time-dial" type="checkbox" checked />
+              <span>Show time dial</span>
+            </label>
             <div class="muted" style="font-size:12px; line-height:1.35; margin-top:8px;">
               Affects UI and globe colors (base surface + ocean/space).
             </div>
@@ -892,11 +1121,192 @@
               Limits for GeoJSON/CSV uploads. Larger values may slow down the browser.
             </div>
           </div>
+
+          <div class="section">
+            <h3>Controls</h3>
+            <div class="muted" style="font-size:12px; line-height:1.35; margin-bottom:8px;">
+              <strong>Left drag:</strong> rotate globe / pan map<br/>
+              <strong>Right drag / Shift+drag:</strong> translate globe / pan map<br/>
+              <strong>Wheel:</strong> zoom &nbsp; <strong>R:</strong> reset camera
+            </div>
+
+            <label for="ctrl-orbit-sens">3D orbit sensitivity</label>
+            <div class="row">
+              <input id="ctrl-orbit-sens" type="range" min="0.1" max="3" step="0.05" value="1" />
+              <span id="ctrl-orbit-sens-value" class="value">1.0</span>
+            </div>
+
+            <label for="ctrl-pan-sens-3d" style="margin-top:6px;">3D pan sensitivity</label>
+            <div class="row">
+              <input id="ctrl-pan-sens-3d" type="range" min="0.1" max="3" step="0.05" value="1" />
+              <span id="ctrl-pan-sens-3d-value" class="value">1.0</span>
+            </div>
+
+            <label for="ctrl-zoom-speed-3d" style="margin-top:6px;">3D zoom speed</label>
+            <div class="row">
+              <input id="ctrl-zoom-speed-3d" type="range" min="0.1" max="3" step="0.05" value="1" />
+              <span id="ctrl-zoom-speed-3d-value" class="value">1.0</span>
+            </div>
+
+            <label for="ctrl-pan-sens-2d" style="margin-top:6px;">2D pan sensitivity</label>
+            <div class="row">
+              <input id="ctrl-pan-sens-2d" type="range" min="0.1" max="3" step="0.05" value="1" />
+              <span id="ctrl-pan-sens-2d-value" class="value">1.0</span>
+            </div>
+
+            <label for="ctrl-zoom-speed-2d" style="margin-top:6px;">2D zoom speed</label>
+            <div class="row">
+              <input id="ctrl-zoom-speed-2d" type="range" min="0.1" max="3" step="0.05" value="1" />
+              <span id="ctrl-zoom-speed-2d-value" class="value">1.0</span>
+            </div>
+
+            <label class="checkbox" style="margin-top:8px;">
+              <input id="ctrl-invert-orbit-y" type="checkbox" />
+              <span>Invert orbit Y axis</span>
+            </label>
+            <label class="checkbox" style="margin-top:4px;">
+              <input id="ctrl-invert-pan-y-3d" type="checkbox" />
+              <span>Invert 3D pan Y axis</span>
+            </label>
+            <label class="checkbox" style="margin-top:4px;">
+              <input id="ctrl-invert-pan-y-2d" type="checkbox" />
+              <span>Invert 2D pan Y axis</span>
+            </label>
+            <label class="checkbox" style="margin-top:4px;">
+              <input id="ctrl-kinetic-pan" type="checkbox" checked />
+              <span>Kinetic panning (2D inertia)</span>
+            </label>
+
+            <button id="ctrl-reset-defaults" class="btn" type="button" style="margin-top:10px; width: 100%; height:30px; border-radius:8px;">
+              Reset controls to defaults
+            </button>
+          </div>
         </div>
       </div>
       <div id="map-area">
         <canvas id="atlas-canvas-2d" width="1280" height="720" class="hidden"></canvas>
         <canvas id="atlas-canvas-3d" width="1280" height="720"></canvas>
+
+        <!-- ── Time Dial ──────────────────────────────────────── -->
+        <div id="time-dial" class="time-dial" aria-label="Time dial">
+          <div class="time-dial-playback">
+            <button id="td-step-back" class="td-btn" type="button" title="Step backward">⏪</button>
+            <button id="td-play" class="td-btn" type="button" title="Play / Pause">▶</button>
+            <button id="td-step-fwd" class="td-btn" type="button" title="Step forward">⏩</button>
+          </div>
+          <div id="td-track-wrapper" class="time-dial-track-wrapper">
+            <canvas id="td-canvas" class="time-dial-canvas"></canvas>
+            <div class="time-dial-needle"></div>
+            <div id="td-label" class="time-dial-label">00:00:00</div>
+          </div>
+          <span id="td-speed" class="time-dial-speed">1×</span>
+          <button id="td-settings-btn" class="time-dial-settings-btn" type="button" title="Time settings">
+            <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 15.5a3.5 3.5 0 1 0 0-7 3.5 3.5 0 0 0 0 7z"/>
+              <path d="M19.4 15a7.8 7.8 0 0 0 .1-1 7.8 7.8 0 0 0-.1-1l2-1.6-2-3.4-2.4 1a8.4 8.4 0 0 0-1.7-1l-.4-2.6H9.1L8.7 7a8.4 8.4 0 0 0-1.7 1l-2.4-1-2 3.4L4.6 13a7.8 7.8 0 0 0-.1 1 7.8 7.8 0 0 0 .1 1l-2 1.6 2 3.4 2.4-1a8.4 8.4 0 0 0 1.7 1l.4 2.6h5.8l.4-2.6a8.4 8.4 0 0 0 1.7-1l2.4 1 2-3.4-2-1.6z"/>
+            </svg>
+          </button>
+        </div>
+
+        <!-- ── Time Settings Modal ────────────────────────────── -->
+        <div id="time-settings-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Time settings">
+          <div class="modal time-settings-modal">
+            <div class="modal-header">
+              <h3>Time Settings</h3>
+              <button id="ts-modal-close" type="button" class="btn" title="Close">✕</button>
+            </div>
+
+            <div style="display:flex; flex-direction:column; gap:14px;">
+              <div class="section">
+                <h3>Time Range</h3>
+                <div class="ts-grid">
+                  <div>
+                    <label for="ts-mode">Time mode</label>
+                    <select id="ts-mode">
+                      <option value="relative" selected>Relative (seconds)</option>
+                      <option value="absolute">Absolute (date/time)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="ts-speed">Playback speed</label>
+                    <select id="ts-speed">
+                      <option value="0.25">0.25×</option>
+                      <option value="0.5">0.5×</option>
+                      <option value="1" selected>1×</option>
+                      <option value="2">2×</option>
+                      <option value="5">5×</option>
+                      <option value="10">10×</option>
+                      <option value="30">30×</option>
+                      <option value="60">60×</option>
+                    </select>
+                  </div>
+                </div>
+                <div class="ts-grid" style="margin-top:10px;">
+                  <div>
+                    <label for="ts-start">Start</label>
+                    <input id="ts-start" type="text" placeholder="0" value="0" />
+                  </div>
+                  <div>
+                    <label for="ts-end">End</label>
+                    <input id="ts-end" type="text" placeholder="10" value="10" />
+                  </div>
+                </div>
+                <div class="ts-grid" style="margin-top:10px;">
+                  <div>
+                    <label for="ts-step">Step size (seconds)</label>
+                    <input id="ts-step" type="number" min="0.001" step="0.001" value="0.016" />
+                  </div>
+                  <div>
+                    <label for="ts-loop">Loop playback</label>
+                    <select id="ts-loop">
+                      <option value="loop" selected>Loop</option>
+                      <option value="once">Play once</option>
+                      <option value="bounce">Bounce (ping-pong)</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              <div class="section">
+                <h3>Layer Time Settings</h3>
+                <div class="muted" style="font-size:12px; line-height:1.35; margin-bottom:8px;">
+                  Enable time-filtering on layers. Choose which attribute field drives temporal visibility.
+                </div>
+                <div id="ts-layer-list" class="layer-time-list">
+                  <div class="muted" style="font-size:12px;">No layers loaded yet.</div>
+                </div>
+              </div>
+
+              <div class="section">
+                <h3>Display</h3>
+                <div class="ts-grid">
+                  <div>
+                    <label for="ts-format">Time label format</label>
+                    <select id="ts-format">
+                      <option value="wallclock" selected>Wall clock (real time)</option>
+                      <option value="seconds">Seconds (0.00s)</option>
+                      <option value="hms">HH:MM:SS</option>
+                      <option value="datetime">Date/Time</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label for="ts-divisions">Tick interval (seconds)</label>
+                    <input id="ts-divisions" type="number" min="0.1" step="0.1" value="1" />
+                  </div>
+                </div>
+                <label class="checkbox" style="margin-top:8px;">
+                  <input id="ts-show-dial" type="checkbox" checked />
+                  <span>Show time dial on map</span>
+                </label>
+              </div>
+            </div>
+
+            <div class="modal-footer">
+              <button id="ts-reset-btn" type="button" class="btn">Reset defaults</button>
+              <button id="ts-save-btn" type="button">Save</button>
+            </div>
+          </div>
+        </div>
 
         <div id="perf-hud" class="perf-hud hidden" aria-label="Performance HUD">
           <div class="hdr">
@@ -1642,6 +2052,7 @@
         startPerfHudPolling(wasm);
         startTerrainClientStatusPolling(wasm);
         startAnimation(wasm);
+        wireTimeDial(wasm);
 
         // If the backend is offline, kick the base surface loader (PMTiles/world.json).
         backendOkPromise
@@ -3503,6 +3914,9 @@
         let pendingDx = 0;
         let pendingDy = 0;
         let dragRaf = 0;
+        // Canvas-space last position for delta-based pan mode.
+        let lastCanvasX = 0;
+        let lastCanvasY = 0;
 
         // Kinetic panning (2D): track drag velocity and continue panning on release.
         let panVelX = 0; // px per ms
@@ -3634,6 +4048,8 @@
           // Arcball-style grab-to-rotate (and 2D pan) initialization.
           try {
             const { x, y } = canvasXYFromClient(canvas, e.clientX, e.clientY);
+            lastCanvasX = x;
+            lastCanvasY = y;
             if (viewMode === "2d") {
               panLastT = performance.now();
               panLastX = x;
@@ -3737,7 +4153,17 @@
               const px = pendingDx;
               const py = pendingDy;
               try {
-                wasm.camera_drag_move(px, py);
+                // Both modes use delta-based input.
+                const dx = px - lastCanvasX;
+                const dy = py - lastCanvasY;
+                lastCanvasX = px;
+                lastCanvasY = py;
+                if (dragMode === "pan") {
+                  wasm.camera_pan(dx, dy);
+                } else {
+                  // Delta orbit: surface follows cursor direction ("from outside").
+                  wasm.camera_orbit(dx, dy);
+                }
                 updateCompass();
               } catch (err) {
                 console.error("camera input failed", err);
@@ -4110,6 +4536,104 @@
           });
         }
 
+        // ── Controls settings wiring ──────────────────────────────
+        {
+          const sliders = [
+            { id: "ctrl-orbit-sens", key: "orbit_sensitivity" },
+            { id: "ctrl-pan-sens-3d", key: "pan_sensitivity_3d" },
+            { id: "ctrl-zoom-speed-3d", key: "zoom_speed_3d" },
+            { id: "ctrl-pan-sens-2d", key: "pan_sensitivity_2d" },
+            { id: "ctrl-zoom-speed-2d", key: "zoom_speed_2d" },
+          ];
+          const checkboxes = [
+            { id: "ctrl-invert-orbit-y", key: "invert_orbit_y" },
+            { id: "ctrl-invert-pan-y-3d", key: "invert_pan_y_3d" },
+            { id: "ctrl-invert-pan-y-2d", key: "invert_pan_y_2d" },
+            { id: "ctrl-kinetic-pan", key: "kinetic_panning" },
+          ];
+
+          // Load saved control config from localStorage
+          function loadControlConfig() {
+            try {
+              const saved = localStorage.getItem("atlas.controlConfig");
+              if (saved) return JSON.parse(saved);
+            } catch (_) {}
+            return null;
+          }
+
+          function saveControlConfig() {
+            try {
+              const json = wasm.get_control_config ? wasm.get_control_config() : null;
+              if (json) localStorage.setItem("atlas.controlConfig", json);
+            } catch (_) {}
+          }
+
+          function syncControlsUI() {
+            try {
+              const cfg = JSON.parse(wasm.get_control_config());
+              for (const { id, key } of sliders) {
+                const el = document.getElementById(id);
+                const val = document.getElementById(id + "-value");
+                if (el && cfg[key] !== undefined) {
+                  el.value = String(cfg[key]);
+                  if (val) val.textContent = Number(cfg[key]).toFixed(1);
+                }
+              }
+              for (const { id, key } of checkboxes) {
+                const el = document.getElementById(id);
+                if (el && cfg[key] !== undefined) el.checked = cfg[key];
+              }
+            } catch (_) {}
+          }
+
+          // Apply saved config on load
+          const savedCfg = loadControlConfig();
+          if (savedCfg && wasm.set_control_config) {
+            for (const [key, value] of Object.entries(savedCfg)) {
+              try {
+                const numVal = typeof value === "boolean" ? (value ? 1 : 0) : Number(value);
+                wasm.set_control_config(key, numVal);
+              } catch (_) {}
+            }
+          }
+          syncControlsUI();
+
+          // Wire slider inputs
+          for (const { id, key } of sliders) {
+            const el = document.getElementById(id);
+            const val = document.getElementById(id + "-value");
+            if (!el) continue;
+            el.addEventListener("input", () => {
+              const v = Number(el.value);
+              if (val) val.textContent = v.toFixed(1);
+              try { wasm.set_control_config(key, v); } catch (_) {}
+              saveControlConfig();
+            });
+          }
+
+          // Wire checkbox inputs
+          for (const { id, key } of checkboxes) {
+            const el = document.getElementById(id);
+            if (!el) continue;
+            el.addEventListener("change", () => {
+              try { wasm.set_control_config(key, el.checked ? 1 : 0); } catch (_) {}
+              saveControlConfig();
+            });
+          }
+
+          // Reset button
+          const resetBtn = document.getElementById("ctrl-reset-defaults");
+          if (resetBtn) {
+            resetBtn.addEventListener("click", () => {
+              try {
+                wasm.reset_control_config();
+                syncControlsUI();
+                saveControlConfig();
+              } catch (err) { console.error("reset_control_config failed", err); }
+            });
+          }
+        }
+
         function applyCitySize() {
           const v = Number(citySize.value);
           citySizeValue.textContent = String(v);
@@ -4229,6 +4753,537 @@
 
         // Default view mode.
         applyViewMode(viewMode);
+      }
+
+      // ═══════════════════════════════════════════════════════════
+      // ▸ Time Dial – scrollable timeline with playback controls
+      // ═══════════════════════════════════════════════════════════
+
+      // ── IndexedDB persistence ──────────────────────────────────
+      const TD_DB_NAME = "atlas-time-settings";
+      const TD_DB_VERSION = 1;
+      const TD_STORE = "settings";
+
+      function tdOpenDb() {
+        return new Promise((resolve, reject) => {
+          const req = indexedDB.open(TD_DB_NAME, TD_DB_VERSION);
+          req.onupgradeneeded = () => {
+            const db = req.result;
+            if (!db.objectStoreNames.contains(TD_STORE)) {
+              db.createObjectStore(TD_STORE);
+            }
+          };
+          req.onsuccess = () => resolve(req.result);
+          req.onerror = () => reject(req.error);
+        });
+      }
+
+      async function tdSaveSettings(settings) {
+        try {
+          const db = await tdOpenDb();
+          const tx = db.transaction(TD_STORE, "readwrite");
+          tx.objectStore(TD_STORE).put(settings, "current");
+          await new Promise((res, rej) => { tx.oncomplete = res; tx.onerror = rej; });
+          db.close();
+        } catch (e) {
+          console.warn("tdSaveSettings failed, falling back to localStorage", e);
+          try { localStorage.setItem("atlas-time-settings", JSON.stringify(settings)); } catch (_) {}
+        }
+      }
+
+      async function tdLoadSettings() {
+        try {
+          const db = await tdOpenDb();
+          const tx = db.transaction(TD_STORE, "readonly");
+          const req = tx.objectStore(TD_STORE).get("current");
+          const result = await new Promise((res, rej) => { req.onsuccess = () => res(req.result); req.onerror = rej; });
+          db.close();
+          if (result) return result;
+        } catch (e) {
+          console.warn("tdLoadSettings from IDB failed", e);
+        }
+        // Fallback: localStorage
+        try {
+          const raw = localStorage.getItem("atlas-time-settings");
+          if (raw) return JSON.parse(raw);
+        } catch (_) {}
+        return null;
+      }
+
+      // ── Default settings ────────────────────────────────────────
+      function tdDefaults() {
+        return {
+          mode: "relative",       // "relative" | "absolute"
+          speed: 1,
+          startTime: 0,
+          endTime: 10,
+          stepSize: 1/60,         // ~16ms per frame
+          loopMode: "loop",       // "loop" | "once" | "bounce"
+          format: "wallclock",      // "wallclock" | "seconds" | "hms" | "datetime"
+          tickInterval: 1,
+          showDial: true,
+          layerTimeConfig: {},    // { layerName: { enabled: bool, field: string } }
+        };
+      }
+
+      // ── Wire it all up ──────────────────────────────────────────
+      function wireTimeDial(wasm) {
+        const dial      = document.getElementById("time-dial");
+        const canvas    = document.getElementById("td-canvas");
+        const wrapper   = document.getElementById("td-track-wrapper");
+        const label     = document.getElementById("td-label");
+        const speedLabel = document.getElementById("td-speed");
+        const playBtn   = document.getElementById("td-play");
+        const stepBack  = document.getElementById("td-step-back");
+        const stepFwd   = document.getElementById("td-step-fwd");
+        const settingsBtn = document.getElementById("td-settings-btn");
+
+        // Settings modal elements
+        const modal     = document.getElementById("time-settings-modal");
+        const modalClose = document.getElementById("ts-modal-close");
+        const tsMode    = document.getElementById("ts-mode");
+        const tsSpeed   = document.getElementById("ts-speed");
+        const tsStart   = document.getElementById("ts-start");
+        const tsEnd     = document.getElementById("ts-end");
+        const tsStep    = document.getElementById("ts-step");
+        const tsLoop    = document.getElementById("ts-loop");
+        const tsFormat  = document.getElementById("ts-format");
+        const tsDivisions = document.getElementById("ts-divisions");
+        const tsShowDial = document.getElementById("ts-show-dial");
+        const tsLayerList = document.getElementById("ts-layer-list");
+        const tsResetBtn = document.getElementById("ts-reset-btn");
+        const tsSaveBtn = document.getElementById("ts-save-btn");
+
+        // Settings panel toggle (in the left panel Settings tab)
+        const panelDialToggle = document.getElementById("toggle-time-dial");
+
+        if (!dial || !canvas || !wrapper) return;
+
+        const ctx = canvas.getContext("2d");
+        let settings = tdDefaults();
+
+        // Helper: sync the panel toggle checkbox + dial visibility
+        function syncDialVisibility() {
+          dial.classList.toggle("hidden", !settings.showDial);
+          if (panelDialToggle) panelDialToggle.checked = settings.showDial;
+        }
+
+        // Playback state
+        let playing = false;
+        let playDirection = 1; // 1=forward, -1=backward (for bounce)
+        let dragStartX = null;
+        let dragStartTime = null;
+
+        // ── Format helpers ────────────────────────────────────────
+        function formatTime(t) {
+          if (settings.format === "wallclock") {
+            const now = new Date();
+            // Offset from "now" by the engine time difference
+            const d = new Date(now.getTime());
+            const hh = String(d.getHours()).padStart(2, "0");
+            const mm = String(d.getMinutes()).padStart(2, "0");
+            const ss = String(d.getSeconds()).padStart(2, "0");
+            return `${hh}:${mm}:${ss}`;
+          }
+          if (settings.format === "hms") {
+            const neg = t < 0;
+            const abs = Math.abs(t);
+            const h = Math.floor(abs / 3600);
+            const m = Math.floor((abs % 3600) / 60);
+            const s = Math.floor(abs % 60);
+            const ms = Math.round((abs % 1) * 100);
+            const hms = `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
+            return (neg ? "-" : "") + (ms > 0 ? `${hms}.${String(ms).padStart(2, "0")}` : hms);
+          }
+          if (settings.format === "datetime") {
+            // epoch-ms offset from an origin (Jan 1 2020 for now)
+            const origin = new Date("2020-01-01T00:00:00Z").getTime();
+            const d = new Date(origin + t * 1000);
+            return d.toISOString().replace("T", " ").replace("Z", "").slice(0, 19);
+          }
+          // seconds
+          return t.toFixed(2) + "s";
+        }
+
+        function shortFormatTime(t) {
+          if (settings.format === "wallclock") {
+            const now = new Date();
+            const offsetSec = t - (wasm.get_time ? wasm.get_time() : 0);
+            const d = new Date(now.getTime() + offsetSec * 1000);
+            const hh = String(d.getHours()).padStart(2, "0");
+            const mm = String(d.getMinutes()).padStart(2, "0");
+            return `${hh}:${mm}`;
+          }
+          if (settings.format === "hms") {
+            const abs = Math.abs(t);
+            const m = Math.floor(abs / 60);
+            const s = Math.floor(abs % 60);
+            return `${m}:${String(s).padStart(2, "0")}`;
+          }
+          if (settings.format === "datetime") {
+            const origin = new Date("2020-01-01T00:00:00Z").getTime();
+            const d = new Date(origin + t * 1000);
+            return `${String(d.getUTCHours()).padStart(2,"0")}:${String(d.getUTCMinutes()).padStart(2,"0")}`;
+          }
+          return t.toFixed(1);
+        }
+
+        // ── Draw the tick track ──────────────────────────────────
+        function drawTrack() {
+          const dpr = window.devicePixelRatio || 1;
+          const rect = wrapper.getBoundingClientRect();
+          const w = rect.width;
+          const h = rect.height;
+          canvas.width = Math.round(w * dpr);
+          canvas.height = Math.round(h * dpr);
+          canvas.style.width = w + "px";
+          canvas.style.height = h + "px";
+          ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+          ctx.clearRect(0, 0, w, h);
+
+          const currentTime = wasm.get_time ? wasm.get_time() : 0;
+          const interval = Math.max(0.1, settings.tickInterval);
+          const centerX = w / 2;
+
+          // Pixels per second – scale so ~10 ticks are visible
+          const pxPerSec = w / (interval * 10);
+
+          // Compute CSS color from theme
+          const fg = getComputedStyle(document.documentElement).getPropertyValue("--fg").trim() || "#e2e8f0";
+          const muted = getComputedStyle(document.documentElement).getPropertyValue("--muted").trim() || "#94a3b8";
+          const accent = getComputedStyle(document.documentElement).getPropertyValue("--accent-border").trim() || "#3b82f6";
+
+          // Find first visible tick
+          const visibleHalf = w / 2;
+          const tMin = currentTime - visibleHalf / pxPerSec;
+          const tMax = currentTime + visibleHalf / pxPerSec;
+          const firstTick = Math.floor(tMin / interval) * interval;
+
+          ctx.lineWidth = 1;
+          for (let t = firstTick; t <= tMax + interval; t += interval) {
+            const x = centerX + (t - currentTime) * pxPerSec;
+            if (x < -10 || x > w + 10) continue;
+
+            // Major tick every 5 intervals, minor in between
+            const isMajor = Math.abs(Math.round(t / interval)) % 5 === 0;
+            const tickH = isMajor ? h * 0.55 : h * 0.30;
+
+            ctx.strokeStyle = isMajor ? fg : muted;
+            ctx.globalAlpha = isMajor ? 0.5 : 0.25;
+            ctx.beginPath();
+            ctx.moveTo(x, (h - tickH) / 2);
+            ctx.lineTo(x, (h + tickH) / 2);
+            ctx.stroke();
+
+            // Label for major ticks
+            if (isMajor) {
+              ctx.globalAlpha = 0.6;
+              ctx.fillStyle = muted;
+              ctx.font = "9px Inter, system-ui, sans-serif";
+              ctx.textAlign = "center";
+              ctx.fillText(shortFormatTime(t), x, h - 4);
+            }
+          }
+
+          // Range indicators (start/end boundaries)
+          const startX = centerX + (settings.startTime - currentTime) * pxPerSec;
+          const endX = centerX + (settings.endTime - currentTime) * pxPerSec;
+
+          ctx.globalAlpha = 0.12;
+          ctx.fillStyle = accent;
+          if (startX > 0) {
+            ctx.fillRect(0, 0, startX, h);
+          }
+          if (endX < w) {
+            ctx.fillRect(endX, 0, w - endX, h);
+          }
+
+          ctx.globalAlpha = 1;
+          // Update label
+          label.textContent = formatTime(currentTime);
+        }
+
+        // ── Playback controls ─────────────────────────────────────
+        function setPlaying(p) {
+          playing = p;
+          playBtn.textContent = playing ? "⏸" : "▶";
+          playBtn.classList.toggle("active", playing);
+        }
+
+        playBtn.addEventListener("click", () => setPlaying(!playing));
+
+        stepBack.addEventListener("click", () => {
+          setPlaying(false);
+          const t = (wasm.get_time ? wasm.get_time() : 0) - settings.tickInterval;
+          const clamped = Math.max(settings.startTime, t);
+          try { wasm.set_time(clamped); } catch (e) { console.error(e); }
+          drawTrack();
+        });
+
+        stepFwd.addEventListener("click", () => {
+          setPlaying(false);
+          const t = (wasm.get_time ? wasm.get_time() : 0) + settings.tickInterval;
+          const clamped = Math.min(settings.endTime, t);
+          try { wasm.set_time(clamped); } catch (e) { console.error(e); }
+          drawTrack();
+        });
+
+        // Playback loop: advance time when playing
+        let lastPlayTick = 0;
+        function playbackTick(now) {
+          if (playing) {
+            const dt = lastPlayTick ? (now - lastPlayTick) / 1000 : 0;
+            lastPlayTick = now;
+            if (dt > 0 && dt < 0.5) {
+              let t = (wasm.get_time ? wasm.get_time() : 0) + dt * settings.speed * playDirection;
+
+              if (settings.loopMode === "loop") {
+                if (t > settings.endTime) t = settings.startTime;
+                if (t < settings.startTime) t = settings.endTime;
+              } else if (settings.loopMode === "once") {
+                if (t > settings.endTime) { t = settings.endTime; setPlaying(false); }
+                if (t < settings.startTime) { t = settings.startTime; setPlaying(false); }
+              } else if (settings.loopMode === "bounce") {
+                if (t > settings.endTime) { t = settings.endTime; playDirection = -1; }
+                if (t < settings.startTime) { t = settings.startTime; playDirection = 1; }
+              }
+
+              try { wasm.set_time(t); } catch (e) { console.error(e); }
+            }
+          } else {
+            lastPlayTick = 0;
+          }
+          drawTrack();
+          requestAnimationFrame(playbackTick);
+        }
+        requestAnimationFrame(playbackTick);
+
+        // ── Drag scrolling ────────────────────────────────────────
+        function getPxPerSec() {
+          const rect = wrapper.getBoundingClientRect();
+          return rect.width / (Math.max(0.1, settings.tickInterval) * 10);
+        }
+
+        wrapper.addEventListener("pointerdown", (e) => {
+          e.preventDefault();
+          wrapper.setPointerCapture(e.pointerId);
+          dragStartX = e.clientX;
+          dragStartTime = wasm.get_time ? wasm.get_time() : 0;
+          setPlaying(false);
+        });
+
+        wrapper.addEventListener("pointermove", (e) => {
+          if (dragStartX === null) return;
+          const dx = e.clientX - dragStartX;
+          const pxPerSec = getPxPerSec();
+          const dt = -dx / pxPerSec;
+          const t = Math.max(settings.startTime, Math.min(settings.endTime, dragStartTime + dt));
+          try { wasm.set_time(t); } catch (err) { console.error(err); }
+          drawTrack();
+        });
+
+        wrapper.addEventListener("pointerup", () => { dragStartX = null; });
+        wrapper.addEventListener("pointercancel", () => { dragStartX = null; });
+
+        // Wheel scroll
+        wrapper.addEventListener("wheel", (e) => {
+          e.preventDefault();
+          const pxPerSec = getPxPerSec();
+          const dt = (e.deltaY > 0 ? 1 : -1) * settings.tickInterval;
+          const t = (wasm.get_time ? wasm.get_time() : 0) + dt;
+          const clamped = Math.max(settings.startTime, Math.min(settings.endTime, t));
+          try { wasm.set_time(clamped); } catch (err) { console.error(err); }
+          drawTrack();
+        }, { passive: false });
+
+        // Resize
+        window.addEventListener("resize", () => drawTrack());
+
+        // ── Settings modal ────────────────────────────────────────
+        function openSettings() {
+          // Populate modal from current settings
+          tsMode.value = settings.mode;
+          tsSpeed.value = String(settings.speed);
+          tsStart.value = String(settings.startTime);
+          tsEnd.value = String(settings.endTime);
+          tsStep.value = String(settings.stepSize);
+          tsLoop.value = settings.loopMode;
+          tsFormat.value = settings.format;
+          tsDivisions.value = String(settings.tickInterval);
+          tsShowDial.checked = settings.showDial;
+          populateLayerTimeList();
+          modal.classList.remove("hidden");
+        }
+
+        function closeSettings() {
+          modal.classList.add("hidden");
+        }
+
+        settingsBtn.addEventListener("click", openSettings);
+        modalClose.addEventListener("click", closeSettings);
+        modal.addEventListener("click", (e) => {
+          if (e.target === modal) closeSettings();
+        });
+
+        // ── Layer time configuration ─────────────────────────────
+        function getLayerNames() {
+          // Collect known layer names from the UI checkboxes
+          const names = [];
+          const knownLayers = [
+            { id: "layer-world-base", name: "World base" },
+            { id: "layer-cities", name: "Cities" },
+            { id: "layer-corridors", name: "Air corridors" },
+            { id: "layer-regions", name: "Regions" },
+            { id: "layer-uploaded-points", name: "Uploaded points" },
+            { id: "layer-uploaded-corridors", name: "Uploaded lines" },
+            { id: "layer-uploaded-regions", name: "Uploaded polygons" },
+            { id: "layer-terrain", name: "3D terrain" },
+          ];
+          for (const l of knownLayers) {
+            names.push(l.name);
+          }
+          // Also include feed layers
+          const feedControls = document.getElementById("feed-layer-controls");
+          if (feedControls) {
+            const feedLabels = feedControls.querySelectorAll("label span");
+            for (const el of feedLabels) {
+              const n = el.textContent?.trim();
+              if (n) names.push("Feed: " + n);
+            }
+          }
+          return names;
+        }
+
+        function populateLayerTimeList() {
+          const layers = getLayerNames();
+          if (layers.length === 0) {
+            tsLayerList.innerHTML = '<div class="muted" style="font-size:12px;">No layers loaded yet.</div>';
+            return;
+          }
+          tsLayerList.innerHTML = "";
+          for (const name of layers) {
+            const cfg = settings.layerTimeConfig[name] || { enabled: false, field: "timestamp" };
+            const row = document.createElement("div");
+            row.className = "layer-time-row";
+
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.checked = cfg.enabled;
+            cb.dataset.layer = name;
+            cb.className = "lt-checkbox";
+
+            const lbl = document.createElement("span");
+            lbl.className = "lt-name";
+            lbl.textContent = name;
+
+            const field = document.createElement("input");
+            field.type = "text";
+            field.placeholder = "timestamp";
+            field.value = cfg.field || "timestamp";
+            field.dataset.layer = name;
+            field.className = "lt-field";
+            field.style.maxWidth = "130px";
+            field.style.padding = "4px 6px";
+            field.style.borderRadius = "4px";
+            field.style.border = "1px solid var(--btn-border)";
+            field.style.background = "var(--btn-bg)";
+            field.style.color = "var(--btn-fg)";
+            field.style.fontSize = "12px";
+
+            row.appendChild(cb);
+            row.appendChild(lbl);
+            row.appendChild(field);
+            tsLayerList.appendChild(row);
+          }
+        }
+
+        // ── Save / load settings ─────────────────────────────────
+        function applySettings(s) {
+          settings = { ...tdDefaults(), ...s };
+          // Sync to engine
+          try { wasm.set_time_end?.(settings.endTime); } catch (_) {}
+          try { wasm.set_dt?.(settings.stepSize); } catch (_) {}
+          speedLabel.textContent = settings.speed + "×";
+          syncDialVisibility();
+          playDirection = 1;
+          drawTrack();
+        }
+
+        async function saveAndApply() {
+          // Read from modal inputs
+          settings.mode = tsMode.value;
+          settings.speed = parseFloat(tsSpeed.value) || 1;
+          settings.startTime = parseFloat(tsStart.value) || 0;
+          settings.endTime = parseFloat(tsEnd.value) || 10;
+          settings.stepSize = parseFloat(tsStep.value) || 1/60;
+          settings.loopMode = tsLoop.value;
+          settings.format = tsFormat.value;
+          settings.tickInterval = parseFloat(tsDivisions.value) || 1;
+          settings.showDial = tsShowDial.checked;
+
+          // Read layer time config
+          const checkboxes = tsLayerList.querySelectorAll(".lt-checkbox");
+          const fields = tsLayerList.querySelectorAll(".lt-field");
+          settings.layerTimeConfig = {};
+          checkboxes.forEach((cb) => {
+            const name = cb.dataset.layer;
+            const fieldEl = tsLayerList.querySelector(`.lt-field[data-layer="${CSS.escape(name)}"]`);
+            settings.layerTimeConfig[name] = {
+              enabled: cb.checked,
+              field: fieldEl ? fieldEl.value.trim() || "timestamp" : "timestamp",
+            };
+          });
+
+          applySettings(settings);
+          await tdSaveSettings(settings);
+          closeSettings();
+        }
+
+        tsSaveBtn.addEventListener("click", saveAndApply);
+
+        tsResetBtn.addEventListener("click", async () => {
+          const def = tdDefaults();
+          applySettings(def);
+          await tdSaveSettings(def);
+          openSettings();
+        });
+
+        // Keyboard shortcut: T to toggle dial visibility
+        window.addEventListener("keydown", (e) => {
+          if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT" || e.target.tagName === "TEXTAREA") return;
+          if (e.key === "t" || e.key === "T") {
+            settings.showDial = !settings.showDial;
+            syncDialVisibility();
+            tdSaveSettings(settings).catch(() => {});
+          }
+          if (e.key === " " && e.target === document.body) {
+            e.preventDefault();
+            setPlaying(!playing);
+          }
+        });
+
+        // Left-panel Settings tab toggle
+        if (panelDialToggle) {
+          panelDialToggle.addEventListener("change", () => {
+            settings.showDial = panelDialToggle.checked;
+            syncDialVisibility();
+            tdSaveSettings(settings).catch(() => {});
+          });
+        }
+
+        // ── Init: load persisted settings ─────────────────────────
+        tdLoadSettings().then((saved) => {
+          if (saved) {
+            applySettings(saved);
+          } else {
+            // Sync defaults from engine
+            settings.endTime = wasm.get_time_end ? wasm.get_time_end() : 10;
+            settings.stepSize = wasm.get_dt ? wasm.get_dt() : 1/60;
+            applySettings(settings);
+          }
+        }).catch(() => {
+          applySettings(settings);
+        });
       }
 
       function bootstrap() {

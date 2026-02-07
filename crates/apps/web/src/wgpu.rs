@@ -2578,7 +2578,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             light_dir,
             _pad0: 0.0,
             viewport: [ctx.config.width as f32, ctx.config.height as f32],
-            globe_alpha: ctx.globe_alpha,
+            // IMPORTANT: even when the globe pipeline uses BlendState::REPLACE (solid mode),
+            // the fragment alpha still lands in the surface and the browser composites the
+            // canvas using that alpha. Force alpha=1.0 whenever transparency is disabled.
+            globe_alpha: if ctx.globe_transparent {
+                ctx.globe_alpha
+            } else {
+                1.0
+            },
             _pad1: 0.0,
             globe_color: ctx.globe_color,
             stars_alpha: ctx.stars_alpha,
