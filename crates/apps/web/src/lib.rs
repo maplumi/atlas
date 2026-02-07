@@ -3423,7 +3423,11 @@ fn rebuild_styles_table(s: &mut ViewerState) -> Vec<Style> {
     let mut styles = vec![default_style(); (max_id as usize).saturating_add(1)];
 
     // Polygons
-    styles[STYLE_BASE_REGIONS as usize] = style_from_layer(s.base_regions_style, 100.0, 0.0, 0.0);
+    let mut base_regions_style = s.base_regions_style;
+    if !s.globe_transparent {
+        base_regions_style.color[3] = 1.0;
+    }
+    styles[STYLE_BASE_REGIONS as usize] = style_from_layer(base_regions_style, 100.0, 0.0, 0.0);
     styles[STYLE_REGIONS as usize] = style_from_layer(s.regions_style, 25.0, 0.0, 0.0);
     styles[STYLE_UPLOADED_REGIONS as usize] =
         style_from_layer(s.uploaded_regions_style, 25.0, 0.0, 0.0);
@@ -4228,7 +4232,7 @@ pub fn is_globe_inertia_active() -> bool {
 ///
 /// Intended usage: call with pointer delta in pixels.
 /// **Contract (3D):** Drag left => surface facing user moves left (yaw increases).
-///   Drag up => surface facing user tilts up (pitch decreases).
+///   Drag up => surface facing user tilts up (pitch increases).
 ///   Sensitivity scaled so full shorter-axis drag ≈ 180°.
 /// **Contract (2D):** Treated as pan — map follows cursor direction.
 #[wasm_bindgen]
@@ -4241,7 +4245,7 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
             ViewMode::ThreeD => {
                 let min_dim = s.canvas_width.min(s.canvas_height).max(1.0);
                 let speed = std::f64::consts::PI / min_dim * cfg.orbit_sensitivity;
-                let dy_sign = if cfg.invert_orbit_y { -1.0 } else { 1.0 };
+                let dy_sign = if cfg.invert_orbit_y { 1.0 } else { -1.0 };
 
                 // Drag right (+dx) → yaw increases → camera orbits eastward
                 // → surface facing user moves RIGHT (follows cursor).
@@ -7795,7 +7799,7 @@ mod camera_contract_tests {
     }
 
     #[test]
-    fn orbit_drag_up_decreases_pitch() {
+    fn orbit_drag_up_increases_pitch() {
         let mut cam = CameraState::default();
         let cfg = ControlConfig::default();
         let w = 1280.0_f64;
@@ -7803,18 +7807,18 @@ mod camera_contract_tests {
         let min_dim = w.min(h).max(1.0);
         let speed = std::f64::consts::PI / min_dim * cfg.orbit_sensitivity;
         // "From outside": default dy_sign = 1.0 (not inverted).
-        let dy_sign = if cfg.invert_orbit_y { -1.0 } else { 1.0 };
+        let dy_sign = if cfg.invert_orbit_y { 1.0 } else { -1.0 };
 
         let initial_pitch = cam.pitch_rad;
         // Simulate drag delta: dy = -50 pixels (drag up on screen).
         let delta_y = -50.0;
         cam.pitch_rad += dy_sign * delta_y * speed;
 
-        // Drag up (negative dy) with default config => pitch decreases
-        // (camera tilts down, surface appears to move up).
+        // Drag up (negative dy) with default config => pitch increases
+        // (camera tilts up, surface appears to move up).
         assert!(
-            cam.pitch_rad < initial_pitch,
-            "drag up with default config must decrease pitch (from outside)"
+            cam.pitch_rad > initial_pitch,
+            "drag up with default config must increase pitch (from outside)"
         );
     }
 
@@ -7828,17 +7832,17 @@ mod camera_contract_tests {
         let h = 720.0_f64;
         let min_dim = w.min(h).max(1.0);
         let speed = std::f64::consts::PI / min_dim * cfg.orbit_sensitivity;
-        let dy_sign = if cfg.invert_orbit_y { -1.0 } else { 1.0 };
+        let dy_sign = if cfg.invert_orbit_y { 1.0 } else { -1.0 };
 
         let mut cam = CameraState::default();
         let initial_pitch = cam.pitch_rad;
         let delta_y = -50.0; // drag up
         cam.pitch_rad += dy_sign * delta_y * speed;
 
-        // With invert_orbit_y=true, drag up => pitch increases.
+        // With invert_orbit_y=true, drag up => pitch decreases.
         assert!(
-            cam.pitch_rad > initial_pitch,
-            "drag up with inverted Y must increase pitch"
+            cam.pitch_rad < initial_pitch,
+            "drag up with inverted Y must decrease pitch"
         );
     }
 
