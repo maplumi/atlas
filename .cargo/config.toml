@@ -2,3 +2,10 @@
 # triggered by hot reload / re-entrant JS glue in debug mode.
 [target.wasm32-unknown-unknown]
 rustflags = ["-C", "debug-assertions=no"]
+
+# Use rsproxy mirror for crates.io (faster/more reliable in CI/docker builds).
+[source.crates-io]
+replace-with = "rsproxy"
+
+[source.rsproxy]
+registry = "sparse+https://rsproxy.cn/index/"

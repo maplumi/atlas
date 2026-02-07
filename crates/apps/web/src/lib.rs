@@ -6776,7 +6776,7 @@ pub fn load_geojson_feed_layer(
     // Keep a configurable cap: feeds are user-controlled and can be huge.
     // Default to 200MB to match upload settings.
     const MAX_GEOJSON_TEXT_BYTES: usize = 200 * 1024 * 1024;
-    const MAX_FEED_POINTS: usize = 10_000_000;
+    const MAX_FEED_POINTS: usize = 50_000_000;
 
     if geojson_text.len() > MAX_GEOJSON_TEXT_BYTES {
         return Err(JsValue::from_str(

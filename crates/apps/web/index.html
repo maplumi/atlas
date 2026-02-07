@@ -1114,8 +1114,8 @@
             </div>
             <label for="max-coord-pairs" style="margin-top:8px;">Max coordinates (thousands)</label>
             <div class="row">
-              <input id="max-coord-pairs" type="range" min="100" max="10000" step="100" value="10000" />
-              <span id="max-coord-pairs-value" class="value">10000k</span>
+                <input id="max-coord-pairs" type="range" min="100" max="50000" step="100" value="50000" />
+              <span id="max-coord-pairs-value" class="value">50000k</span>
             </div>
             <div class="muted" style="font-size:12px; line-height:1.35; margin-top:4px;">
               Limits for GeoJSON/CSV uploads. Larger values may slow down the browser.
@@ -1535,9 +1535,9 @@
         }
       } catch (_) {}
 
-      // Max coordinate pairs for GeoJSON uploads (default 10M, max 10M).
-      const MAX_COORD_PAIRS_LIMIT = 10_000_000;
-      const DEFAULT_MAX_COORD_PAIRS = 10_000_000;
+      // Max coordinate pairs for GeoJSON uploads (default 50M, max 50M).
+      const MAX_COORD_PAIRS_LIMIT = 50_000_000;
+      const DEFAULT_MAX_COORD_PAIRS = 50_000_000;
       let maxCoordPairs = DEFAULT_MAX_COORD_PAIRS;
       try {
         const saved = parseInt(localStorage.getItem("atlas.maxCoordPairs") || "", 10);
@@ -4546,7 +4546,7 @@
           if (maxCoordPairsValue) maxCoordPairsValue.textContent = `${initialK}k`;
 
           maxCoordPairsSlider.addEventListener("input", (e) => {
-            const k = Math.max(100, Math.min(10000, Math.round(Number(e.target.value))));
+            const k = Math.max(100, Math.min(50000, Math.round(Number(e.target.value))));
             maxCoordPairs = k * 1000;
             if (maxCoordPairsValue) maxCoordPairsValue.textContent = `${k}k`;
             try { localStorage.setItem("atlas.maxCoordPairs", String(maxCoordPairs)); } catch (_) {}
