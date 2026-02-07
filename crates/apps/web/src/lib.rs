@@ -4242,13 +4242,21 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
         let cfg = s.controls;
         match s.view_mode {
             ViewMode::ThreeD => {
+                // Feed globe controller for inertia velocity tracking.
+                // Reconstruct absolute position from stored last + delta.
+                let new_x = s.drag_last_x_px + delta_x_px;
+                let new_y = s.drag_last_y_px + delta_y_px;
+                s.globe_controller.on_pointer_move([new_x, new_y]);
+                s.drag_last_x_px = new_x;
+                s.drag_last_y_px = new_y;
+
                 let min_dim = s.canvas_width.min(s.canvas_height).max(1.0);
                 let speed = std::f64::consts::PI / min_dim * cfg.orbit_sensitivity;
                 let dy_sign = if cfg.invert_orbit_y { -1.0 } else { 1.0 };
 
-                // Negate yaw delta: drag left → yaw increases → camera orbits right
-                // → surface moves LEFT ("rotate from outside").
-                s.camera.yaw_rad -= delta_x_px * speed;
+                // Drag right (+dx) → yaw increases → camera orbits eastward
+                // → surface facing user moves RIGHT (follows cursor).
+                s.camera.yaw_rad += delta_x_px * speed;
                 s.camera.pitch_rad = clamp(
                     s.camera.pitch_rad + dy_sign * delta_y_px * speed,
                     -cfg.pitch_clamp_rad,
@@ -4257,6 +4265,12 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
                 s.camera.yaw_rad = (s.camera.yaw_rad + std::f64::consts::PI)
                     .rem_euclid(2.0 * std::f64::consts::PI)
                     - std::f64::consts::PI;
+
+                // Sync globe controller orientation so inertia continues
+                // from the correct state when the drag ends.
+                let sync_yaw = s.camera.yaw_rad;
+                let sync_pitch = s.camera.pitch_rad;
+                s.globe_controller.set_from_yaw_pitch(sync_yaw, sync_pitch);
             }
             ViewMode::TwoD => {
                 s.camera_2d = pan_camera_2d(
@@ -4293,8 +4307,12 @@ pub fn camera_drag_begin_with_button(x_px: f64, y_px: f64, button: i32) -> Resul
         s.drag_last_y_px = y_px;
         match s.view_mode {
             ViewMode::ThreeD => {
-                // Do NOT reset camera.target here — that would undo any
-                // right-click pan translation the user has applied.
+                // Left-click (orbit) resets target to origin so rotation
+                // is always around the globe center, not a panned offset.
+                // Right-click (pan) keeps the current target.
+                if button == 0 {
+                    s.camera.target = [0.0, 0.0, 0.0];
+                }
                 let canvas_w = s.canvas_width;
                 let canvas_h = s.canvas_height;
                 s.globe_controller.set_canvas_size(canvas_w, canvas_h);
@@ -4323,6 +4341,9 @@ pub fn camera_drag_move(x_px: f64, y_px: f64) -> Result<(), JsValue> {
         let cfg = s.controls;
         match s.view_mode {
             ViewMode::ThreeD => {
+                // Feed globe controller for inertia velocity tracking.
+                s.globe_controller.on_pointer_move([x_px, y_px]);
+
                 let next_u = arcball_unit_from_screen(s.canvas_width, s.canvas_height, x_px, y_px);
                 if let Some(prev_u) = s.arcball_last_unit {
                     let q = quat_from_unit_vectors(prev_u, next_u);
@@ -4448,39 +4469,14 @@ pub fn camera_zoom(wheel_delta_y: f64) -> Result<(), JsValue> {
         let cfg = s.controls;
         match s.view_mode {
             ViewMode::ThreeD => {
-                let cam = s.camera;
-                let zoom = (wheel_delta_y * 0.0015 * cfg.zoom_speed_3d).exp();
+                // Delegate to globe controller for smooth zoom with
+                // velocity-based interpolation.  Scale the raw wheel
+                // delta by the user's zoom-speed preference.
+                s.globe_controller
+                    .on_wheel(wheel_delta_y * cfg.zoom_speed_3d);
 
-                let mut dist = clamp(cam.distance * zoom, cfg.min_distance, cfg.max_distance);
-
-                let dir_cam = [
-                    cam.pitch_rad.cos() * cam.yaw_rad.cos(),
-                    cam.pitch_rad.sin(),
-                    -cam.pitch_rad.cos() * cam.yaw_rad.sin(),
-                ];
-                let dir_cam = vec3_normalize(dir_cam);
-                let eye = vec3_add(cam.target, vec3_mul(dir_cam, dist));
-
-                let min_eye_r = 1.001 * WGS84_A;
-                let eye_r = vec3_dot(eye, eye).sqrt();
-                if eye_r < min_eye_r {
-                    let b = 2.0 * vec3_dot(cam.target, dir_cam);
-                    let c = vec3_dot(cam.target, cam.target) - min_eye_r * min_eye_r;
-                    let disc = b * b - 4.0 * c;
-                    if disc >= 0.0 {
-                        let sdisc = disc.sqrt();
-                        let t0 = (-b - sdisc) / 2.0;
-                        let t1 = (-b + sdisc) / 2.0;
-                        let t = t0.max(t1);
-                        if t.is_finite() && t > 0.0 {
-                            dist = clamp(t, cfg.min_distance, cfg.max_distance);
-                        }
-                    }
-                }
-
-                s.camera.distance = dist;
-                // Sync globe controller distance
-                s.globe_controller.set_distance(dist);
+                // Sync legacy camera distance for immediate render.
+                s.camera.distance = s.globe_controller.distance();
             }
             ViewMode::TwoD => {
                 let zoom = (-wheel_delta_y * 0.0015 * cfg.zoom_speed_2d).exp();
@@ -7804,7 +7800,7 @@ mod camera_contract_tests {
     // "Drag up => surface facing user tilts up (pitch decreases in default config)."
 
     #[test]
-    fn orbit_drag_left_increases_yaw() {
+    fn orbit_drag_right_increases_yaw() {
         let mut cam = CameraState::default();
         let cfg = ControlConfig::default();
         let w = 1280.0_f64;
@@ -7813,15 +7809,13 @@ mod camera_contract_tests {
         let speed = std::f64::consts::PI / min_dim * cfg.orbit_sensitivity;
 
         let initial_yaw = cam.yaw_rad;
-        // Simulate drag delta: dx = -100 pixels (drag left on screen).
-        let delta_x = -100.0;
-        // "From outside" contract: yaw -= delta_x * speed.
-        // Drag left (negative dx) => yaw increases.
-        cam.yaw_rad -= delta_x * speed;
+        // Drag right (+100 px): surface follows cursor rightward.
+        let delta_x = 100.0;
+        cam.yaw_rad += delta_x * speed;
 
         assert!(
             cam.yaw_rad > initial_yaw,
-            "drag left must increase yaw (from outside)"
+            "drag right must increase yaw (surface follows cursor)"
         );
     }
 
@@ -7998,9 +7992,11 @@ mod camera_contract_tests {
         let initial_dist = cam.distance;
         // Wheel deltaY > 0 = scroll down = zoom out (increase distance).
         // Wheel deltaY < 0 = scroll up = zoom in (decrease distance).
+        // globe_controller.on_wheel uses (delta * 0.002).exp() internally;
+        // we scale the delta by cfg.zoom_speed_3d before passing it in.
         let wheel_delta_y = -100.0; // scroll up
-        let zoom = (wheel_delta_y * 0.0015 * cfg.zoom_speed_3d).exp();
-        let new_dist = clamp(initial_dist * zoom, cfg.min_distance, cfg.max_distance);
+        let zoom = (wheel_delta_y * cfg.zoom_speed_3d * 0.002).exp();
+        let new_dist = initial_dist * zoom;
         assert!(
             new_dist < initial_dist,
             "scroll up (negative deltaY) must decrease distance (zoom in)"
@@ -8013,8 +8009,8 @@ mod camera_contract_tests {
         let cam = CameraState::default();
         let initial_dist = cam.distance;
         let wheel_delta_y = 100.0; // scroll down
-        let zoom = (wheel_delta_y * 0.0015 * cfg.zoom_speed_3d).exp();
-        let new_dist = clamp(initial_dist * zoom, cfg.min_distance, cfg.max_distance);
+        let zoom = (wheel_delta_y * cfg.zoom_speed_3d * 0.002).exp();
+        let new_dist = initial_dist * zoom;
         assert!(
             new_dist > initial_dist,
             "scroll down (positive deltaY) must increase distance (zoom out)"

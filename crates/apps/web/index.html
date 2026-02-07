@@ -1109,7 +1109,7 @@
             <h3>File Upload</h3>
             <label for="upload-size-limit">Max upload size (MB)</label>
             <div class="row">
-              <input id="upload-size-limit" type="range" min="1" max="200" step="1" value="8" />
+              <input id="upload-size-limit" type="range" min="1" max="1024" step="1" value="1024" />
               <span id="upload-size-limit-value" class="value">8</span>
             </div>
             <label for="max-coord-pairs" style="margin-top:8px;">Max coordinates (thousands)</label>
@@ -1524,9 +1524,9 @@
         viewMode = (saved === "2d" || saved === "3d") ? saved : "3d";
       } catch (_) {}
 
-      // File upload size limit in bytes (default 8MB, max 200MB).
-      const MAX_UPLOAD_SIZE_MB_LIMIT = 200;
-      const DEFAULT_UPLOAD_SIZE_MB = 8;
+      // File upload size limit in bytes (default 1GB, max 1GB).
+      const MAX_UPLOAD_SIZE_MB_LIMIT = 1024;
+      const DEFAULT_UPLOAD_SIZE_MB = 1024;
       let uploadSizeLimitMB = DEFAULT_UPLOAD_SIZE_MB;
       try {
         const saved = parseInt(localStorage.getItem("atlas.uploadSizeMB") || "", 10);
