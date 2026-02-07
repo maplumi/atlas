@@ -1114,7 +1114,7 @@
             </div>
             <label for="max-coord-pairs" style="margin-top:8px;">Max coordinates (thousands)</label>
             <div class="row">
-              <input id="max-coord-pairs" type="range" min="100" max="5000" step="100" value="1000" />
+              <input id="max-coord-pairs" type="range" min="100" max="5000" step="100" value="2000" />
               <span id="max-coord-pairs-value" class="value">1000k</span>
             </div>
             <div class="muted" style="font-size:12px; line-height:1.35; margin-top:4px;">
@@ -1537,7 +1537,7 @@
 
       // Max coordinate pairs for GeoJSON uploads (default 1M, max 5M).
       const MAX_COORD_PAIRS_LIMIT = 5_000_000;
-      const DEFAULT_MAX_COORD_PAIRS = 1_000_000;
+      const DEFAULT_MAX_COORD_PAIRS = 2_000_000;
       let maxCoordPairs = DEFAULT_MAX_COORD_PAIRS;
       try {
         const saved = parseInt(localStorage.getItem("atlas.maxCoordPairs") || "", 10);

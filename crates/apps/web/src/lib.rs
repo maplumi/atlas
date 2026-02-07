@@ -4242,14 +4242,6 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
         let cfg = s.controls;
         match s.view_mode {
             ViewMode::ThreeD => {
-                // Feed globe controller for inertia velocity tracking.
-                // Reconstruct absolute position from stored last + delta.
-                let new_x = s.drag_last_x_px + delta_x_px;
-                let new_y = s.drag_last_y_px + delta_y_px;
-                s.globe_controller.on_pointer_move([new_x, new_y]);
-                s.drag_last_x_px = new_x;
-                s.drag_last_y_px = new_y;
-
                 let min_dim = s.canvas_width.min(s.canvas_height).max(1.0);
                 let speed = std::f64::consts::PI / min_dim * cfg.orbit_sensitivity;
                 let dy_sign = if cfg.invert_orbit_y { -1.0 } else { 1.0 };
@@ -4266,8 +4258,10 @@ pub fn camera_orbit(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
                     .rem_euclid(2.0 * std::f64::consts::PI)
                     - std::f64::consts::PI;
 
-                // Sync globe controller orientation so inertia continues
-                // from the correct state when the drag ends.
+                // Sync globe controller so the update loop and inertia
+                // start from the correct orientation when the drag ends.
+                // Do NOT call on_pointer_move here — it runs a competing
+                // arcball rotation that conflicts with our delta-based math.
                 let sync_yaw = s.camera.yaw_rad;
                 let sync_pitch = s.camera.pitch_rad;
                 s.globe_controller.set_from_yaw_pitch(sync_yaw, sync_pitch);
@@ -4338,37 +4332,19 @@ pub fn camera_drag_move(x_px: f64, y_px: f64) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.auto_rotate_last_user_time_s = wall_clock_seconds();
-        let cfg = s.controls;
         match s.view_mode {
             ViewMode::ThreeD => {
-                // Feed globe controller for inertia velocity tracking.
+                // Let globe controller drive drag via its own arcball
+                // for smooth rotation with inertia velocity tracking.
                 s.globe_controller.on_pointer_move([x_px, y_px]);
 
+                // Keep legacy camera state in sync for rendering.
+                s.camera.yaw_rad = s.globe_controller.yaw_rad();
+                s.camera.pitch_rad = s.globe_controller.pitch_rad();
+                s.camera.distance = s.globe_controller.distance();
+
+                // Update arcball_last_unit for legacy code paths.
                 let next_u = arcball_unit_from_screen(s.canvas_width, s.canvas_height, x_px, y_px);
-                if let Some(prev_u) = s.arcball_last_unit {
-                    let q = quat_from_unit_vectors(prev_u, next_u);
-                    let q_inv = quat_conjugate(q);
-
-                    let dir_cam = [
-                        s.camera.pitch_rad.cos() * s.camera.yaw_rad.cos(),
-                        s.camera.pitch_rad.sin(),
-                        -s.camera.pitch_rad.cos() * s.camera.yaw_rad.sin(),
-                    ];
-                    let dir_cam = vec3_normalize(dir_cam);
-                    let dir2 = quat_rotate_vec3(q_inv, dir_cam);
-                    let pitch = clamp(dir2[1], -1.0, 1.0).asin();
-                    let yaw = (-dir2[2]).atan2(dir2[0]);
-
-                    s.camera.pitch_rad = clamp(pitch, -cfg.pitch_clamp_rad, cfg.pitch_clamp_rad);
-                    s.camera.yaw_rad = (yaw + std::f64::consts::PI)
-                        .rem_euclid(2.0 * std::f64::consts::PI)
-                        - std::f64::consts::PI;
-
-                    // Sync globe controller with updated camera state
-                    let sync_yaw = s.camera.yaw_rad;
-                    let sync_pitch = s.camera.pitch_rad;
-                    s.globe_controller.set_from_yaw_pitch(sync_yaw, sync_pitch);
-                }
                 s.arcball_last_unit = Some(next_u);
             }
             ViewMode::TwoD => {
@@ -6800,7 +6776,7 @@ pub fn load_geojson_feed_layer(
     // Keep a configurable cap: feeds are user-controlled and can be huge.
     // Default to 200MB to match upload settings.
     const MAX_GEOJSON_TEXT_BYTES: usize = 200 * 1024 * 1024;
-    const MAX_FEED_POINTS: usize = 1_000_000;
+    const MAX_FEED_POINTS: usize = 2_000_000;
 
     if geojson_text.len() > MAX_GEOJSON_TEXT_BYTES {
         return Err(JsValue::from_str(
