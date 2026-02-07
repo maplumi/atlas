@@ -1153,6 +1153,13 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
+        let alpha_mode = surface_caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|m| *m == ::wgpu::CompositeAlphaMode::Opaque)
+            .unwrap_or(surface_caps.alpha_modes[0]);
+
         let config = ::wgpu::SurfaceConfiguration {
             usage: ::wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -1160,7 +1167,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             height,
             desired_maximum_frame_latency: 2,
             present_mode: ::wgpu::PresentMode::Fifo,
-            alpha_mode: surface_caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
         };
         surface.configure(&device, &config);
