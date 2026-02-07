@@ -2099,6 +2099,7 @@ fn camera_view_proj(camera: CameraState, canvas_width: f64, canvas_height: f64) 
 }
 
 /// Returns the view-projection matrix from the globe controller (quaternion-based).
+#[allow(dead_code)]
 fn globe_controller_view_proj(
     gc: &GlobeController,
     canvas_width: f64,
@@ -2189,11 +2190,8 @@ fn render_scene() -> Result<(), JsValue> {
                 let state = state_ref.borrow();
                 if let Some(ctx) = &state.wgpu {
                     perf_reset(ctx);
-                    let view_proj = globe_controller_view_proj(
-                        &state.globe_controller,
-                        state.canvas_width,
-                        state.canvas_height,
-                    );
+                    let view_proj =
+                        camera_view_proj(state.camera, state.canvas_width, state.canvas_height);
 
                     let light_dir = if state.sun_follow_real_time {
                         current_sun_direction_world().unwrap_or([0.4, 0.7, 0.2])
@@ -2293,8 +2291,7 @@ fn render_labels_overlay_3d() {
             return;
         }
 
-        let view_proj =
-            globe_controller_view_proj(&s.globe_controller, s.canvas_width, s.canvas_height);
+        let view_proj = camera_view_proj(s.camera, s.canvas_width, s.canvas_height);
         let wf = w as f32;
         let hf = h as f32;
 
@@ -6405,8 +6402,7 @@ pub fn cursor_click(x_px: f64, y_px: f64) -> Result<JsValue, JsValue> {
     // Prefer: point (near) -> line (near) -> polygon (inside).
     let picked = with_state(|state| {
         let s = state.borrow();
-        let view_proj =
-            globe_controller_view_proj(&s.globe_controller, s.canvas_width, s.canvas_height);
+        let view_proj = camera_view_proj(s.camera, s.canvas_width, s.canvas_height);
         let w = s.canvas_width.max(1.0) as f32;
         let h = s.canvas_height.max(1.0) as f32;
         let px = x_px as f32;
@@ -6776,7 +6772,7 @@ pub fn load_geojson_feed_layer(
     // Keep a configurable cap: feeds are user-controlled and can be huge.
     // Default to 200MB to match upload settings.
     const MAX_GEOJSON_TEXT_BYTES: usize = 200 * 1024 * 1024;
-    const MAX_FEED_POINTS: usize = 2_000_000;
+    const MAX_FEED_POINTS: usize = 10_000_000;
 
     if geojson_text.len() > MAX_GEOJSON_TEXT_BYTES {
         return Err(JsValue::from_str(
@@ -7352,20 +7348,23 @@ pub fn advance_frame() -> Result<f64, JsValue> {
             };
             s.last_frame_time_s = now;
 
-            // Apply auto-rotate before globe controller update if idle
-            if s.auto_rotate_enabled {
-                let idle = now - s.auto_rotate_last_user_time_s;
-                if idle >= s.auto_rotate_resume_delay_s {
-                    let speed_rad = s.auto_rotate_speed_deg_per_s.to_radians();
-                    s.globe_controller.apply_yaw_delta(speed_rad * dt);
-                }
+            // Apply auto-rotate before globe controller update if idle.
+            let idle = now - s.auto_rotate_last_user_time_s;
+            let auto_rotating = s.auto_rotate_enabled && idle >= s.auto_rotate_resume_delay_s;
+            if auto_rotating {
+                let speed_rad = s.auto_rotate_speed_deg_per_s.to_radians();
+                s.globe_controller.apply_yaw_delta(speed_rad * dt);
             }
 
             s.globe_controller.update(dt);
 
-            // Keep legacy camera state in sync
-            s.camera.yaw_rad = s.globe_controller.yaw_rad();
-            s.camera.pitch_rad = s.globe_controller.pitch_rad();
+            // Keep legacy camera state in sync.
+            // Only overwrite yaw/pitch when globe controller is driving motion
+            // (auto-rotate or inertia). Distance is always synced for smooth zoom.
+            if auto_rotating || s.globe_controller.is_inertia_active() {
+                s.camera.yaw_rad = s.globe_controller.yaw_rad();
+                s.camera.pitch_rad = s.globe_controller.pitch_rad();
+            }
             s.camera.distance = s.globe_controller.distance();
         }
     });

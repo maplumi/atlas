@@ -1114,8 +1114,8 @@
             </div>
             <label for="max-coord-pairs" style="margin-top:8px;">Max coordinates (thousands)</label>
             <div class="row">
-              <input id="max-coord-pairs" type="range" min="100" max="5000" step="100" value="2000" />
-              <span id="max-coord-pairs-value" class="value">1000k</span>
+              <input id="max-coord-pairs" type="range" min="100" max="10000" step="100" value="10000" />
+              <span id="max-coord-pairs-value" class="value">10000k</span>
             </div>
             <div class="muted" style="font-size:12px; line-height:1.35; margin-top:4px;">
               Limits for GeoJSON/CSV uploads. Larger values may slow down the browser.
@@ -1535,9 +1535,9 @@
         }
       } catch (_) {}
 
-      // Max coordinate pairs for GeoJSON uploads (default 1M, max 5M).
-      const MAX_COORD_PAIRS_LIMIT = 5_000_000;
-      const DEFAULT_MAX_COORD_PAIRS = 2_000_000;
+      // Max coordinate pairs for GeoJSON uploads (default 10M, max 10M).
+      const MAX_COORD_PAIRS_LIMIT = 10_000_000;
+      const DEFAULT_MAX_COORD_PAIRS = 10_000_000;
       let maxCoordPairs = DEFAULT_MAX_COORD_PAIRS;
       try {
         const saved = parseInt(localStorage.getItem("atlas.maxCoordPairs") || "", 10);
@@ -2606,13 +2606,23 @@
 
         if (toggleGlobeTransparent) {
           // Prefer persisted UI state; fall back to wasm default.
-          let initial = null;
+          // Force default to opaque to avoid accidental transparency.
+          let initial = false;
+          let hasSaved = false;
           try {
             const saved = localStorage.getItem("atlas-globe-transparent");
-            if (saved === "true" || saved === "false") initial = (saved === "true");
+            if (saved === "true" || saved === "false") {
+              hasSaved = true;
+              initial = (saved === "true");
+            }
           } catch (_) {}
 
-          if (initial === null) {
+          if (hasSaved && initial) {
+            initial = false;
+            try { localStorage.setItem("atlas-globe-transparent", "false"); } catch (_) {}
+          }
+
+          if (!hasSaved) {
             try {
               const s = wasm.get_globe_settings?.();
               initial = !!s?.transparent;
@@ -4158,7 +4168,14 @@
                 const dy = py - lastCanvasY;
                 lastCanvasX = px;
                 lastCanvasY = py;
-                if (dragMode === "pan") {
+                const buttons = typeof e.buttons === "number" ? e.buttons : 0;
+                let mode = dragMode;
+                if (buttons & 2) {
+                  mode = "pan";
+                } else if (buttons & 1) {
+                  mode = "orbit";
+                }
+                if (mode === "pan") {
                   wasm.camera_pan(dx, dy);
                 } else {
                   // Delta orbit: surface follows cursor direction ("from outside").
@@ -4529,7 +4546,7 @@
           if (maxCoordPairsValue) maxCoordPairsValue.textContent = `${initialK}k`;
 
           maxCoordPairsSlider.addEventListener("input", (e) => {
-            const k = Math.max(100, Math.min(5000, Math.round(Number(e.target.value))));
+            const k = Math.max(100, Math.min(10000, Math.round(Number(e.target.value))));
             maxCoordPairs = k * 1000;
             if (maxCoordPairsValue) maxCoordPairsValue.textContent = `${k}k`;
             try { localStorage.setItem("atlas.maxCoordPairs", String(maxCoordPairs)); } catch (_) {}
