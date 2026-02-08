@@ -75,6 +75,13 @@ pub struct GlobeController {
     canvas_width: f64,
     canvas_height: f64,
 
+    /// Arcball center in pixels for the current drag.
+    ///
+    /// By default this is the canvas center, but for a more stable “grab-and-rotate”
+    /// feel (especially when the globe has been panned off-center), we set this to
+    /// the pointer-down position for left-drag orbit.
+    arcball_center_px: [f64; 2],
+
     /// Drag state.
     dragging: bool,
     pub drag_button: DragButton,
@@ -117,6 +124,7 @@ impl Default for GlobeController {
             inertia_active: false,
             canvas_width: 1280.0,
             canvas_height: 720.0,
+            arcball_center_px: [1280.0 * 0.5, 720.0 * 0.5],
             dragging: false,
             drag_button: DragButton::None,
             last_pos_px: [0.0, 0.0],
@@ -140,6 +148,11 @@ impl GlobeController {
     pub fn set_canvas_size(&mut self, width: f64, height: f64) {
         self.canvas_width = width.max(1.0);
         self.canvas_height = height.max(1.0);
+
+        // If no drag is active, keep the default arcball center synced.
+        if !self.dragging {
+            self.arcball_center_px = [self.canvas_width * 0.5, self.canvas_height * 0.5];
+        }
     }
 
     /// Handle pointer down event.
@@ -162,6 +175,15 @@ impl GlobeController {
         self.last_pos_px = pos_px;
         self.start_pos_px = pos_px;
         self.last_velocity_time_s = now_seconds();
+
+        // For orbit (left-drag), center the arcball on the grab point so rotation feels
+        // anchored to a fixed point even when the globe is panned off-center.
+        // For other buttons, keep the default canvas-centered arcball.
+        if self.drag_button == DragButton::Left {
+            self.arcball_center_px = pos_px;
+        } else {
+            self.arcball_center_px = [self.canvas_width * 0.5, self.canvas_height * 0.5];
+        }
 
         // Initialize arcball unit vector.
         self.arcball_last_unit = Some(self.screen_to_arcball(pos_px));
@@ -222,6 +244,9 @@ impl GlobeController {
         self.drag_button = DragButton::None;
         self.arcball_last_unit = None;
         self.velocity_history.clear();
+
+        // Restore default arcball center.
+        self.arcball_center_px = [self.canvas_width * 0.5, self.canvas_height * 0.5];
     }
 
     /// Handle mouse wheel event for zoom.
@@ -376,8 +401,8 @@ impl GlobeController {
     fn screen_to_arcball(&self, pos_px: [f64; 2]) -> [f64; 3] {
         // NDC coordinates.
         let min_dim = self.canvas_width.min(self.canvas_height).max(1.0);
-        let nx = (2.0 * pos_px[0] - self.canvas_width) / min_dim;
-        let ny = (self.canvas_height - 2.0 * pos_px[1]) / min_dim;
+        let nx = (2.0 * (pos_px[0] - self.arcball_center_px[0])) / min_dim;
+        let ny = (2.0 * (self.arcball_center_px[1] - pos_px[1])) / min_dim;
 
         // Map to arcball sphere.
         let r2 = nx * nx + ny * ny;

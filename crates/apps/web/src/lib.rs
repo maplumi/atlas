@@ -1,7 +1,7 @@
 use gloo_net::http::Request;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wasm_bindgen::JsCast;
@@ -26,7 +26,12 @@ async fn yield_now() {
 
 use catalog::{CatalogEntry, CatalogStore};
 use formats::SceneManifest;
+use foundation::handles::Handle;
 use foundation::math::{Geodetic, WGS84_A, WGS84_B, ecef_to_geodetic, geodetic_to_ecef};
+use layers::labels::{
+    LabelAnchor, LabelLayoutConfig, LabelProjector, LabelRule, LabelStyle as LayerLabelStyle,
+    LabelsConfig, LabelsLayer, PlacedLabel2D as LayerPlacedLabel2D, layout_labels_2d,
+};
 use layers::symbology::LayerStyle;
 use layers::vector::VectorLayer;
 use scene::components::VectorGeometryKind;
@@ -36,12 +41,13 @@ use globe_controller::GlobeController;
 
 mod wgpu;
 use wgpu::{
-    CityVertex, CorridorVertex, Globals2D, Overlay2DVertex, OverlayVertex, Point2DInstance,
-    Segment2DInstance, Style, TerrainVertex, WgpuContext, init_wgpu_from_canvas_id, perf_reset,
-    perf_snapshot, render_map2d, render_mesh, resize_wgpu, set_base_regions_points,
-    set_base_regions2d_vertices, set_cities_points, set_corridors_points, set_grid2d_instances,
-    set_lines2d_instances, set_points2d_instances, set_regions_points, set_regions2d_vertices,
-    set_styles, set_terrain_points,
+    CityVertex, CorridorVertex, Globals2D, LabelInstance, Overlay2DVertex, OverlayVertex,
+    Point2DInstance, Segment2DInstance, Style, TerrainVertex, WgpuContext,
+    init_wgpu_from_canvas_id, perf_reset, perf_snapshot, render_map2d, render_mesh, resize_wgpu,
+    set_base_regions_points, set_base_regions2d_vertices, set_cities_points, set_corridors_points,
+    set_grid2d_instances, set_label_atlas, set_label_instances, set_lines2d_instances,
+    set_points2d_instances, set_regions_points, set_regions2d_vertices, set_styles,
+    set_terrain_points,
 };
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
@@ -152,6 +158,9 @@ pub struct CameraState {
     pub pitch_rad: f64,
     pub distance: f64,
     pub target: [f64; 3],
+    /// Screen-space pan offset in pixels (mouse coordinate convention: +x right, +y down).
+    /// Implemented as an off-axis projection shift so orbit remains stable after panning.
+    pub pan_px: [f64; 2],
 }
 
 #[derive(Debug, Copy, Clone)]
@@ -201,40 +210,43 @@ struct Cull2DJob {
 #[derive(Debug, Clone)]
 struct DebugLabel {
     text: String,
-    mercator_m: [f32; 2],
     viewer_pos: [f32; 3],
     priority: f32,
 }
 
+#[derive(Debug, Clone)]
+struct LabelSettings {
+    style: LayerLabelStyle,
+    font_family: String,
+    max_labels: usize,
+    sdf_range_px: f32,
+    cell_padding_px: f32,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+enum LabelSource {
+    BaseWorld,
+    Cities,
+    Corridors,
+    Regions,
+    Uploaded,
+}
+
 #[derive(Debug, Copy, Clone)]
-struct Label2DSnapshot {
-    cam: Camera2DState,
-    viewport_px: [f32; 2],
-    generation: u64,
+struct LabelGlyph {
+    uv_min: [f32; 2],
+    uv_max: [f32; 2],
+    advance_px: f32,
 }
 
 #[derive(Debug, Clone)]
-struct Label2DCandidate {
-    text: String,
-    mercator_m: [f32; 2],
-    priority: f32,
-}
-
-#[derive(Debug, Clone)]
-struct PlacedLabel2D {
-    text: String,
-    x_px: f32,
-    y_px: f32,
-    priority: f32,
-}
-
-#[derive(Debug)]
-struct Label2DJob {
-    snapshot: Label2DSnapshot,
-    candidates: Vec<Label2DCandidate>,
-    i: usize,
-    occupied_cells: std::collections::HashSet<u64>,
-    placed: Vec<PlacedLabel2D>,
+struct LabelAtlasCache {
+    chars: Vec<char>,
+    font_size_px: f32,
+    atlas_w: u32,
+    atlas_h: u32,
+    sdf_range_px: f32,
+    glyphs: BTreeMap<char, LabelGlyph>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -299,6 +311,7 @@ impl Default for CameraState {
             pitch_rad: 5f64.to_radians(),
             distance: 3.0 * WGS84_A,
             target: [0.0, 0.0, 0.0],
+            pan_px: [0.0, 0.0],
         }
     }
 }
@@ -373,7 +386,7 @@ impl Default for ControlConfig {
             orbit_sensitivity: 1.0,
             pan_sensitivity_3d: 1.0,
             zoom_speed_3d: 1.0,
-            invert_orbit_y: false,
+            invert_orbit_y: true,
             invert_pan_y_3d: false,
             min_distance: 10.0,
             max_distance: 200.0 * WGS84_A,
@@ -397,6 +410,27 @@ struct FeedLayerState {
     centers_mercator: Vec<[f32; 2]>,
     count_points: usize,
     style: LayerStyle,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct StyleRule {
+    /// Property key to match in GeoJSON feature.properties.
+    property: String,
+    /// Equality match. If an array is provided, any element may match.
+    equals: serde_json::Value,
+    /// Optional geometry filter: "point" | "line" | "polygon" | "any".
+    geometry: Option<String>,
+
+    // Style overrides
+    color_hex: Option<String>,
+    opacity: Option<f32>,
+    size_px: Option<f32>,
+    width_px: Option<f32>,
+    lift: Option<f32>,
+
+    stroke_color_hex: Option<String>,
+    stroke_opacity: Option<f32>,
+    stroke_width_px: Option<f32>,
 }
 
 #[derive(Debug)]
@@ -439,15 +473,26 @@ struct ViewerState {
     regions_world: Option<scene::World>,
     uploaded_world: Option<scene::World>,
 
+    // Original uploaded GeoJSON data (retains per-feature properties for styling).
+    uploaded_chunk: Option<formats::VectorChunk>,
+
+    // Conditional / attribute-driven styling rules per layer id.
+    layer_rules: BTreeMap<String, Vec<StyleRule>>,
+    layer_rules_json: BTreeMap<String, String>,
+
     // CPU-side cached geometry in viewer coordinates.
     base_regions_positions: Option<Vec<[f32; 3]>>,
     base_regions_mercator: Option<Vec<[f32; 2]>>,
+    base_regions_outline_positions: Option<Vec<[f32; 3]>>,
+    base_regions_outline_mercator: Option<Vec<[f32; 2]>>,
     cities_centers: Option<Vec<[f32; 3]>>,
     cities_mercator: Option<Vec<[f32; 2]>>,
     corridors_positions: Option<Vec<[f32; 3]>>,
     corridors_mercator: Option<Vec<[f32; 2]>>,
     regions_positions: Option<Vec<[f32; 3]>>,
     regions_mercator: Option<Vec<[f32; 2]>>,
+    regions_outline_positions: Option<Vec<[f32; 3]>>,
+    regions_outline_mercator: Option<Vec<[f32; 2]>>,
 
     base_world_loading: bool,
     base_world_error: Option<String>,
@@ -481,6 +526,8 @@ struct ViewerState {
     uploaded_corridors_mercator: Option<Vec<[f32; 2]>>,
     uploaded_regions_positions: Option<Vec<[f32; 3]>>,
     uploaded_regions_mercator: Option<Vec<[f32; 2]>>,
+    uploaded_regions_outline_positions: Option<Vec<[f32; 3]>>,
+    uploaded_regions_outline_mercator: Option<Vec<[f32; 2]>>,
     uploaded_count_points: usize,
     uploaded_count_lines: usize,
     uploaded_count_polys: usize,
@@ -535,9 +582,27 @@ struct ViewerState {
     labels_enabled: bool,
     labels_gen: u64,
     debug_labels: Vec<DebugLabel>,
-    labels2d_job: Option<Label2DJob>,
-    labels2d_last_snapshot: Option<Label2DSnapshot>,
-    labels2d_placed: Vec<PlacedLabel2D>,
+    labels_settings: LabelSettings,
+    labels_atlas: Option<LabelAtlasCache>,
+
+    // Layer-specific label toggles (in addition to global `labels_enabled`).
+    labels_base_world: bool,
+    labels_cities: bool,
+    labels_corridors: bool,
+    labels_regions: bool,
+    labels_uploaded: bool,
+
+    // Cached label anchors extracted from engine worlds (already converted to viewer coords).
+    labels_cached_gen: u64,
+    labels_cached_base: Vec<LabelAnchor>,
+    labels_cached_cities: Vec<LabelAnchor>,
+    labels_cached_corridors: Vec<LabelAnchor>,
+    labels_cached_regions: Vec<LabelAnchor>,
+    labels_cached_uploaded: Vec<LabelAnchor>,
+
+    // Throttle label layout work (layout+instance build) to reduce per-frame CPU overhead.
+    labels_last_layout_frame: u64,
+    labels_last_layout_gen: u64,
 
     // Combined buffers (all visible layers), uploaded into the shared GPU buffers.
     pending_styles: Option<Vec<Style>>,
@@ -588,15 +653,15 @@ thread_local! {
         city_marker_size: 4.0,
         line_width_px: 2.5,
 
-        base_regions_style: LayerStyle { visible: true, color: [0.20, 0.65, 0.35, 1.0], lift: 0.0 },
-        cities_style: LayerStyle { visible: false, color: [1.0, 0.25, 0.25, 0.95], lift: 0.0 },
-        corridors_style: LayerStyle { visible: false, color: [1.0, 0.85, 0.25, 0.90], lift: 0.0 },
-        regions_style: LayerStyle { visible: false, color: [0.10, 0.90, 0.75, 0.30], lift: 0.0 },
-        uploaded_points_style: LayerStyle { visible: false, color: [0.60, 0.95, 1.00, 0.95], lift: 0.0 },
-        uploaded_corridors_style: LayerStyle { visible: false, color: [0.85, 0.95, 0.60, 0.90], lift: 0.0 },
-        uploaded_regions_style: LayerStyle { visible: false, color: [0.45, 0.75, 1.00, 0.25], lift: 0.0 },
-        selection_style: LayerStyle { visible: true, color: [1.0, 1.0, 1.0, 0.95], lift: 0.0 },
-        terrain_style: LayerStyle { visible: false, color: [0.32, 0.72, 0.45, 0.95], lift: 0.0 },
+        base_regions_style: LayerStyle { visible: true, color: [0.20, 0.65, 0.35, 1.0], stroke_color: [0.20, 0.65, 0.35, 1.0], stroke_width_px: 0.0, size_px: 0.0, width_px: 0.0, lift: 0.0 },
+        cities_style: LayerStyle { visible: false, color: [1.0, 0.25, 0.25, 0.95], stroke_color: [1.0, 0.25, 0.25, 0.95], stroke_width_px: 0.0, size_px: 0.0, width_px: 0.0, lift: 0.0 },
+        corridors_style: LayerStyle { visible: false, color: [1.0, 0.85, 0.25, 0.90], stroke_color: [1.0, 0.85, 0.25, 0.90], stroke_width_px: 0.0, size_px: 0.0, width_px: 0.0, lift: 0.0 },
+        regions_style: LayerStyle { visible: false, color: [0.10, 0.90, 0.75, 0.30], stroke_color: [0.10, 0.90, 0.75, 0.30], stroke_width_px: 0.0, size_px: 0.0, width_px: 0.0, lift: 0.0 },
+        uploaded_points_style: LayerStyle { visible: false, color: [0.60, 0.95, 1.00, 0.95], stroke_color: [0.60, 0.95, 1.00, 0.95], stroke_width_px: 0.0, size_px: 0.0, width_px: 0.0, lift: 0.0 },
+        uploaded_corridors_style: LayerStyle { visible: false, color: [0.85, 0.95, 0.60, 0.90], stroke_color: [0.85, 0.95, 0.60, 0.90], stroke_width_px: 0.0, size_px: 0.0, width_px: 0.0, lift: 0.0 },
+        uploaded_regions_style: LayerStyle { visible: false, color: [0.45, 0.75, 1.00, 0.25], stroke_color: [0.45, 0.75, 1.00, 0.25], stroke_width_px: 0.0, size_px: 0.0, width_px: 0.0, lift: 0.0 },
+        selection_style: LayerStyle { visible: true, color: [1.0, 1.0, 1.0, 0.95], stroke_color: [1.0, 1.0, 1.0, 0.95], stroke_width_px: 0.0, size_px: 0.0, width_px: 0.0, lift: 0.0 },
+        terrain_style: LayerStyle { visible: false, color: [0.32, 0.72, 0.45, 0.95], stroke_color: [0.32, 0.72, 0.45, 0.95], stroke_width_px: 0.0, size_px: 0.0, width_px: 0.0, lift: 0.0 },
 
         base_world: None,
         cities_world: None,
@@ -604,14 +669,23 @@ thread_local! {
         regions_world: None,
         uploaded_world: None,
 
+        uploaded_chunk: None,
+
+        layer_rules: BTreeMap::new(),
+        layer_rules_json: BTreeMap::new(),
+
         base_regions_positions: None,
         base_regions_mercator: None,
+        base_regions_outline_positions: None,
+        base_regions_outline_mercator: None,
         cities_centers: None,
         cities_mercator: None,
         corridors_positions: None,
         corridors_mercator: None,
         regions_positions: None,
         regions_mercator: None,
+        regions_outline_positions: None,
+        regions_outline_mercator: None,
 
         base_world_loading: false,
         base_world_error: None,
@@ -635,7 +709,7 @@ thread_local! {
         auto_rotate_enabled: true,
         auto_rotate_speed_deg_per_s: 0.15,
         auto_rotate_last_user_time_s: 0.0,
-        auto_rotate_resume_delay_s: 1.2,
+        auto_rotate_resume_delay_s: 10.0,
 
         uploaded_name: None,
         uploaded_catalog_id: None,
@@ -645,6 +719,8 @@ thread_local! {
         uploaded_corridors_mercator: None,
         uploaded_regions_positions: None,
         uploaded_regions_mercator: None,
+        uploaded_regions_outline_positions: None,
+        uploaded_regions_outline_mercator: None,
         uploaded_count_points: 0,
         uploaded_count_lines: 0,
         uploaded_count_polys: 0,
@@ -693,9 +769,28 @@ thread_local! {
         labels_enabled: true,
         labels_gen: 0,
         debug_labels: Vec::new(),
-        labels2d_job: None,
-        labels2d_last_snapshot: None,
-        labels2d_placed: Vec::new(),
+        labels_settings: LabelSettings {
+            style: LayerLabelStyle::default(),
+            font_family: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif".to_string(),
+            max_labels: 600,
+            sdf_range_px: 8.0,
+            cell_padding_px: 6.0,
+        },
+        labels_atlas: None,
+
+        labels_base_world: true,
+        labels_cities: true,
+        labels_corridors: true,
+        labels_regions: true,
+        labels_uploaded: true,
+        labels_cached_gen: u64::MAX,
+        labels_cached_base: Vec::new(),
+        labels_cached_cities: Vec::new(),
+        labels_cached_corridors: Vec::new(),
+        labels_cached_regions: Vec::new(),
+        labels_cached_uploaded: Vec::new(),
+        labels_last_layout_frame: 0,
+        labels_last_layout_gen: 0,
         pending_styles: None,
         pending_cities: None,
         pending_corridors: None,
@@ -1319,181 +1414,6 @@ fn cull2d_advance_job(
     points_done && lines_done
 }
 
-fn label2d_should_restart(prev: Option<Label2DSnapshot>, next: Label2DSnapshot) -> bool {
-    let Some(prev) = prev else {
-        return true;
-    };
-    if prev.generation != next.generation {
-        return true;
-    }
-    // Restart if viewport changes materially.
-    if (prev.viewport_px[0] - next.viewport_px[0]).abs() > 0.5
-        || (prev.viewport_px[1] - next.viewport_px[1]).abs() > 0.5
-    {
-        return true;
-    }
-    // Restart if camera moved enough that label positions change.
-    let dlon = (next.cam.center_lon_deg - prev.cam.center_lon_deg).abs();
-    let dlat = (next.cam.center_lat_deg - prev.cam.center_lat_deg).abs();
-    if dlon > 0.05 || dlat > 0.05 {
-        return true;
-    }
-    let z_ratio = (next.cam.zoom / prev.cam.zoom.max(1e-9)).max(1e-9);
-    if !((1.0 / 1.1)..=1.1).contains(&z_ratio) {
-        return true;
-    }
-    false
-}
-
-fn label2d_cell_key(cx: i32, cy: i32) -> u64 {
-    ((cx as u32 as u64) << 32) | (cy as u32 as u64)
-}
-
-fn label2d_try_place(
-    occupied: &mut std::collections::HashSet<u64>,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-) -> bool {
-    // Coarse collision: grid-based occupancy.
-    // This is cheap and good enough for a scaffold.
-    let cell_w = 120.0;
-    let cell_h = 28.0;
-    if !(x.is_finite() && y.is_finite()) {
-        return false;
-    }
-    if x < 4.0 || x > (w - 4.0) || y < 4.0 || y > (h - 4.0) {
-        return false;
-    }
-
-    let cx = (x / cell_w).floor() as i32;
-    let cy = (y / cell_h).floor() as i32;
-    // Reserve a small neighborhood to reduce overlaps.
-    for oy in -1..=1 {
-        for ox in -1..=1 {
-            let k = label2d_cell_key(cx + ox, cy + oy);
-            if occupied.contains(&k) {
-                return false;
-            }
-        }
-    }
-    for oy in -1..=1 {
-        for ox in -1..=1 {
-            occupied.insert(label2d_cell_key(cx + ox, cy + oy));
-        }
-    }
-    true
-}
-
-fn label2d_build_candidates(s: &ViewerState) -> Vec<Label2DCandidate> {
-    let mut out: Vec<Label2DCandidate> = Vec::new();
-
-    // Selection label (highest priority).
-    if s.selection_style.visible
-        && let Some(c) = s.selection_center_mercator
-    {
-        let lon = wrap_lon_deg(inverse_mercator_lon_deg(c[0] as f64));
-        let lat = inverse_mercator_lat_deg(c[1] as f64);
-        out.push(Label2DCandidate {
-            text: format!("Selected ({lon:.5}, {lat:.5})"),
-            mercator_m: c,
-            priority: 10_000.0,
-        });
-    }
-
-    // User-supplied debug labels.
-    for dl in &s.debug_labels {
-        out.push(Label2DCandidate {
-            text: dl.text.clone(),
-            mercator_m: dl.mercator_m,
-            priority: dl.priority,
-        });
-    }
-
-    // Highest priority first.
-    out.sort_by(|a, b| {
-        b.priority
-            .partial_cmp(&a.priority)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    out
-}
-
-fn label2d_start_job(snapshot: Label2DSnapshot, candidates: Vec<Label2DCandidate>) -> Label2DJob {
-    Label2DJob {
-        snapshot,
-        candidates,
-        i: 0,
-        occupied_cells: std::collections::HashSet::new(),
-        placed: Vec::new(),
-    }
-}
-
-fn label2d_advance_job(
-    job: &mut Label2DJob,
-    projector: &MercatorProjector,
-    w: f32,
-    h: f32,
-    budget: usize,
-) -> bool {
-    let mut remaining = budget;
-    while job.i < job.candidates.len() && remaining > 0 {
-        let c = &job.candidates[job.i];
-        job.i += 1;
-        remaining -= 1;
-
-        let (x, y) = projector.project_mercator_m(
-            c.mercator_m[0] as f64,
-            c.mercator_m[1] as f64,
-            w as f64,
-            h as f64,
-        );
-        let x = x as f32;
-        let y = y as f32;
-
-        if label2d_try_place(&mut job.occupied_cells, x, y, w, h) {
-            job.placed.push(PlacedLabel2D {
-                text: c.text.clone(),
-                x_px: x,
-                y_px: y,
-                priority: c.priority,
-            });
-            if job.placed.len() >= 2000 {
-                break;
-            }
-        }
-    }
-
-    job.i >= job.candidates.len() || job.placed.len() >= 2000
-}
-
-fn render_labels2d_overlay(ctx2d: &CanvasRenderingContext2d, labels: &[PlacedLabel2D]) {
-    // Render as an overlay. Keep this conservative and readable.
-    ctx2d.set_font("12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif");
-    ctx2d.set_text_align("left");
-    ctx2d.set_text_baseline("middle");
-
-    // Draw in priority order (already sorted) so high-priority labels land on top.
-    for l in labels {
-        // Priority -> alpha ramp (kept subtle).
-        let a = (0.70 + 0.30 * (l.priority / 10_000.0).clamp(0.0, 1.0)) as f64;
-        ctx2d.set_global_alpha(a);
-        let x = l.x_px as f64 + 6.0;
-        let y = l.y_px as f64 - 10.0;
-        // Outline for contrast.
-        ctx_set_stroke_style(ctx2d, "rgba(0,0,0,0.85)");
-        ctx2d.set_line_width(3.5);
-        let _ = ctx2d.stroke_text(&l.text, x, y);
-        // Fill.
-        ctx_set_fill_style(ctx2d, "rgba(255,255,255,0.92)");
-        let _ = ctx2d.fill_text(&l.text, x, y);
-    }
-
-    // Restore default alpha for any other overlay drawing.
-    ctx2d.set_global_alpha(1.0);
-}
-
 fn clip_polygon_lat_band(mut poly: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
     // Sutherland–Hodgman against two horizontal lines: lat <= +max, lat >= -max.
     fn clip_against(
@@ -2094,7 +2014,22 @@ fn camera_view_proj(camera: CameraState, canvas_width: f64, canvas_height: f64) 
     // severe z-fighting between the globe and draped overlays.
     let near = (camera.distance * 0.001).max(10.0);
     let far = (camera.distance * 4.0 + 4.0 * WGS84_A).max(near + 1.0);
-    let proj = mat4_perspective_rh_z0(45f64.to_radians(), aspect, near, far);
+    let mut proj = mat4_perspective_rh_z0(45f64.to_radians(), aspect, near, far);
+
+    // Apply a screen-space pan as an off-axis projection shift.
+    //
+    // With our perspective matrix (clip_w = -view_z), setting the (row 0/1, col 2)
+    // terms shifts NDC by a constant amount:
+    //   x_ndc' = x_ndc + offset_x, where m02 = -offset_x
+    //   y_ndc' = y_ndc + offset_y, where m12 = -offset_y
+    //
+    // We store pan in pixels (+y down), so y offset is inverted when converting to NDC.
+    let w = canvas_width.max(1.0);
+    let h = canvas_height.max(1.0);
+    let offset_x_ndc = (2.0 * camera.pan_px[0] / w) as f32;
+    let offset_y_ndc = (-2.0 * camera.pan_px[1] / h) as f32;
+    proj[2][0] = -offset_x_ndc;
+    proj[2][1] = -offset_y_ndc;
     mat4_mul(proj, view)
 }
 
@@ -2187,36 +2122,47 @@ fn render_scene() -> Result<(), JsValue> {
         ViewMode::ThreeD => {
             let t0 = now_ms();
             let _ = STATE.try_with(|state_ref| {
-                let state = state_ref.borrow();
-                if let Some(ctx) = &state.wgpu {
+                let mut state = state_ref.borrow_mut();
+                let w = state.canvas_width.max(1.0);
+                let h = state.canvas_height.max(1.0);
+                let view_proj = camera_view_proj(state.camera, w, h);
+
+                let light_dir = if state.sun_follow_real_time {
+                    current_sun_direction_world().unwrap_or([0.4, 0.7, 0.2])
+                } else {
+                    [0.4, 0.7, 0.2]
+                };
+
+                // Layer visibility is baked into the combined overlay buffers; we can always
+                // attempt to draw and rely on vertex counts to early-out.
+                let show_base_regions = state.base_regions_style.visible;
+                let show_terrain = state.terrain_style.visible;
+                let show_cities = true;
+                let show_corridors = true;
+                let show_regions = true;
+                let show_graticule = state.show_graticule;
+
+                if let Some(ctx) = state.wgpu.as_mut() {
                     perf_reset(ctx);
-                    let view_proj =
-                        camera_view_proj(state.camera, state.canvas_width, state.canvas_height);
+                }
+                update_labels_gpu(&mut state, ViewMode::ThreeD, view_proj, w, h);
 
-                    let light_dir = if state.sun_follow_real_time {
-                        current_sun_direction_world().unwrap_or([0.4, 0.7, 0.2])
-                    } else {
-                        [0.4, 0.7, 0.2]
-                    };
-
-                    // Layer visibility is baked into the combined overlay buffers; we can always
-                    // attempt to draw and rely on vertex counts to early-out.
-                    let show_base_regions = state.base_regions_style.visible;
-                    let show_terrain = state.terrain_style.visible;
-                    let show_cities = true;
-                    let show_corridors = true;
-                    let show_regions = true;
+                if let Some(ctx_ref) = state.wgpu.as_ref() {
                     let _ = render_mesh(
-                        ctx,
+                        ctx_ref,
                         view_proj,
                         light_dir,
-                        state.show_graticule,
+                        show_graticule,
                         show_base_regions,
                         show_terrain,
                         show_cities,
                         show_corridors,
                         show_regions,
                     );
+                }
+
+                if let Some(ctx2d) = state.ctx_2d.as_ref() {
+                    ctx2d.clear_rect(0.0, 0.0, w, h);
                 }
             });
 
@@ -2237,9 +2183,6 @@ fn render_scene() -> Result<(), JsValue> {
                 }
             });
 
-            // Draw overlay labels on the 2D canvas (selection/debug labels).
-            // Keep this separate from the WebGPU pass to avoid text/GPU complexity.
-            render_labels_overlay_3d();
             Ok(())
         }
         ViewMode::TwoD => {
@@ -2275,58 +2218,490 @@ fn project_viewer_to_screen(
     Some((sx, sy))
 }
 
-fn render_labels_overlay_3d() {
-    let _ = STATE.try_with(|state_ref| {
-        let s = state_ref.borrow();
-        let Some(ctx2d) = s.ctx_2d.as_ref() else {
-            return;
+struct LabelProjector2D {
+    projector: MercatorProjector,
+    width_px: f32,
+    height_px: f32,
+}
+
+impl LabelProjector for LabelProjector2D {
+    fn project(&self, world: foundation::math::Vec3) -> Option<[f32; 2]> {
+        let viewer = [world.x as f32, world.y as f32, world.z as f32];
+        let m = viewer_to_mercator_m(&viewer);
+        let (x, y) = self.projector.project_mercator_m(
+            m[0] as f64,
+            m[1] as f64,
+            self.width_px as f64,
+            self.height_px as f64,
+        );
+        Some([x as f32, y as f32])
+    }
+}
+
+struct LabelProjector3D {
+    view_proj: [[f32; 4]; 4],
+    width_px: f32,
+    height_px: f32,
+}
+
+impl LabelProjector for LabelProjector3D {
+    fn project(&self, world: foundation::math::Vec3) -> Option<[f32; 2]> {
+        let viewer = [world.x as f32, world.y as f32, world.z as f32];
+        project_viewer_to_screen(self.view_proj, viewer, self.width_px, self.height_px)
+            .map(|(x, y)| [x, y])
+    }
+}
+
+fn label_anchor_style(s: &ViewerState) -> LayerLabelStyle {
+    s.labels_settings.style.clone()
+}
+
+fn label_source_enabled(s: &ViewerState, source: LabelSource) -> bool {
+    match source {
+        LabelSource::BaseWorld => s.labels_base_world,
+        LabelSource::Cities => s.labels_cities,
+        LabelSource::Corridors => s.labels_corridors,
+        LabelSource::Regions => s.labels_regions,
+        LabelSource::Uploaded => s.labels_uploaded,
+    }
+}
+
+fn rebuild_cached_label_anchors(s: &mut ViewerState) {
+    if s.labels_cached_gen == s.labels_gen {
+        return;
+    }
+
+    // NOTE: This work can be moderately expensive (walks worlds and reads properties),
+    // so we only do it when generation changes.
+    let style = label_anchor_style(s);
+    let rule = LabelRule {
+        key: "name".to_string(),
+        kind: None,
+        priority: 1.0,
+        style,
+    };
+    let config = LabelsConfig {
+        rules: vec![rule],
+        // Extraction-side cap: keep it tight to reduce downstream work.
+        max_labels: s.labels_settings.max_labels,
+        max_text_len: 256,
+    };
+    let layer = LabelsLayer::new(1, config);
+
+    let extract_world = |world_opt: Option<&scene::World>| -> Vec<LabelAnchor> {
+        let mut out = Vec::new();
+        if let Some(world) = world_opt {
+            out = layer.extract(world).labels;
+            for anchor in out.iter_mut() {
+                anchor.position = viewer_vec3_from_ecef(anchor.position);
+            }
+        }
+        out
+    };
+
+    s.labels_cached_base = extract_world(s.base_world.as_ref());
+    s.labels_cached_cities = extract_world(s.cities_world.as_ref());
+    s.labels_cached_corridors = extract_world(s.corridors_world.as_ref());
+    s.labels_cached_regions = extract_world(s.regions_world.as_ref());
+    s.labels_cached_uploaded = extract_world(s.uploaded_world.as_ref());
+
+    s.labels_cached_gen = s.labels_gen;
+}
+
+fn viewer_vec3_from_ecef(p: foundation::math::Vec3) -> foundation::math::Vec3 {
+    let v = ecef_vec3_to_viewer_f32(p);
+    foundation::math::Vec3::new(v[0] as f64, v[1] as f64, v[2] as f64)
+}
+
+fn collect_label_anchors(s: &ViewerState) -> Vec<LabelAnchor> {
+    let mut anchors: Vec<LabelAnchor> = Vec::new();
+    let style = label_anchor_style(s);
+
+    if s.selection_style.visible
+        && let Some(p) = s.selection_center
+    {
+        anchors.push(LabelAnchor {
+            entity: scene::entity::EntityId(Handle::new(0, 0)),
+            text: "Selected".to_string(),
+            position: foundation::math::Vec3::new(p[0] as f64, p[1] as f64, p[2] as f64),
+            kind: VectorGeometryKind::Point,
+            priority: 10_000.0,
+            style: style.clone(),
+        });
+    }
+
+    for dl in &s.debug_labels {
+        anchors.push(LabelAnchor {
+            entity: scene::entity::EntityId(Handle::new(0, 0)),
+            text: dl.text.clone(),
+            position: foundation::math::Vec3::new(
+                dl.viewer_pos[0] as f64,
+                dl.viewer_pos[1] as f64,
+                dl.viewer_pos[2] as f64,
+            ),
+            kind: VectorGeometryKind::Point,
+            priority: dl.priority,
+            style: style.clone(),
+        });
+    }
+
+    // Cached world anchors are already converted to viewer coords.
+    // Respect both layer visibility and per-layer label toggles.
+    if s.base_regions_style.visible && label_source_enabled(s, LabelSource::BaseWorld) {
+        anchors.extend(s.labels_cached_base.iter().cloned());
+    }
+    if s.cities_style.visible && label_source_enabled(s, LabelSource::Cities) {
+        anchors.extend(s.labels_cached_cities.iter().cloned());
+    }
+    if s.corridors_style.visible && label_source_enabled(s, LabelSource::Corridors) {
+        anchors.extend(s.labels_cached_corridors.iter().cloned());
+    }
+    if s.regions_style.visible && label_source_enabled(s, LabelSource::Regions) {
+        anchors.extend(s.labels_cached_regions.iter().cloned());
+    }
+    if (s.uploaded_points_style.visible
+        || s.uploaded_corridors_style.visible
+        || s.uploaded_regions_style.visible)
+        && label_source_enabled(s, LabelSource::Uploaded)
+    {
+        anchors.extend(s.labels_cached_uploaded.iter().cloned());
+    }
+
+    anchors
+}
+
+fn layout_labels_for_view(
+    s: &ViewerState,
+    view_mode: ViewMode,
+    view_proj: [[f32; 4]; 4],
+    w: f64,
+    h: f64,
+) -> Vec<LayerPlacedLabel2D> {
+    let mut anchors = collect_label_anchors(s);
+    anchors.sort_by(|a, b| {
+        b.priority
+            .partial_cmp(&a.priority)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    if anchors.is_empty() {
+        return Vec::new();
+    }
+
+    let cell_px = (s.labels_settings.style.font_size_px * 2.0).max(24.0);
+    let config = LabelLayoutConfig {
+        viewport_px: [w as f32, h as f32],
+        cell_px,
+        padding_px: s.labels_settings.cell_padding_px,
+        max_labels: s.labels_settings.max_labels,
+    };
+
+    match view_mode {
+        ViewMode::TwoD => {
+            let projector = LabelProjector2D {
+                projector: MercatorProjector::new(s.camera_2d, w, h),
+                width_px: w as f32,
+                height_px: h as f32,
+            };
+            layout_labels_2d(&anchors, &projector, config)
+        }
+        ViewMode::ThreeD => {
+            let projector = LabelProjector3D {
+                view_proj,
+                width_px: w as f32,
+                height_px: h as f32,
+            };
+            layout_labels_2d(&anchors, &projector, config)
+        }
+    }
+}
+
+fn collect_label_chars(labels: &[LayerPlacedLabel2D]) -> Vec<char> {
+    let mut set = BTreeMap::new();
+    for label in labels {
+        for ch in label.text.chars() {
+            set.entry(ch).or_insert(0);
+        }
+    }
+    set.keys().copied().collect()
+}
+
+fn build_sdf_from_alpha(alpha: &[u8], w: u32, h: u32, range_px: i32) -> Vec<u8> {
+    let mut out = vec![0u8; (w as usize) * (h as usize)];
+    if range_px <= 0 {
+        return out;
+    }
+    let range = range_px;
+    for y in 0..h as i32 {
+        for x in 0..w as i32 {
+            let idx = (y as usize) * (w as usize) + (x as usize);
+            let inside = alpha[idx] >= 128;
+            let mut best = range * range;
+            for dy in -range..=range {
+                let ny = y + dy;
+                if ny < 0 || ny >= h as i32 {
+                    continue;
+                }
+                for dx in -range..=range {
+                    let nx = x + dx;
+                    if nx < 0 || nx >= w as i32 {
+                        continue;
+                    }
+                    let nidx = (ny as usize) * (w as usize) + (nx as usize);
+                    let ninside = alpha[nidx] >= 128;
+                    if ninside == inside {
+                        continue;
+                    }
+                    let d2 = dx * dx + dy * dy;
+                    if d2 < best {
+                        best = d2;
+                    }
+                }
+            }
+            let dist = (best as f32).sqrt();
+            let signed = if inside { dist } else { -dist };
+            let norm = (signed / range as f32) * 0.5 + 0.5;
+            out[idx] = (norm.clamp(0.0, 1.0) * 255.0).round() as u8;
+        }
+    }
+    out
+}
+
+fn build_label_atlas(
+    chars: &[char],
+    settings: LabelSettings,
+) -> Result<(LabelAtlasCache, Vec<u8>), JsValue> {
+    let window = web_sys::window().ok_or_else(|| JsValue::from_str("window missing"))?;
+    let document = window
+        .document()
+        .ok_or_else(|| JsValue::from_str("document missing"))?;
+    let canvas = document
+        .create_element("canvas")?
+        .dyn_into::<HtmlCanvasElement>()?;
+
+    let cell_px = (settings.style.font_size_px + settings.cell_padding_px * 2.0)
+        .ceil()
+        .max(1.0) as u32;
+    let cols = ((chars.len() as f32).sqrt().ceil() as u32).max(1);
+    let rows = (chars.len() as u32).div_ceil(cols).max(1);
+    let atlas_w = cell_px * cols;
+    let atlas_h = cell_px * rows;
+
+    let mut pixels = vec![0u8; (atlas_w * atlas_h) as usize];
+    let mut glyphs = BTreeMap::new();
+
+    canvas.set_width(cell_px);
+    canvas.set_height(cell_px);
+    let ctx = canvas
+        .get_context("2d")?
+        .ok_or_else(|| JsValue::from_str("2d context unavailable"))?
+        .dyn_into::<CanvasRenderingContext2d>()?;
+
+    let font_size = settings.style.font_size_px.max(1.0);
+    let family = settings.font_family.trim();
+    let family = if family.is_empty() {
+        "system-ui, -apple-system, Segoe UI, Roboto, sans-serif"
+    } else {
+        family
+    };
+    let font = format!("{}px {}", font_size, family);
+    ctx.set_text_align("left");
+    ctx.set_text_baseline("alphabetic");
+
+    for (i, ch) in chars.iter().enumerate() {
+        let col = (i as u32) % cols;
+        let row = (i as u32) / cols;
+        let x0 = col * cell_px;
+        let y0 = row * cell_px;
+
+        ctx.clear_rect(0.0, 0.0, cell_px as f64, cell_px as f64);
+        ctx.set_font(&font);
+        ctx_set_fill_style(&ctx, "white");
+
+        let x = settings.cell_padding_px as f64;
+        let y = (settings.cell_padding_px + font_size) as f64;
+        let _ = ctx.fill_text(&ch.to_string(), x, y);
+
+        let image = ctx.get_image_data(0.0, 0.0, cell_px as f64, cell_px as f64)?;
+        let data = image.data();
+        let mut alpha = vec![0u8; (cell_px * cell_px) as usize];
+        for p in 0..(cell_px * cell_px) as usize {
+            alpha[p] = data[p * 4 + 3];
+        }
+
+        let sdf = build_sdf_from_alpha(
+            &alpha,
+            cell_px,
+            cell_px,
+            settings.sdf_range_px.round().max(1.0) as i32,
+        );
+
+        for cy in 0..cell_px {
+            let dst_row = (y0 + cy) as usize * atlas_w as usize;
+            let src_row = cy as usize * cell_px as usize;
+            let dst = &mut pixels[dst_row + x0 as usize..dst_row + x0 as usize + cell_px as usize];
+            dst.copy_from_slice(&sdf[src_row..src_row + cell_px as usize]);
+        }
+
+        let uv_min = [x0 as f32 / atlas_w as f32, y0 as f32 / atlas_h as f32];
+        let uv_max = [
+            (x0 + cell_px) as f32 / atlas_w as f32,
+            (y0 + cell_px) as f32 / atlas_h as f32,
+        ];
+        let advance_px = if *ch == ' ' {
+            font_size * 0.35
+        } else {
+            font_size * 0.6
         };
+        glyphs.insert(
+            *ch,
+            LabelGlyph {
+                uv_min,
+                uv_max,
+                advance_px,
+            },
+        );
+    }
 
-        // Clear the overlay each frame.
-        let w = s.canvas_width.max(1.0);
-        let h = s.canvas_height.max(1.0);
-        ctx2d.clear_rect(0.0, 0.0, w, h);
+    Ok((
+        LabelAtlasCache {
+            chars: chars.to_vec(),
+            font_size_px: font_size,
+            atlas_w,
+            atlas_h,
+            sdf_range_px: settings.sdf_range_px,
+            glyphs,
+        },
+        pixels,
+    ))
+}
 
-        if !s.labels_enabled {
-            return;
+fn build_label_instances(
+    labels: &[LayerPlacedLabel2D],
+    atlas: &LabelAtlasCache,
+) -> Vec<LabelInstance> {
+    let mut out = Vec::new();
+    if labels.is_empty() {
+        return out;
+    }
+
+    for label in labels {
+        let text = label.text.as_str();
+        if text.is_empty() {
+            continue;
         }
-
-        let view_proj = camera_view_proj(s.camera, s.canvas_width, s.canvas_height);
-        let wf = w as f32;
-        let hf = h as f32;
-
-        // Assemble a small set of labels.
-        let mut labels: Vec<(f32, String, [f32; 3])> = Vec::new();
-        if s.selection_style.visible
-            && let Some(p) = s.selection_center
-        {
-            labels.push((10_000.0, "Selected".to_string(), p));
-        }
-        for dl in &s.debug_labels {
-            labels.push((dl.priority, dl.text.clone(), dl.viewer_pos));
-        }
-        labels.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
-
-        ctx2d.set_font("12px system-ui, -apple-system, Segoe UI, Roboto, sans-serif");
-        ctx2d.set_text_align("left");
-        ctx2d.set_text_baseline("middle");
-
-        for (_prio, text, pos) in labels.iter().take(256) {
-            let Some((sx, sy)) = project_viewer_to_screen(view_proj, *pos, wf, hf) else {
+        let mut x = label.screen_pos_px[0] - label.size_px[0] * 0.5;
+        let y = label.screen_pos_px[1] - label.size_px[1] * 0.5;
+        for ch in text.chars() {
+            let Some(glyph) = atlas.glyphs.get(&ch) else {
+                x += atlas.font_size_px * 0.6;
                 continue;
             };
-            if sx < 0.0 || sx > wf || sy < 0.0 || sy > hf {
+            if ch == ' ' {
+                x += glyph.advance_px;
                 continue;
             }
-            let x = sx as f64 + 6.0;
-            let y = sy as f64 - 10.0;
-            ctx_set_stroke_style(ctx2d, "rgba(0,0,0,0.85)");
-            ctx2d.set_line_width(3.5);
-            let _ = ctx2d.stroke_text(text, x, y);
-            ctx_set_fill_style(ctx2d, "rgba(255,255,255,0.92)");
-            let _ = ctx2d.fill_text(text, x, y);
+
+            out.push(LabelInstance {
+                pos_px: [x, y],
+                size_px: [glyph.advance_px, atlas.font_size_px],
+                uv_min: glyph.uv_min,
+                uv_max: glyph.uv_max,
+                color: label.style.color,
+                halo: label.style.halo_color,
+                sdf_range_px: atlas.sdf_range_px,
+                halo_width_px: label.style.halo_width_px,
+                _pad0: [0.0, 0.0],
+            });
+            x += glyph.advance_px;
         }
-    });
+    }
+
+    out
+}
+
+fn update_labels_gpu(
+    s: &mut ViewerState,
+    view_mode: ViewMode,
+    view_proj: [[f32; 4]; 4],
+    w: f64,
+    h: f64,
+) {
+    if !s.labels_enabled {
+        if let Some(ctx) = s.wgpu.as_mut() {
+            set_label_instances(ctx, &[]);
+        }
+        return;
+    }
+
+    // Refresh cached anchors only when label generation changes (world loads, toggles, etc).
+    rebuild_cached_label_anchors(s);
+
+    // Throttle expensive label work. The GPU will keep drawing the previous instance buffer.
+    // Always update immediately on generation changes.
+    let gen_changed = s.labels_last_layout_gen != s.labels_gen;
+    if !gen_changed {
+        let every_n_frames = match view_mode {
+            ViewMode::ThreeD => 2u64,
+            ViewMode::TwoD => 1u64,
+        };
+        if every_n_frames > 1 && !s.frame_index.is_multiple_of(every_n_frames) {
+            return;
+        }
+    }
+
+    let labels = layout_labels_for_view(s, view_mode, view_proj, w, h);
+    if labels.is_empty() {
+        if let Some(ctx) = s.wgpu.as_mut() {
+            set_label_instances(ctx, &[]);
+        }
+        return;
+    }
+
+    let chars = collect_label_chars(&labels);
+    // Avoid rebuilding the atlas when the visible character set shrinks. We only rebuild when:
+    // - font size / sdf range / font family changes
+    // - new characters appear (monotonic growth of `chars`)
+    let (needs_rebuild, needed_chars) = match s.labels_atlas.as_ref() {
+        Some(cache) => {
+            let mut union = cache.chars.clone();
+            for ch in &chars {
+                if !union.contains(ch) {
+                    union.push(*ch);
+                }
+            }
+            union.sort();
+            let font_changed = cache.font_size_px != s.labels_settings.style.font_size_px;
+            let sdf_changed = cache.sdf_range_px != s.labels_settings.sdf_range_px;
+            let new_chars = union.len() != cache.chars.len();
+            (font_changed || sdf_changed || new_chars, union)
+        }
+        None => {
+            let mut init = chars;
+            init.sort();
+            (true, init)
+        }
+    };
+
+    if needs_rebuild
+        && let Ok((cache, pixels)) = build_label_atlas(&needed_chars, s.labels_settings.clone())
+    {
+        if let Some(ctx) = s.wgpu.as_mut() {
+            set_label_atlas(ctx, cache.atlas_w, cache.atlas_h, &pixels);
+        }
+        s.labels_atlas = Some(cache);
+    }
+
+    if let Some(cache) = s.labels_atlas.as_ref() {
+        let instances = build_label_instances(&labels, cache);
+        if let Some(ctx) = s.wgpu.as_mut() {
+            set_label_instances(ctx, &instances);
+        }
+    } else if let Some(ctx) = s.wgpu.as_mut() {
+        set_label_instances(ctx, &[]);
+    }
+
+    s.labels_last_layout_frame = s.frame_index;
+    s.labels_last_layout_gen = s.labels_gen;
 }
 
 /// Perf stats collected during a 2D render pass.
@@ -2929,6 +3304,8 @@ fn render_scene_2d_wgpu() -> Result<(), JsValue> {
             state.cull2d_visible_line_segs = 0;
         }
 
+        update_labels_gpu(&mut state, ViewMode::TwoD, [[0.0; 4]; 4], w, h);
+
         let ctx = state.wgpu.as_ref().unwrap();
 
         let res = render_map2d(
@@ -2940,47 +3317,6 @@ fn render_scene_2d_wgpu() -> Result<(), JsValue> {
             show_lines,
             show_points,
         );
-
-        // Labels overlay (Canvas2D): layout is time-sliced and drawn on top.
-        if state.labels_enabled
-            && let Some(ctx2d) = state.ctx_2d.clone()
-        {
-            let snapshot = Label2DSnapshot {
-                cam: state.camera_2d,
-                viewport_px: [w as f32, h as f32],
-                generation: state.labels_gen,
-            };
-
-            let need_restart = if let Some(job) = state.labels2d_job.as_ref() {
-                label2d_should_restart(Some(job.snapshot), snapshot)
-            } else {
-                label2d_should_restart(state.labels2d_last_snapshot, snapshot)
-            };
-
-            if need_restart {
-                let candidates = {
-                    let s_ro: &ViewerState = &state;
-                    label2d_build_candidates(s_ro)
-                };
-                state.labels2d_job = Some(label2d_start_job(snapshot, candidates));
-                state.labels2d_placed.clear();
-            }
-
-            let projector = MercatorProjector::new(state.camera_2d, w, h);
-            if let Some(mut job) = state.labels2d_job.take() {
-                let done = label2d_advance_job(&mut job, &projector, w as f32, h as f32, 250);
-                // Render progressively.
-                state.labels2d_placed = job.placed.clone();
-                if done {
-                    state.labels2d_last_snapshot = Some(job.snapshot);
-                    state.labels2d_job = None;
-                } else {
-                    state.labels2d_job = Some(job);
-                }
-            }
-
-            render_labels2d_overlay(&ctx2d, &state.labels2d_placed);
-        }
 
         let t1 = now_ms();
         state.perf_2d_total_ms = t1 - t0;
@@ -3356,6 +3692,86 @@ fn build_corridor_vertices(positions_line_list: &[[f32; 3]], style_id: u32) -> V
 
     out
 }
+
+fn build_corridor_vertices_with_style_ids(
+    positions_line_list: &[[f32; 3]],
+    style_ids: &[u32],
+) -> Vec<CorridorVertex> {
+    let seg_count = (positions_line_list.len() / 2).min(style_ids.len());
+    let mut out: Vec<CorridorVertex> = Vec::with_capacity(seg_count);
+
+    const MAX_SEGMENTS: usize = 1_500_000;
+    let mut emitted_segments = 0usize;
+
+    for (seg_index, seg) in positions_line_list
+        .chunks_exact(2)
+        .take(1_500_000)
+        .enumerate()
+    {
+        if seg_index >= seg_count {
+            break;
+        }
+        let style_id = style_ids[seg_index];
+
+        let a = seg[0];
+        let b = seg[1];
+
+        // Skip degenerate segments.
+        let dx = a[0] - b[0];
+        let dy = a[1] - b[1];
+        let dz = a[2] - b[2];
+        if dx * dx + dy * dy + dz * dz < 1e-12 {
+            continue;
+        }
+
+        let (lon_a, lat_a) = world_to_lon_lat_deg([a[0] as f64, a[1] as f64, a[2] as f64]);
+        let (lon_b, lat_b) = world_to_lon_lat_deg([b[0] as f64, b[1] as f64, b[2] as f64]);
+        let ua = unit_from_lon_lat_deg(lon_a, lat_a);
+        let ub = unit_from_lon_lat_deg(lon_b, lat_b);
+        let dot = (ua[0] * ub[0] + ua[1] * ub[1] + ua[2] * ub[2]).clamp(-1.0, 1.0);
+        let angle = dot.acos();
+        let max_step = 5.0_f64.to_radians();
+        let steps = ((angle / max_step).ceil() as usize).clamp(1, 128);
+
+        let push_segment = |out: &mut Vec<CorridorVertex>, a: [f32; 3], b: [f32; 3]| {
+            out.push(CorridorVertex {
+                a,
+                _pad0: 0,
+                b,
+                style_id,
+            });
+        };
+
+        if steps <= 1 {
+            push_segment(&mut out, a, b);
+            emitted_segments += 1;
+        } else {
+            let mut prev = a;
+            for i in 1..=steps {
+                if emitted_segments >= MAX_SEGMENTS {
+                    break;
+                }
+                let t = i as f64 / steps as f64;
+                let p = if i == steps {
+                    b
+                } else {
+                    let u = slerp_unit(ua, ub, t);
+                    let (lon, lat) = lon_lat_deg_from_unit(u);
+                    lon_lat_deg_to_world(lon, lat)
+                };
+                push_segment(&mut out, prev, p);
+                prev = p;
+                emitted_segments += 1;
+            }
+        }
+
+        if emitted_segments >= MAX_SEGMENTS {
+            break;
+        }
+    }
+
+    out
+}
 // Stable GPU style IDs. Geometry references these IDs so we can update style values
 // without rebuilding / re-uploading geometry.
 const STYLE_DEFAULT: u32 = 0;
@@ -3363,6 +3779,10 @@ const STYLE_BASE_REGIONS: u32 = 1;
 const STYLE_REGIONS: u32 = 2;
 const STYLE_UPLOADED_REGIONS: u32 = 3;
 const STYLE_SELECTION_POLY: u32 = 4;
+
+const STYLE_BASE_REGIONS_STROKE: u32 = 5;
+const STYLE_REGIONS_STROKE: u32 = 6;
+const STYLE_UPLOADED_REGIONS_STROKE: u32 = 7;
 
 const STYLE_CITIES: u32 = 10;
 const STYLE_UPLOADED_POINTS: u32 = 11;
@@ -3415,7 +3835,8 @@ fn rebuild_styles_table(s: &mut ViewerState) -> Vec<Style> {
         let _ = feed_style_id(s, feed_layer_id);
     }
 
-    let mut max_id = STYLE_SELECTION_LINE.max(STYLE_GRATICULE_2D);
+    let mut max_id = STYLE_UPLOADED_REGIONS_STROKE.max(STYLE_GRATICULE_2D);
+    max_id = max_id.max(STYLE_SELECTION_LINE);
     if let Some(max_feed) = s.feed_style_ids.values().copied().max() {
         max_id = max_id.max(max_feed);
     }
@@ -3428,9 +3849,51 @@ fn rebuild_styles_table(s: &mut ViewerState) -> Vec<Style> {
         base_regions_style.color[3] = 1.0;
     }
     styles[STYLE_BASE_REGIONS as usize] = style_from_layer(base_regions_style, 100.0, 0.0, 0.0);
+    {
+        let width_px = s.base_regions_style.stroke_width_px.clamp(0.0, 24.0);
+        let mut st = Style {
+            color: s.base_regions_style.stroke_color,
+            lift_m: styles[STYLE_BASE_REGIONS as usize].lift_m + 5.0,
+            size_px: 0.0,
+            width_px,
+            _pad0: 0.0,
+        };
+        if width_px <= 0.0 {
+            st.color[3] = 0.0;
+        }
+        styles[STYLE_BASE_REGIONS_STROKE as usize] = st;
+    }
     styles[STYLE_REGIONS as usize] = style_from_layer(s.regions_style, 25.0, 0.0, 0.0);
+    {
+        let width_px = s.regions_style.stroke_width_px.clamp(0.0, 24.0);
+        let mut st = Style {
+            color: s.regions_style.stroke_color,
+            lift_m: styles[STYLE_REGIONS as usize].lift_m + 5.0,
+            size_px: 0.0,
+            width_px,
+            _pad0: 0.0,
+        };
+        if width_px <= 0.0 {
+            st.color[3] = 0.0;
+        }
+        styles[STYLE_REGIONS_STROKE as usize] = st;
+    }
     styles[STYLE_UPLOADED_REGIONS as usize] =
         style_from_layer(s.uploaded_regions_style, 25.0, 0.0, 0.0);
+    {
+        let width_px = s.uploaded_regions_style.stroke_width_px.clamp(0.0, 24.0);
+        let mut st = Style {
+            color: s.uploaded_regions_style.stroke_color,
+            lift_m: styles[STYLE_UPLOADED_REGIONS as usize].lift_m + 5.0,
+            size_px: 0.0,
+            width_px,
+            _pad0: 0.0,
+        };
+        if width_px <= 0.0 {
+            st.color[3] = 0.0;
+        }
+        styles[STYLE_UPLOADED_REGIONS_STROKE as usize] = st;
+    }
     styles[STYLE_SELECTION_POLY as usize] = Style {
         color: s.selection_style.color,
         lift_m: (s.selection_style.lift + 0.03) * (WGS84_A as f32),
@@ -3440,27 +3903,52 @@ fn rebuild_styles_table(s: &mut ViewerState) -> Vec<Style> {
     };
 
     // Points
-    let size_px = s.city_marker_size.clamp(1.0, 64.0);
-    styles[STYLE_CITIES as usize] = style_from_layer(s.cities_style, 50.0, size_px, 1.0);
+    let global_size_px = s.city_marker_size.clamp(1.0, 64.0);
+    let cities_size_px = if s.cities_style.size_px > 0.0 {
+        s.cities_style.size_px.clamp(1.0, 64.0)
+    } else {
+        global_size_px
+    };
+    let uploaded_points_size_px = if s.uploaded_points_style.size_px > 0.0 {
+        s.uploaded_points_style.size_px.clamp(1.0, 64.0)
+    } else {
+        global_size_px
+    };
+    styles[STYLE_CITIES as usize] = style_from_layer(s.cities_style, 50.0, cities_size_px, 1.0);
     styles[STYLE_UPLOADED_POINTS as usize] =
-        style_from_layer(s.uploaded_points_style, 50.0, size_px, 1.0);
+        style_from_layer(s.uploaded_points_style, 50.0, uploaded_points_size_px, 1.0);
     styles[STYLE_SELECTION_POINT as usize] = style_from_layer(
         s.selection_style,
         50.0,
-        (s.city_marker_size * 1.35).clamp(1.0, 64.0),
+        (global_size_px * 1.35).clamp(1.0, 64.0),
         1.0,
     );
 
     // Lines
-    let width_px = s.line_width_px.clamp(1.0, 24.0);
-    styles[STYLE_CORRIDORS as usize] = style_from_layer(s.corridors_style, 50.0, 0.0, width_px);
-    styles[STYLE_UPLOADED_CORRIDORS as usize] =
-        style_from_layer(s.uploaded_corridors_style, 50.0, 0.0, width_px);
+    let global_width_px = s.line_width_px.clamp(1.0, 24.0);
+    let corridors_width_px = if s.corridors_style.width_px > 0.0 {
+        s.corridors_style.width_px.clamp(0.5, 24.0)
+    } else {
+        global_width_px
+    };
+    let uploaded_corridors_width_px = if s.uploaded_corridors_style.width_px > 0.0 {
+        s.uploaded_corridors_style.width_px.clamp(0.5, 24.0)
+    } else {
+        global_width_px
+    };
+    styles[STYLE_CORRIDORS as usize] =
+        style_from_layer(s.corridors_style, 50.0, 0.0, corridors_width_px);
+    styles[STYLE_UPLOADED_CORRIDORS as usize] = style_from_layer(
+        s.uploaded_corridors_style,
+        50.0,
+        0.0,
+        uploaded_corridors_width_px,
+    );
     styles[STYLE_SELECTION_LINE as usize] = Style {
         color: s.selection_style.color,
         lift_m: (s.selection_style.lift + 0.03) * (WGS84_A as f32),
         size_px: 0.0,
-        width_px: (s.line_width_px * 1.6).clamp(1.0, 24.0),
+        width_px: (global_width_px * 1.6).clamp(1.0, 24.0),
         _pad0: 0.0,
     };
 
@@ -3478,6 +3966,11 @@ fn rebuild_styles_table(s: &mut ViewerState) -> Vec<Style> {
         if let Some(id) = s.feed_style_ids.get(feed_layer_id).copied()
             && (id as usize) < styles.len()
         {
+            let size_px = if layer.style.size_px > 0.0 {
+                layer.style.size_px.clamp(1.0, 64.0)
+            } else {
+                global_size_px
+            };
             styles[id as usize] = style_from_layer(layer.style, 50.0, size_px, 1.0);
         }
     }
@@ -3533,18 +4026,40 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
                 .base_regions_positions
                 .as_ref()
                 .map(|pos| world_tris_to_mercator_clipped(pos));
-        } else {
-            s.base_regions_positions = s.base_world.as_ref().map(|w| {
-                let snap = layer.extract(w);
+            // Surface tiles are pre-triangulated and do not currently preserve polygon ring
+            // boundaries, so we can't extract outlines here.
+            s.base_regions_outline_positions = None;
+            s.base_regions_outline_mercator = None;
+        } else if let Some(w) = s.base_world.as_ref() {
+            let snap = layer.extract(w);
+
+            s.base_regions_positions = Some(
                 snap.area_triangles
                     .into_iter()
                     .map(ecef_vec3_to_viewer_f32)
-                    .collect::<Vec<_>>()
-            });
+                    .collect::<Vec<_>>(),
+            );
             s.base_regions_mercator = s
                 .base_regions_positions
                 .as_ref()
                 .map(|pos| world_tris_to_mercator_clipped(pos));
+
+            let mut outline: Vec<[f32; 3]> =
+                Vec::with_capacity(snap.area_outline_segments.len() * 2);
+            for seg in snap.area_outline_segments {
+                outline.push(ecef_vec3_to_viewer_f32(seg[0]));
+                outline.push(ecef_vec3_to_viewer_f32(seg[1]));
+            }
+            s.base_regions_outline_positions = Some(outline);
+            s.base_regions_outline_mercator = s
+                .base_regions_outline_positions
+                .as_ref()
+                .map(|pos| world_segs_to_mercator_clipped(pos));
+        } else {
+            s.base_regions_positions = None;
+            s.base_regions_mercator = None;
+            s.base_regions_outline_positions = None;
+            s.base_regions_outline_mercator = None;
         }
         s.cities_centers = s.cities_world.as_ref().map(|w| {
             let snap = layer.extract(w);
@@ -3574,17 +4089,36 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
             .as_ref()
             .map(|pos| world_segs_to_mercator_clipped(pos));
 
-        s.regions_positions = s.regions_world.as_ref().map(|w| {
+        if let Some(w) = s.regions_world.as_ref() {
             let snap = layer.extract(w);
-            snap.area_triangles
-                .into_iter()
-                .map(ecef_vec3_to_viewer_f32)
-                .collect::<Vec<_>>()
-        });
-        s.regions_mercator = s
-            .regions_positions
-            .as_ref()
-            .map(|pos| world_tris_to_mercator_clipped(pos));
+            s.regions_positions = Some(
+                snap.area_triangles
+                    .into_iter()
+                    .map(ecef_vec3_to_viewer_f32)
+                    .collect::<Vec<_>>(),
+            );
+            s.regions_mercator = s
+                .regions_positions
+                .as_ref()
+                .map(|pos| world_tris_to_mercator_clipped(pos));
+
+            let mut outline: Vec<[f32; 3]> =
+                Vec::with_capacity(snap.area_outline_segments.len() * 2);
+            for seg in snap.area_outline_segments {
+                outline.push(ecef_vec3_to_viewer_f32(seg[0]));
+                outline.push(ecef_vec3_to_viewer_f32(seg[1]));
+            }
+            s.regions_outline_positions = Some(outline);
+            s.regions_outline_mercator = s
+                .regions_outline_positions
+                .as_ref()
+                .map(|pos| world_segs_to_mercator_clipped(pos));
+        } else {
+            s.regions_positions = None;
+            s.regions_mercator = None;
+            s.regions_outline_positions = None;
+            s.regions_outline_mercator = None;
+        }
 
         // Uploaded
         if let Some(w) = s.uploaded_world.as_ref() {
@@ -3648,6 +4182,20 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
                 .uploaded_regions_positions
                 .as_ref()
                 .map(|pos| world_tris_to_mercator_clipped(pos));
+
+            s.uploaded_regions_outline_positions = Some({
+                let mut out: Vec<[f32; 3]> =
+                    Vec::with_capacity(snap.area_outline_segments.len() * 2);
+                for seg in snap.area_outline_segments {
+                    out.push(ecef_vec3_to_viewer_f32(seg[0]));
+                    out.push(ecef_vec3_to_viewer_f32(seg[1]));
+                }
+                out
+            });
+            s.uploaded_regions_outline_mercator = s
+                .uploaded_regions_outline_positions
+                .as_ref()
+                .map(|pos| world_segs_to_mercator_clipped(pos));
         } else {
             s.uploaded_centers = None;
             s.uploaded_mercator = None;
@@ -3655,6 +4203,8 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
             s.uploaded_corridors_mercator = None;
             s.uploaded_regions_positions = None;
             s.uploaded_regions_mercator = None;
+            s.uploaded_regions_outline_positions = None;
+            s.uploaded_regions_outline_mercator = None;
         }
 
         // Feed layers (points).
@@ -3675,7 +4225,7 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
             .as_ref()
             .map(|pos| world_tris_to_mercator_clipped(pos));
 
-        let styles = rebuild_styles_table(&mut s);
+        let mut style_alloc = DynamicStyleAllocator::new(rebuild_styles_table(&mut s));
 
         let mut points: Vec<CityVertex> = Vec::new();
         let mut lines: Vec<CorridorVertex> = Vec::new();
@@ -3689,16 +4239,74 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
         let mut lines2d: Vec<Segment2DInstance> = Vec::new();
         let mut grid2d: Vec<Segment2DInstance> = Vec::new();
 
+        let mut uploaded_points_from_chunk = false;
+        let mut uploaded_lines_from_chunk = false;
+        let mut uploaded_polys_from_chunk = false;
+
         // Points (instanced)
         if s.cities_style.visible
             && let Some(centers) = s.cities_centers.as_deref()
         {
             points.extend(build_city_vertices(centers, STYLE_CITIES));
         }
-        if s.uploaded_points_style.visible
-            && let Some(centers) = s.uploaded_centers.as_deref()
-        {
-            points.extend(build_city_vertices(centers, STYLE_UPLOADED_POINTS));
+        if s.uploaded_points_style.visible {
+            if let Some(chunk) = s.uploaded_chunk.as_ref() {
+                let base = style_alloc
+                    .get(STYLE_UPLOADED_POINTS)
+                    .unwrap_or_else(default_style);
+                let rules: &[StyleRule] = s
+                    .layer_rules
+                    .get("uploaded_points")
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+
+                let mut emitted = 0usize;
+                for f in &chunk.features {
+                    use formats::VectorGeometry::*;
+                    match &f.geometry {
+                        Point(p) => {
+                            let center = lon_lat_deg_to_world(p.lon_deg, p.lat_deg);
+                            let mut st = base;
+                            apply_simplestyle_properties(&mut st, "point", &f.properties);
+                            apply_rules_to_style(&mut st, rules, "point", &f.properties);
+                            let style_id = style_alloc.alloc(st);
+                            points.push(CityVertex { center, style_id });
+                            points2d.push(Point2DInstance {
+                                center_m: viewer_to_mercator_m(&center),
+                                style_id,
+                                _pad0: 0,
+                            });
+                            emitted += 1;
+                        }
+                        MultiPoint(ps) => {
+                            for p in ps {
+                                if emitted >= MAX_UPLOADED_POINTS {
+                                    break;
+                                }
+                                let center = lon_lat_deg_to_world(p.lon_deg, p.lat_deg);
+                                let mut st = base;
+                                apply_simplestyle_properties(&mut st, "point", &f.properties);
+                                apply_rules_to_style(&mut st, rules, "point", &f.properties);
+                                let style_id = style_alloc.alloc(st);
+                                points.push(CityVertex { center, style_id });
+                                points2d.push(Point2DInstance {
+                                    center_m: viewer_to_mercator_m(&center),
+                                    style_id,
+                                    _pad0: 0,
+                                });
+                                emitted += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    if emitted >= MAX_UPLOADED_POINTS {
+                        break;
+                    }
+                }
+                uploaded_points_from_chunk = true;
+            } else if let Some(centers) = s.uploaded_centers.as_deref() {
+                points.extend(build_city_vertices(centers, STYLE_UPLOADED_POINTS));
+            }
         }
         for (feed_layer_id, layer) in &s.feed_layers {
             if layer.style.visible && !layer.centers.is_empty() {
@@ -3725,16 +4333,273 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
         {
             lines.extend(build_corridor_vertices(pos, STYLE_CORRIDORS));
         }
-        if s.uploaded_corridors_style.visible
-            && let Some(pos) = s.uploaded_corridors_positions.as_deref()
-        {
-            lines.extend(build_corridor_vertices(pos, STYLE_UPLOADED_CORRIDORS));
+        if s.uploaded_corridors_style.visible {
+            if let Some(chunk) = s.uploaded_chunk.as_ref() {
+                let base = style_alloc
+                    .get(STYLE_UPLOADED_CORRIDORS)
+                    .unwrap_or_else(default_style);
+                let rules: &[StyleRule] = s
+                    .layer_rules
+                    .get("uploaded_corridors")
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+
+                let mut seg_positions: Vec<[f32; 3]> = Vec::new();
+                let mut seg_style_ids: Vec<u32> = Vec::new();
+
+                for f in &chunk.features {
+                    use formats::VectorGeometry::*;
+
+                    let mut st = base;
+                    apply_simplestyle_properties(&mut st, "line", &f.properties);
+                    apply_rules_to_style(&mut st, rules, "line", &f.properties);
+                    let style_id = style_alloc.alloc(st);
+
+                    let push_line = |seg_positions: &mut Vec<[f32; 3]>,
+                                     seg_style_ids: &mut Vec<u32>,
+                                     lines2d: &mut Vec<Segment2DInstance>,
+                                     line: &[formats::GeoPoint],
+                                     style_id: u32| {
+                        if line.len() < 2 {
+                            return;
+                        }
+                        for seg in line.windows(2) {
+                            if seg_style_ids.len() >= MAX_UPLOADED_LINE_SEGMENTS {
+                                break;
+                            }
+                            let a = lon_lat_deg_to_world(seg[0].lon_deg, seg[0].lat_deg);
+                            let b = lon_lat_deg_to_world(seg[1].lon_deg, seg[1].lat_deg);
+                            seg_positions.push(a);
+                            seg_positions.push(b);
+                            seg_style_ids.push(style_id);
+
+                            // 2D/WebMercator instance for this segment.
+                            let (lon0, lat0) = world_to_lon_lat_fast_deg(a);
+                            let (lon1, lat1) = world_to_lon_lat_fast_deg(b);
+                            let Some(((clon0, clat0), (clon1, clat1))) =
+                                clip_segment_lat_band((lon0, lat0), (lon1, lat1))
+                            else {
+                                continue;
+                            };
+                            let ax = mercator_x_m(clon0);
+                            let ay = mercator_y_m(clat0);
+                            let bx0 = mercator_x_m(clon1);
+                            let by = mercator_y_m(clat1);
+                            let bx = unwrap_mercator_x_m(ax, bx0);
+                            lines2d.push(Segment2DInstance {
+                                a_m: [ax as f32, ay as f32],
+                                b_m: [bx as f32, by as f32],
+                                style_id,
+                                _pad0: 0,
+                            });
+                        }
+                    };
+
+                    match &f.geometry {
+                        LineString(line) => push_line(
+                            &mut seg_positions,
+                            &mut seg_style_ids,
+                            &mut lines2d,
+                            line,
+                            style_id,
+                        ),
+                        MultiLineString(lines) => {
+                            for line in lines {
+                                if seg_style_ids.len() >= MAX_UPLOADED_LINE_SEGMENTS {
+                                    break;
+                                }
+                                push_line(
+                                    &mut seg_positions,
+                                    &mut seg_style_ids,
+                                    &mut lines2d,
+                                    line,
+                                    style_id,
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    if seg_style_ids.len() >= MAX_UPLOADED_LINE_SEGMENTS {
+                        break;
+                    }
+                }
+
+                if !seg_positions.is_empty() {
+                    lines.extend(build_corridor_vertices_with_style_ids(
+                        &seg_positions,
+                        &seg_style_ids,
+                    ));
+                }
+                uploaded_lines_from_chunk = true;
+            } else if let Some(pos) = s.uploaded_corridors_positions.as_deref() {
+                lines.extend(build_corridor_vertices(pos, STYLE_UPLOADED_CORRIDORS));
+            }
         }
         if s.selection_style.visible
             && let Some(pos) = s.selection_line_positions.as_deref()
             && !pos.is_empty()
         {
             lines.extend(build_corridor_vertices(pos, STYLE_SELECTION_LINE));
+        }
+
+        // Uploaded polygons (per-feature fill + optional stroke)
+        if s.uploaded_regions_style.visible
+            && let Some(chunk) = s.uploaded_chunk.as_ref()
+        {
+            let base_fill = style_alloc
+                .get(STYLE_UPLOADED_REGIONS)
+                .unwrap_or_else(default_style);
+            let base_stroke = style_alloc
+                .get(STYLE_UPLOADED_REGIONS_STROKE)
+                .unwrap_or_else(default_style);
+            let rules: &[StyleRule] = s
+                .layer_rules
+                .get("uploaded_regions")
+                .map(|v| v.as_slice())
+                .unwrap_or(&[]);
+
+            let mut outline_positions: Vec<[f32; 3]> = Vec::new();
+            let mut outline_style_ids: Vec<u32> = Vec::new();
+
+            for f in &chunk.features {
+                use formats::VectorGeometry::*;
+
+                let mut process_poly = |rings: &Vec<Vec<formats::GeoPoint>>| {
+                    // Fill style
+                    let mut fill = base_fill;
+                    apply_simplestyle_fill_properties(&mut fill, &f.properties);
+                    apply_rules_to_style(&mut fill, rules, "polygon", &f.properties);
+                    let fill_id = style_alloc.alloc(fill);
+
+                    // Stroke style (note: base may be disabled if layer stroke width=0)
+                    let mut stroke = base_stroke;
+                    apply_simplestyle_properties(&mut stroke, "polygon", &f.properties);
+                    apply_rules_to_style(&mut stroke, rules, "polygon", &f.properties);
+                    let stroke_enabled = stroke.width_px > 0.0 && stroke.color[3] > 0.0;
+                    let stroke_id = if stroke_enabled {
+                        Some(style_alloc.alloc(stroke))
+                    } else {
+                        None
+                    };
+
+                    // Triangulate into world triangles.
+                    let tris = triangulate_geo_polygon_rings_to_world_tris(rings);
+                    if tris.len() > MAX_UPLOADED_POLY_VERTS {
+                        return;
+                    }
+                    polys.reserve(tris.len());
+                    for p in &tris {
+                        polys.push(OverlayVertex {
+                            position: *p,
+                            style_id: fill_id,
+                        });
+                    }
+
+                    // 2D mercator triangles for this feature.
+                    let tri2d = world_tris_to_mercator_clipped(&tris);
+                    polys2d.reserve(tri2d.len());
+                    for tri in tri2d.chunks_exact(3).take(2_000_000) {
+                        let anchor_x_m = tri[0][0];
+                        polys2d.push(Overlay2DVertex {
+                            position_m: tri[0],
+                            anchor_x_m,
+                            style_id: fill_id,
+                        });
+                        polys2d.push(Overlay2DVertex {
+                            position_m: tri[1],
+                            anchor_x_m,
+                            style_id: fill_id,
+                        });
+                        polys2d.push(Overlay2DVertex {
+                            position_m: tri[2],
+                            anchor_x_m,
+                            style_id: fill_id,
+                        });
+                    }
+
+                    // Outline segments (stroke)
+                    if let Some(stroke_id) = stroke_id {
+                        let segs = outline_segments_from_geo_rings(rings);
+                        outline_positions.reserve(segs.len() * 2);
+                        outline_style_ids.reserve(segs.len());
+                        for (a, b) in segs {
+                            if outline_style_ids.len() >= MAX_UPLOADED_LINE_SEGMENTS {
+                                break;
+                            }
+                            outline_positions.push(a);
+                            outline_positions.push(b);
+                            outline_style_ids.push(stroke_id);
+
+                            // 2D/WebMercator instance for this segment.
+                            let (lon0, lat0) = world_to_lon_lat_fast_deg(a);
+                            let (lon1, lat1) = world_to_lon_lat_fast_deg(b);
+                            let Some(((clon0, clat0), (clon1, clat1))) =
+                                clip_segment_lat_band((lon0, lat0), (lon1, lat1))
+                            else {
+                                continue;
+                            };
+                            let ax = mercator_x_m(clon0);
+                            let ay = mercator_y_m(clat0);
+                            let bx0 = mercator_x_m(clon1);
+                            let by = mercator_y_m(clat1);
+                            let bx = unwrap_mercator_x_m(ax, bx0);
+                            lines2d.push(Segment2DInstance {
+                                a_m: [ax as f32, ay as f32],
+                                b_m: [bx as f32, by as f32],
+                                style_id: stroke_id,
+                                _pad0: 0,
+                            });
+                        }
+                    }
+                };
+
+                match &f.geometry {
+                    Polygon(rings) => process_poly(rings),
+                    MultiPolygon(polys_in) => {
+                        for rings in polys_in {
+                            process_poly(rings);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+
+            if !outline_positions.is_empty() {
+                lines.extend(build_corridor_vertices_with_style_ids(
+                    &outline_positions,
+                    &outline_style_ids,
+                ));
+            }
+
+            uploaded_polys_from_chunk = true;
+        }
+
+        // Polygon outlines (as lines)
+        if s.base_regions_style.visible
+            && s.base_regions_style.stroke_width_px > 0.0
+            && s.base_regions_style.stroke_color[3] > 0.0
+            && let Some(pos) = s.base_regions_outline_positions.as_deref()
+            && !pos.is_empty()
+        {
+            lines.extend(build_corridor_vertices(pos, STYLE_BASE_REGIONS_STROKE));
+        }
+        if s.regions_style.visible
+            && s.regions_style.stroke_width_px > 0.0
+            && s.regions_style.stroke_color[3] > 0.0
+            && let Some(pos) = s.regions_outline_positions.as_deref()
+            && !pos.is_empty()
+        {
+            lines.extend(build_corridor_vertices(pos, STYLE_REGIONS_STROKE));
+        }
+        if s.uploaded_regions_style.visible
+            && s.uploaded_regions_style.stroke_width_px > 0.0
+            && s.uploaded_regions_style.stroke_color[3] > 0.0
+            && !uploaded_polys_from_chunk
+            && let Some(pos) = s.uploaded_regions_outline_positions.as_deref()
+            && !pos.is_empty()
+        {
+            lines.extend(build_corridor_vertices(pos, STYLE_UPLOADED_REGIONS_STROKE));
         }
 
         // Base polygons (triangles)
@@ -3784,6 +4649,7 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
             }));
         }
         if s.uploaded_regions_style.visible
+            && !uploaded_polys_from_chunk
             && let Some(pos) = s.uploaded_regions_positions.as_deref()
         {
             let style_id = STYLE_UPLOADED_REGIONS;
@@ -3828,6 +4694,7 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
             }
         }
         if s.uploaded_regions_style.visible
+            && !uploaded_polys_from_chunk
             && let Some(pos) = s.uploaded_regions_mercator.as_deref()
         {
             polys2d.reserve(pos.len());
@@ -3889,7 +4756,8 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
                 });
             }
         }
-        if s.uploaded_corridors_style.visible
+        if !uploaded_lines_from_chunk
+            && s.uploaded_corridors_style.visible
             && let Some(pos) = s.uploaded_corridors_mercator.as_deref()
         {
             lines2d.reserve(pos.len() / 2);
@@ -3917,6 +4785,57 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
             }
         }
 
+        // 2D polygon outlines (Mercator segments)
+        if s.base_regions_style.visible
+            && s.base_regions_style.stroke_width_px > 0.0
+            && s.base_regions_style.stroke_color[3] > 0.0
+            && let Some(pos) = s.base_regions_outline_mercator.as_deref()
+            && !pos.is_empty()
+        {
+            lines2d.reserve(pos.len() / 2);
+            for seg in pos.chunks_exact(2).take(1_500_000) {
+                lines2d.push(Segment2DInstance {
+                    a_m: seg[0],
+                    b_m: seg[1],
+                    style_id: STYLE_BASE_REGIONS_STROKE,
+                    _pad0: 0,
+                });
+            }
+        }
+        if s.regions_style.visible
+            && s.regions_style.stroke_width_px > 0.0
+            && s.regions_style.stroke_color[3] > 0.0
+            && let Some(pos) = s.regions_outline_mercator.as_deref()
+            && !pos.is_empty()
+        {
+            lines2d.reserve(pos.len() / 2);
+            for seg in pos.chunks_exact(2).take(1_500_000) {
+                lines2d.push(Segment2DInstance {
+                    a_m: seg[0],
+                    b_m: seg[1],
+                    style_id: STYLE_REGIONS_STROKE,
+                    _pad0: 0,
+                });
+            }
+        }
+        if s.uploaded_regions_style.visible
+            && s.uploaded_regions_style.stroke_width_px > 0.0
+            && s.uploaded_regions_style.stroke_color[3] > 0.0
+            && !uploaded_polys_from_chunk
+            && let Some(pos) = s.uploaded_regions_outline_mercator.as_deref()
+            && !pos.is_empty()
+        {
+            lines2d.reserve(pos.len() / 2);
+            for seg in pos.chunks_exact(2).take(1_500_000) {
+                lines2d.push(Segment2DInstance {
+                    a_m: seg[0],
+                    b_m: seg[1],
+                    style_id: STYLE_UPLOADED_REGIONS_STROKE,
+                    _pad0: 0,
+                });
+            }
+        }
+
         // 2D points (Mercator)
         if s.cities_style.visible
             && let Some(centers) = s.cities_mercator.as_deref()
@@ -3930,7 +4849,8 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
                 });
             }
         }
-        if s.uploaded_points_style.visible
+        if !uploaded_points_from_chunk
+            && s.uploaded_points_style.visible
             && let Some(centers) = s.uploaded_mercator.as_deref()
         {
             points2d.reserve(centers.len());
@@ -4000,6 +4920,8 @@ fn rebuild_overlays_and_upload() -> Result<(), JsValue> {
                 }
             }
         }
+
+        let styles = style_alloc.into_styles();
 
         if let Some(ctx) = &mut s.wgpu {
             set_styles(ctx, &styles);
@@ -4122,6 +5044,7 @@ pub fn set_view_mode(mode: &str) -> Result<(), JsValue> {
                     s.camera.pitch_rad = pitch_rad;
                     s.camera.distance = distance;
                     s.camera.target = [0.0, 0.0, 0.0];
+                    s.camera.pan_px = [0.0, 0.0];
 
                     // Sync globe controller with the new camera state
                     s.globe_controller.set_from_yaw_pitch(yaw_rad, pitch_rad);
@@ -4163,7 +5086,15 @@ pub fn camera_reset() -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
         match s.view_mode {
-            ViewMode::ThreeD => s.camera = CameraState::default(),
+            ViewMode::ThreeD => {
+                s.camera = CameraState::default();
+                let yaw = s.camera.yaw_rad;
+                let pitch = s.camera.pitch_rad;
+                let distance = s.camera.distance;
+                s.globe_controller.set_from_yaw_pitch(yaw, pitch);
+                s.globe_controller.set_distance(distance);
+                s.auto_rotate_last_user_time_s = wall_clock_seconds();
+            }
             ViewMode::TwoD => s.camera_2d = Camera2DState::default(),
         }
     });
@@ -4232,7 +5163,7 @@ pub fn is_globe_inertia_active() -> bool {
 ///
 /// Intended usage: call with pointer delta in pixels.
 /// **Contract (3D):** Drag left => surface facing user moves left (yaw increases).
-///   Drag up => surface facing user tilts up (pitch increases).
+///   Drag up/down => tilt pitch; direction controlled by `invert_orbit_y`.
 ///   Sensitivity scaled so full shorter-axis drag ≈ 180°.
 /// **Contract (2D):** Treated as pan — map follows cursor direction.
 #[wasm_bindgen]
@@ -4302,12 +5233,10 @@ pub fn camera_drag_begin_with_button(x_px: f64, y_px: f64, button: i32) -> Resul
         s.drag_last_y_px = y_px;
         match s.view_mode {
             ViewMode::ThreeD => {
-                // Left-click (orbit) resets target to origin so rotation
-                // is always around the globe center, not a panned offset.
-                // Right-click (pan) keeps the current target.
-                if button == 0 {
-                    s.camera.target = [0.0, 0.0, 0.0];
-                }
+                // Keep the current target for both orbit and pan.
+                // This ensures that a prior 3D pan (screen-space offset) is not
+                // canceled when the user starts orbiting, avoiding a perceived
+                // “snap back” to the default centered view.
                 let canvas_w = s.canvas_width;
                 let canvas_h = s.canvas_height;
                 s.globe_controller.set_canvas_size(canvas_w, canvas_h);
@@ -4365,6 +5294,7 @@ pub fn camera_drag_move(x_px: f64, y_px: f64) -> Result<(), JsValue> {
 pub fn camera_drag_end() -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
+        s.auto_rotate_last_user_time_s = wall_clock_seconds();
         s.arcball_last_unit = None;
         if matches!(s.view_mode, ViewMode::ThreeD) {
             s.globe_controller.on_pointer_up();
@@ -4373,12 +5303,12 @@ pub fn camera_drag_end() -> Result<(), JsValue> {
     Ok(())
 }
 
-/// Pan the camera target (translates the globe in 3D, pans map in 2D).
+/// Pan the view (translates the globe in screen space in 3D, pans map in 2D).
 ///
 /// **Contract (3D):** Right-click drag moves the entire globe in the viewport.
 ///   Drag right => globe moves right on screen.  Drag up => globe moves up.
-///   The target offset is clamped to `max_target_offset_m` to keep the globe
-///   visible.  Double-click or R key resets target to origin.
+///   The pan offset is clamped to `max_target_offset_m` (converted to screen units)
+///   to keep the globe visible.  Double-click or R key resets the camera.
 /// **Contract (2D):** Same as left-drag pan — map follows cursor.
 #[wasm_bindgen]
 pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
@@ -4388,37 +5318,26 @@ pub fn camera_pan(delta_x_px: f64, delta_y_px: f64) -> Result<(), JsValue> {
         let cfg = s.controls;
         match s.view_mode {
             ViewMode::ThreeD => {
-                // Compute camera right/up vectors in world space to translate
-                // the target perpendicular to the view direction.
-                let dir_cam = vec3_normalize([
-                    s.camera.pitch_rad.cos() * s.camera.yaw_rad.cos(),
-                    s.camera.pitch_rad.sin(),
-                    -s.camera.pitch_rad.cos() * s.camera.yaw_rad.sin(),
-                ]);
-                let world_up = [0.0, 1.0, 0.0];
-                let right = vec3_normalize(vec3_cross(world_up, dir_cam));
-                let up = vec3_cross(dir_cam, right);
-
-                // Scale: at distance D, one pixel ≈ D * fov_y / viewport_height
-                // Use the shorter dimension for consistent feel.
-                let fov_y_rad = 45f64.to_radians();
-                let h = s.canvas_height.max(1.0);
-                let px_to_world = s.camera.distance * (fov_y_rad / h) * cfg.pan_sensitivity_3d;
-
                 let dy_sign = if cfg.invert_pan_y_3d { -1.0 } else { 1.0 };
 
-                // Move target: right-drag right => target moves right => globe moves right.
-                let offset_right = vec3_mul(right, -delta_x_px * px_to_world);
-                let offset_up = vec3_mul(up, dy_sign * delta_y_px * px_to_world);
-                let new_target = vec3_add(vec3_add(s.camera.target, offset_right), offset_up);
+                // Pan as a pure screen-space offset.
+                // This keeps orbit pivot stable (no wobble after panning) and matches the
+                // UX contract: “moves the entire globe in the viewport”.
+                s.camera.pan_px[0] += delta_x_px * cfg.pan_sensitivity_3d;
+                s.camera.pan_px[1] += (dy_sign * delta_y_px) * cfg.pan_sensitivity_3d;
 
-                // Clamp target offset to prevent globe from going completely off-screen.
-                let r = vec3_dot(new_target, new_target).sqrt();
-                if r <= cfg.max_target_offset_m {
-                    s.camera.target = new_target;
-                } else {
-                    let scale = cfg.max_target_offset_m / r;
-                    s.camera.target = vec3_mul(new_target, scale);
+                // Clamp using existing world-unit limit (max_target_offset_m), converting
+                // through the same px→world scale used by the previous implementation.
+                let fov_y_rad = 45f64.to_radians();
+                let h = s.canvas_height.max(1.0);
+                let px_to_world = s.camera.distance * (fov_y_rad / h);
+                let pan_world_x = s.camera.pan_px[0] * px_to_world;
+                let pan_world_y = s.camera.pan_px[1] * px_to_world;
+                let pan_world_r = (pan_world_x * pan_world_x + pan_world_y * pan_world_y).sqrt();
+                if pan_world_r > cfg.max_target_offset_m {
+                    let scale = cfg.max_target_offset_m / pan_world_r;
+                    s.camera.pan_px[0] *= scale;
+                    s.camera.pan_px[1] *= scale;
                 }
             }
             ViewMode::TwoD => {
@@ -4537,6 +5456,9 @@ pub fn load_base_world() {
         s.base_world_error = None;
         s.base_world_source = Some("world.json".to_string());
         s.base_count_polys = 0;
+
+        // World content changed; refresh cached label anchors/layout.
+        s.labels_gen = s.labels_gen.wrapping_add(1);
     });
 
     ensure_base_world_loaded();
@@ -4582,9 +5504,143 @@ pub fn set_labels_enabled(enabled: bool) -> Result<(), JsValue> {
         s.labels_enabled = enabled;
         // Force a refresh.
         s.labels_gen = s.labels_gen.wrapping_add(1);
-        s.labels2d_job = None;
-        s.labels2d_last_snapshot = None;
-        s.labels2d_placed.clear();
+    });
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn get_label_settings() -> String {
+    with_state(|state| {
+        let s = state.borrow();
+        let st = &s.labels_settings.style;
+        format!(
+            r#"{{"enabled":{},"font_size_px":{},"font_family":"{}","color":[{},{},{},{}],"halo_color":[{},{},{},{}],"halo_width_px":{},"max_labels":{}}}"#,
+            s.labels_enabled,
+            st.font_size_px,
+            s.labels_settings.font_family.replace('"', ""),
+            st.color[0],
+            st.color[1],
+            st.color[2],
+            st.color[3],
+            st.halo_color[0],
+            st.halo_color[1],
+            st.halo_color[2],
+            st.halo_color[3],
+            st.halo_width_px,
+            s.labels_settings.max_labels,
+        )
+    })
+}
+
+#[wasm_bindgen]
+pub fn set_label_font_family(font_family: String) -> Result<(), JsValue> {
+    let family = font_family.trim();
+    if family.len() > 256 {
+        return Err(JsValue::from_str("font family too long"));
+    }
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.labels_settings.font_family = family.to_string();
+        s.labels_gen = s.labels_gen.wrapping_add(1);
+        s.labels_atlas = None;
+    });
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn get_layer_label_settings() -> String {
+    with_state(|state| {
+        let s = state.borrow();
+        format!(
+            r#"{{"world_base":{},"cities":{},"corridors":{},"regions":{},"uploaded":{}}}"#,
+            s.labels_base_world,
+            s.labels_cities,
+            s.labels_corridors,
+            s.labels_regions,
+            s.labels_uploaded,
+        )
+    })
+}
+
+#[wasm_bindgen]
+pub fn set_layer_labels_enabled(layer: String, enabled: bool) -> Result<(), JsValue> {
+    let layer = layer.trim().to_ascii_lowercase();
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        match layer.as_str() {
+            "world_base" | "world-base" | "base" => s.labels_base_world = enabled,
+            "cities" => s.labels_cities = enabled,
+            "corridors" => s.labels_corridors = enabled,
+            "regions" => s.labels_regions = enabled,
+            "uploaded" => s.labels_uploaded = enabled,
+            _ => {
+                // Unknown layer name: ignore.
+            }
+        }
+        s.labels_gen = s.labels_gen.wrapping_add(1);
+    });
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_label_font_size_px(font_size_px: f64) -> Result<(), JsValue> {
+    if !font_size_px.is_finite() {
+        return Err(JsValue::from_str("font size must be finite"));
+    }
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.labels_settings.style.font_size_px = (font_size_px as f32).clamp(6.0, 64.0);
+        s.labels_gen = s.labels_gen.wrapping_add(1);
+        s.labels_atlas = None;
+    });
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_label_color_rgba(r: f64, g: f64, b: f64, a: f64) -> Result<(), JsValue> {
+    if !(r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite()) {
+        return Err(JsValue::from_str("label color must be finite"));
+    }
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.labels_settings.style.color = [r as f32, g as f32, b as f32, a as f32];
+        s.labels_gen = s.labels_gen.wrapping_add(1);
+    });
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_label_halo_color_rgba(r: f64, g: f64, b: f64, a: f64) -> Result<(), JsValue> {
+    if !(r.is_finite() && g.is_finite() && b.is_finite() && a.is_finite()) {
+        return Err(JsValue::from_str("halo color must be finite"));
+    }
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.labels_settings.style.halo_color = [r as f32, g as f32, b as f32, a as f32];
+        s.labels_gen = s.labels_gen.wrapping_add(1);
+    });
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_label_halo_width_px(halo_width_px: f64) -> Result<(), JsValue> {
+    if !halo_width_px.is_finite() {
+        return Err(JsValue::from_str("halo width must be finite"));
+    }
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.labels_settings.style.halo_width_px = (halo_width_px as f32).clamp(0.0, 12.0);
+        s.labels_gen = s.labels_gen.wrapping_add(1);
+    });
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_label_max_labels(max_labels: u32) -> Result<(), JsValue> {
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.labels_settings.max_labels = (max_labels as usize).clamp(50, 5000);
+        s.labels_gen = s.labels_gen.wrapping_add(1);
     });
     render_scene()
 }
@@ -4595,9 +5651,6 @@ pub fn clear_debug_labels() -> Result<(), JsValue> {
         let mut s = state.borrow_mut();
         s.debug_labels.clear();
         s.labels_gen = s.labels_gen.wrapping_add(1);
-        s.labels2d_job = None;
-        s.labels2d_last_snapshot = None;
-        s.labels2d_placed.clear();
     });
     render_scene()
 }
@@ -4623,22 +5676,16 @@ pub fn add_debug_label_with_priority(
     let lon = wrap_lon_deg(lon_deg);
     let lat = clamp(lat_deg, -MERCATOR_MAX_LAT_DEG, MERCATOR_MAX_LAT_DEG);
 
-    let x_m = mercator_x_m(lon) as f32;
-    let y_m = mercator_y_m(lat) as f32;
     let viewer_pos = lon_lat_deg_to_world(lon, lat);
 
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.debug_labels.push(DebugLabel {
             text,
-            mercator_m: [x_m, y_m],
             viewer_pos,
             priority: priority as f32,
         });
         s.labels_gen = s.labels_gen.wrapping_add(1);
-        // Keep prior placements, but restart the job so it can incorporate the new label.
-        s.labels2d_job = None;
-        s.labels2d_last_snapshot = None;
     });
 
     render_scene()
@@ -4695,10 +5742,15 @@ pub fn set_globe_transparent(transparent: bool) -> Result<(), JsValue> {
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.globe_transparent = transparent;
+        if !transparent {
+            // Force base surface to fully opaque when globe transparency is off.
+            s.base_regions_style.color[3] = 1.0;
+        }
         if let Some(ctx) = &mut s.wgpu {
             wgpu::set_globe_transparent(ctx, transparent);
         }
     });
+    let _ = rebuild_styles_and_upload_only();
     render_scene()
 }
 
@@ -4773,6 +5825,430 @@ fn color_to_hex(rgb: [f32; 3]) -> String {
     let g = (rgb[1].clamp(0.0, 1.0) * 255.0).round() as u8;
     let b = (rgb[2].clamp(0.0, 1.0) * 255.0).round() as u8;
     format!("#{:02x}{:02x}{:02x}", r, g, b)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct StyleKey {
+    rgba: [u8; 4],
+    lift_mm: i32,
+    size_centi: u16,
+    width_centi: u16,
+}
+
+fn style_key(style: &Style) -> StyleKey {
+    let rgba = [
+        (style.color[0].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (style.color[1].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (style.color[2].clamp(0.0, 1.0) * 255.0).round() as u8,
+        (style.color[3].clamp(0.0, 1.0) * 255.0).round() as u8,
+    ];
+
+    let lift_mm = (style.lift_m.clamp(-10_000_000.0, 10_000_000.0) * 1000.0).round() as i32;
+    let size_centi = (style.size_px.clamp(0.0, 512.0) * 100.0).round() as u16;
+    let width_centi = (style.width_px.clamp(0.0, 512.0) * 100.0).round() as u16;
+    StyleKey {
+        rgba,
+        lift_mm,
+        size_centi,
+        width_centi,
+    }
+}
+
+struct DynamicStyleAllocator {
+    styles: Vec<Style>,
+    map: HashMap<StyleKey, u32>,
+}
+
+impl DynamicStyleAllocator {
+    fn new(styles: Vec<Style>) -> Self {
+        let mut map: HashMap<StyleKey, u32> = HashMap::new();
+        for (i, st) in styles.iter().enumerate() {
+            let id = i as u32;
+            map.insert(style_key(st), id);
+        }
+        Self { styles, map }
+    }
+
+    fn alloc(&mut self, style: Style) -> u32 {
+        let key = style_key(&style);
+        if let Some(id) = self.map.get(&key).copied() {
+            return id;
+        }
+        let id = self.styles.len() as u32;
+        self.styles.push(style);
+        self.map.insert(key, id);
+        id
+    }
+
+    fn get(&self, id: u32) -> Option<Style> {
+        self.styles.get(id as usize).copied()
+    }
+
+    fn into_styles(self) -> Vec<Style> {
+        self.styles
+    }
+}
+
+fn json_to_f64(v: &serde_json::Value) -> Option<f64> {
+    match v {
+        serde_json::Value::Number(n) => n.as_f64(),
+        serde_json::Value::String(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+fn json_value_matches(rule_value: &serde_json::Value, prop_value: &serde_json::Value) -> bool {
+    use serde_json::Value;
+    match rule_value {
+        Value::Array(arr) => arr.iter().any(|rv| json_value_matches(rv, prop_value)),
+        Value::String(rs) => prop_value.as_str().is_some_and(|ps| ps == rs),
+        Value::Bool(rb) => prop_value.as_bool().is_some_and(|pb| pb == *rb),
+        Value::Number(_) => {
+            let Some(rn) = json_to_f64(rule_value) else {
+                return false;
+            };
+            let Some(pn) = json_to_f64(prop_value) else {
+                return false;
+            };
+            (rn - pn).abs() <= 1e-9
+        }
+        _ => rule_value == prop_value,
+    }
+}
+
+fn geometry_tag_matches(rule: Option<&str>, actual: &str) -> bool {
+    let Some(rule) = rule else {
+        return true;
+    };
+    let r = rule.trim().to_ascii_lowercase();
+    if r.is_empty() || r == "any" {
+        return true;
+    }
+    r == actual
+}
+
+fn rule_matches(
+    rule: &StyleRule,
+    geometry_tag: &str,
+    props: &serde_json::Map<String, serde_json::Value>,
+) -> bool {
+    if !geometry_tag_matches(rule.geometry.as_deref(), geometry_tag) {
+        return false;
+    }
+    let Some(v) = props.get(&rule.property) else {
+        return false;
+    };
+    json_value_matches(&rule.equals, v)
+}
+
+fn apply_rule_to_style(style: &mut Style, rule: &StyleRule) {
+    if let Some(hex) = rule.color_hex.as_deref()
+        && let Some(rgb) = parse_hex_color(hex)
+    {
+        style.color[0] = rgb[0];
+        style.color[1] = rgb[1];
+        style.color[2] = rgb[2];
+    }
+    if let Some(a) = rule.opacity {
+        style.color[3] = a.clamp(0.0, 1.0);
+    }
+    if let Some(sz) = rule.size_px {
+        style.size_px = sz.clamp(0.0, 256.0);
+    }
+    if let Some(w) = rule.width_px {
+        style.width_px = w.clamp(0.0, 256.0);
+    }
+    if let Some(lift) = rule.lift {
+        style.lift_m = (lift * (WGS84_A as f32)).clamp(-10_000_000.0, 10_000_000.0);
+    }
+}
+
+fn apply_rules_to_style(
+    style: &mut Style,
+    rules: &[StyleRule],
+    geometry_tag: &str,
+    props: &serde_json::Map<String, serde_json::Value>,
+) {
+    for rule in rules {
+        if rule_matches(rule, geometry_tag, props) {
+            apply_rule_to_style(style, rule);
+        }
+    }
+}
+
+fn apply_simplestyle_properties(
+    style: &mut Style,
+    geometry_tag: &str,
+    props: &serde_json::Map<String, serde_json::Value>,
+) {
+    // https://github.com/mapbox/simplestyle-spec (subset)
+    if geometry_tag == "point" {
+        if let Some(c) = props.get("marker-color").and_then(|v| v.as_str())
+            && let Some(rgb) = parse_hex_color(c)
+        {
+            style.color[0] = rgb[0];
+            style.color[1] = rgb[1];
+            style.color[2] = rgb[2];
+        }
+        if let Some(a) = props.get("marker-opacity").and_then(json_to_f64) {
+            style.color[3] = (a as f32).clamp(0.0, 1.0);
+        }
+        if let Some(sz) = props.get("marker-size") {
+            if let Some(s) = sz.as_str() {
+                let v = match s.trim().to_ascii_lowercase().as_str() {
+                    "small" | "s" => 4.0,
+                    "medium" | "m" => 8.0,
+                    "large" | "l" => 12.0,
+                    _ => style.size_px,
+                };
+                style.size_px = v;
+            } else if let Some(n) = json_to_f64(sz) {
+                style.size_px = (n as f32).clamp(0.0, 256.0);
+            }
+        }
+        return;
+    }
+
+    // line / polygon stroke
+    if let Some(c) = props.get("stroke").and_then(|v| v.as_str())
+        && let Some(rgb) = parse_hex_color(c)
+    {
+        style.color[0] = rgb[0];
+        style.color[1] = rgb[1];
+        style.color[2] = rgb[2];
+    }
+    if let Some(a) = props.get("stroke-opacity").and_then(json_to_f64) {
+        style.color[3] = (a as f32).clamp(0.0, 1.0);
+    }
+    if let Some(w) = props.get("stroke-width").and_then(json_to_f64) {
+        style.width_px = (w as f32).clamp(0.0, 256.0);
+    }
+}
+
+fn apply_simplestyle_fill_properties(
+    style: &mut Style,
+    props: &serde_json::Map<String, serde_json::Value>,
+) {
+    // https://github.com/mapbox/simplestyle-spec (subset)
+    if let Some(c) = props.get("fill").and_then(|v| v.as_str()) {
+        let c = c.trim();
+        if c.eq_ignore_ascii_case("none") || c.eq_ignore_ascii_case("transparent") {
+            style.color[3] = 0.0;
+        } else if let Some(rgb) = parse_hex_color(c) {
+            style.color[0] = rgb[0];
+            style.color[1] = rgb[1];
+            style.color[2] = rgb[2];
+        }
+    }
+    if let Some(a) = props.get("fill-opacity").and_then(json_to_f64) {
+        style.color[3] = (a as f32).clamp(0.0, 1.0);
+    }
+}
+
+fn outline_segments_from_geo_rings(rings: &[Vec<formats::GeoPoint>]) -> Vec<([f32; 3], [f32; 3])> {
+    const MAX_RING_VERTICES: usize = 200_000;
+    const MAX_TOTAL_SEGMENTS: usize = 2_000_000;
+
+    fn drop_closing_duplicate(points: &mut Vec<[f32; 3]>) {
+        if points.len() >= 2 {
+            let first = points[0];
+            let last = *points.last().unwrap();
+            let dx = (first[0] - last[0]).abs();
+            let dy = (first[1] - last[1]).abs();
+            let dz = (first[2] - last[2]).abs();
+            if dx < 1e-6 && dy < 1e-6 && dz < 1e-6 {
+                points.pop();
+            }
+        }
+    }
+
+    let mut out: Vec<([f32; 3], [f32; 3])> = Vec::new();
+    for ring in rings {
+        if ring.len() > MAX_RING_VERTICES {
+            continue;
+        }
+        let mut pts: Vec<[f32; 3]> = ring
+            .iter()
+            .map(|p| lon_lat_deg_to_world(p.lon_deg, p.lat_deg))
+            .filter(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite())
+            .collect();
+        drop_closing_duplicate(&mut pts);
+        pts.dedup_by(|a, b| {
+            (a[0] - b[0]).abs() < 1e-6 && (a[1] - b[1]).abs() < 1e-6 && (a[2] - b[2]).abs() < 1e-6
+        });
+        if pts.len() < 2 {
+            continue;
+        }
+        for seg in pts.windows(2) {
+            if out.len() >= MAX_TOTAL_SEGMENTS {
+                return out;
+            }
+            out.push((seg[0], seg[1]));
+        }
+        if out.len() >= MAX_TOTAL_SEGMENTS {
+            return out;
+        }
+        out.push((*pts.last().unwrap(), pts[0]));
+    }
+    out
+}
+
+fn triangulate_geo_polygon_rings_to_world_tris(rings: &[Vec<formats::GeoPoint>]) -> Vec<[f32; 3]> {
+    const MAX_RING_VERTICES: usize = 100_000;
+    const MAX_TOTAL_VERTICES: usize = 500_000;
+
+    fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+        a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+    }
+    fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+        [
+            a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0],
+        ]
+    }
+    fn normalize(v: [f64; 3]) -> [f64; 3] {
+        let l2 = dot(v, v);
+        if !(l2.is_finite()) || l2 <= 0.0 {
+            return v;
+        }
+        let inv = 1.0 / l2.sqrt();
+        [v[0] * inv, v[1] * inv, v[2] * inv]
+    }
+    fn centroid(points: &[[f64; 3]]) -> [f64; 3] {
+        let mut s = [0.0_f64, 0.0, 0.0];
+        for p in points {
+            s[0] += p[0];
+            s[1] += p[1];
+            s[2] += p[2];
+        }
+        let n = points.len().max(1) as f64;
+        [s[0] / n, s[1] / n, s[2] / n]
+    }
+    fn ellipsoid_normal_ecef(p: [f64; 3]) -> [f64; 3] {
+        let a2 = WGS84_A * WGS84_A;
+        let b2 = WGS84_B * WGS84_B;
+        normalize([p[0] / a2, p[1] / a2, p[2] / b2])
+    }
+    fn drop_closing_duplicate(points: &mut Vec<[f64; 3]>) {
+        if points.len() >= 2 {
+            let first = points[0];
+            let last = *points.last().unwrap();
+            if (first[0] - last[0]).abs() < 1e-9
+                && (first[1] - last[1]).abs() < 1e-9
+                && (first[2] - last[2]).abs() < 1e-9
+            {
+                points.pop();
+            }
+        }
+    }
+
+    let Some(outer) = rings.first() else {
+        return Vec::new();
+    };
+    if outer.len() < 3 {
+        return Vec::new();
+    }
+
+    let outer_world: Vec<[f64; 3]> = outer
+        .iter()
+        .map(|p| lon_lat_deg_to_world(p.lon_deg, p.lat_deg))
+        .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+        .filter(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite())
+        .collect();
+    if outer_world.len() < 3 {
+        return Vec::new();
+    }
+
+    let origin = centroid(&outer_world);
+    let n = ellipsoid_normal_ecef(origin);
+
+    let up = if n[2].abs() < 0.99 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [0.0, 1.0, 0.0]
+    };
+    let east = normalize(cross(up, n));
+    let north = cross(n, east);
+
+    let east_l2 = dot(east, east);
+    let north_l2 = dot(north, north);
+    if !(east_l2.is_finite() && north_l2.is_finite()) || east_l2 < 1e-20 || north_l2 < 1e-20 {
+        return Vec::new();
+    }
+
+    let mut vertices_3d: Vec<[f64; 3]> = Vec::new();
+    let mut coords_2d: Vec<f64> = Vec::new();
+    let mut hole_indices: Vec<usize> = Vec::new();
+    let mut have_outer = false;
+
+    for ring in rings {
+        if ring.len() > MAX_RING_VERTICES {
+            continue;
+        }
+        let mut ring_pts: Vec<[f64; 3]> = ring
+            .iter()
+            .map(|p| lon_lat_deg_to_world(p.lon_deg, p.lat_deg))
+            .map(|p| [p[0] as f64, p[1] as f64, p[2] as f64])
+            .filter(|p| p[0].is_finite() && p[1].is_finite() && p[2].is_finite())
+            .collect();
+        drop_closing_duplicate(&mut ring_pts);
+        ring_pts.dedup_by(|a, b| {
+            (a[0] - b[0]).abs() < 1e-9 && (a[1] - b[1]).abs() < 1e-9 && (a[2] - b[2]).abs() < 1e-9
+        });
+        if ring_pts.len() < 3 {
+            continue;
+        }
+
+        let mut tmp_vertices: Vec<[f64; 3]> = Vec::with_capacity(ring_pts.len());
+        let mut tmp_coords: Vec<f64> = Vec::with_capacity(ring_pts.len() * 2);
+        let mut projection_ok = true;
+        for p in ring_pts {
+            let v = [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+            let x = dot(v, east);
+            let y = dot(v, north);
+            if !(x.is_finite() && y.is_finite()) {
+                projection_ok = false;
+                break;
+            }
+            tmp_coords.push(x);
+            tmp_coords.push(y);
+            tmp_vertices.push(p);
+        }
+        if !projection_ok || tmp_vertices.len() < 3 {
+            continue;
+        }
+
+        if vertices_3d.len().saturating_add(tmp_vertices.len()) > MAX_TOTAL_VERTICES {
+            continue;
+        }
+
+        if have_outer {
+            hole_indices.push(vertices_3d.len());
+        } else {
+            have_outer = true;
+        }
+
+        coords_2d.extend(tmp_coords);
+        vertices_3d.extend(tmp_vertices);
+    }
+
+    if vertices_3d.len() < 3 {
+        return Vec::new();
+    }
+
+    let indices = match earcutr::earcut(&coords_2d, &hole_indices, 2) {
+        Ok(ix) => ix,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut out: Vec<[f32; 3]> = Vec::with_capacity(indices.len());
+    for idx in indices {
+        if let Some(v) = vertices_3d.get(idx) {
+            out.push([v[0] as f32, v[1] as f32, v[2] as f32]);
+        }
+    }
+    out
 }
 
 fn update_bounds(
@@ -5043,6 +6519,9 @@ fn ensure_base_world_loaded() {
             s.base_count_polys = polys;
             s.base_world_loading = false;
             s.surface_last_error = None;
+
+            // World content changed; refresh cached label anchors/layout.
+            s.labels_gen = s.labels_gen.wrapping_add(1);
         });
 
         let _ = rebuild_overlays_and_upload();
@@ -5067,6 +6546,9 @@ pub fn begin_base_world_stream() {
         s.base_world_error = None;
         s.base_world_source = Some("world.pmtiles".to_string());
         s.base_count_polys = 0;
+
+        // World content changed; refresh cached label anchors/layout.
+        s.labels_gen = s.labels_gen.wrapping_add(1);
     });
     let _ = rebuild_overlays_and_upload();
     let _ = render_scene();
@@ -5089,6 +6571,9 @@ pub fn append_base_world_geojson_chunk(geojson_text: String) -> Result<(), JsVal
         if let Some(world) = s.base_world.as_mut() {
             formats::ingest_vector_chunk(world, &chunk, Some(VectorGeometryKind::Area));
         }
+
+        // World content changed; refresh cached label anchors/layout.
+        s.labels_gen = s.labels_gen.wrapping_add(1);
     });
 
     Ok(())
@@ -5112,6 +6597,9 @@ pub fn finish_base_world_stream() {
     with_state(|state| {
         let mut s = state.borrow_mut();
         s.base_count_polys = tri_count;
+
+        // World content changed; refresh cached label anchors/layout.
+        s.labels_gen = s.labels_gen.wrapping_add(1);
     });
 
     let _ = rebuild_overlays_and_upload();
@@ -5214,6 +6702,9 @@ fn ensure_builtin_layer_loaded(id: &str) {
                     let mut s = state.borrow_mut();
                     s.cities_world = Some(world);
                     s.cities_count_points = points;
+
+                    // World content changed; refresh cached label anchors/layout.
+                    s.labels_gen = s.labels_gen.wrapping_add(1);
                 });
                 let _ = rebuild_overlays_and_upload();
                 let _ = render_scene();
@@ -5243,6 +6734,9 @@ fn ensure_builtin_layer_loaded(id: &str) {
                     let mut s = state.borrow_mut();
                     s.corridors_world = Some(world);
                     s.corridors_count_lines = lines;
+
+                    // World content changed; refresh cached label anchors/layout.
+                    s.labels_gen = s.labels_gen.wrapping_add(1);
                 });
                 let _ = rebuild_overlays_and_upload();
                 let _ = render_scene();
@@ -5272,6 +6766,9 @@ fn ensure_builtin_layer_loaded(id: &str) {
                     let mut s = state.borrow_mut();
                     s.regions_world = Some(world);
                     s.regions_count_polys = polys;
+
+                    // World content changed; refresh cached label anchors/layout.
+                    s.labels_gen = s.labels_gen.wrapping_add(1);
                 });
                 let _ = rebuild_overlays_and_upload();
                 let _ = render_scene();
@@ -5769,6 +7266,35 @@ pub fn get_layer_style(id: &str) -> Result<JsValue, JsValue> {
     );
     let _ = js_sys::Reflect::set(
         &o,
+        &JsValue::from_str("stroke_color_hex"),
+        &JsValue::from_str(&color_to_hex([
+            style.stroke_color[0],
+            style.stroke_color[1],
+            style.stroke_color[2],
+        ])),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("stroke_opacity"),
+        &JsValue::from_f64(style.stroke_color[3] as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("stroke_width_px"),
+        &JsValue::from_f64(style.stroke_width_px as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("size_px"),
+        &JsValue::from_f64(style.size_px as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
+        &JsValue::from_str("width_px"),
+        &JsValue::from_f64(style.width_px as f64),
+    );
+    let _ = js_sys::Reflect::set(
+        &o,
         &JsValue::from_str("lift"),
         &JsValue::from_f64(style.lift as f64),
     );
@@ -6027,6 +7553,111 @@ pub fn set_layer_color_hex(id: &str, hex: &str) -> Result<(), JsValue> {
 }
 
 #[wasm_bindgen]
+pub fn set_layer_stroke_color_hex(id: &str, hex: &str) -> Result<(), JsValue> {
+    let rgb = parse_hex_color(hex).ok_or_else(|| JsValue::from_str("Invalid color"))?;
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        if let Some(st) = layer_style_mut(&mut s, id) {
+            st.stroke_color[0] = rgb[0];
+            st.stroke_color[1] = rgb[1];
+            st.stroke_color[2] = rgb[2];
+        }
+    });
+    let _ = rebuild_overlays_and_upload();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_layer_stroke_opacity(id: &str, opacity: f64) -> Result<(), JsValue> {
+    let a = (opacity as f32).clamp(0.0, 1.0);
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        if let Some(st) = layer_style_mut(&mut s, id) {
+            st.stroke_color[3] = a;
+        }
+    });
+    let _ = rebuild_overlays_and_upload();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_layer_stroke_width_px(id: &str, width_px: f64) -> Result<(), JsValue> {
+    let w = (width_px as f32).clamp(0.0, 24.0);
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        if let Some(st) = layer_style_mut(&mut s, id) {
+            st.stroke_width_px = w;
+        }
+    });
+    let _ = rebuild_overlays_and_upload();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_layer_size_px(id: &str, size_px: f64) -> Result<(), JsValue> {
+    let v = (size_px as f32).clamp(0.0, 64.0);
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        if let Some(st) = layer_style_mut(&mut s, id) {
+            st.size_px = v;
+        }
+    });
+    let _ = rebuild_styles_and_upload_only();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_layer_width_px(id: &str, width_px: f64) -> Result<(), JsValue> {
+    let v = (width_px as f32).clamp(0.0, 24.0);
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        if let Some(st) = layer_style_mut(&mut s, id) {
+            st.width_px = v;
+        }
+    });
+    let _ = rebuild_styles_and_upload_only();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn set_layer_rules_json(id: &str, rules_json: String) -> Result<(), JsValue> {
+    let trimmed = rules_json.trim();
+    if trimmed.is_empty() {
+        with_state(|state| {
+            let mut s = state.borrow_mut();
+            s.layer_rules.remove(id);
+            s.layer_rules_json.remove(id);
+        });
+        let _ = rebuild_overlays_and_upload();
+        return render_scene();
+    }
+
+    let rules: Vec<StyleRule> =
+        serde_json::from_str(trimmed).map_err(|e| JsValue::from_str(&e.to_string()))?;
+
+    with_state(|state| {
+        let mut s = state.borrow_mut();
+        s.layer_rules.insert(id.to_string(), rules);
+        s.layer_rules_json
+            .insert(id.to_string(), trimmed.to_string());
+    });
+
+    let _ = rebuild_overlays_and_upload();
+    render_scene()
+}
+
+#[wasm_bindgen]
+pub fn get_layer_rules_json(id: &str) -> String {
+    with_state(|state| {
+        let s = state.borrow();
+        s.layer_rules_json
+            .get(id)
+            .cloned()
+            .unwrap_or_else(|| "".to_string())
+    })
+}
+
+#[wasm_bindgen]
 pub fn set_layer_opacity(id: &str, opacity: f64) -> Result<(), JsValue> {
     let a = (opacity as f32).clamp(0.0, 1.0);
     with_state(|state| {
@@ -6098,15 +7729,24 @@ pub fn clear_uploaded() -> Result<(), JsValue> {
         s.uploaded_name = None;
         s.uploaded_catalog_id = None;
         s.uploaded_world = None;
+        s.uploaded_chunk = None;
         s.uploaded_centers = None;
+        s.uploaded_mercator = None;
         s.uploaded_corridors_positions = None;
+        s.uploaded_corridors_mercator = None;
         s.uploaded_regions_positions = None;
+        s.uploaded_regions_mercator = None;
+        s.uploaded_regions_outline_positions = None;
+        s.uploaded_regions_outline_mercator = None;
         s.uploaded_count_points = 0;
         s.uploaded_count_lines = 0;
         s.uploaded_count_polys = 0;
         s.uploaded_points_style.visible = false;
         s.uploaded_corridors_style.visible = false;
         s.uploaded_regions_style.visible = false;
+
+        // World content changed; refresh cached label anchors/layout.
+        s.labels_gen = s.labels_gen.wrapping_add(1);
     });
     let _ = rebuild_overlays_and_upload();
     render_scene()
@@ -6228,6 +7868,9 @@ pub async fn catalog_load(id: String) -> Result<JsValue, JsValue> {
             let h = s.canvas_height.max(1.0);
             fit_camera_2d_to_bounds(&mut s.camera_2d, w, h, min_lon, max_lon, min_lat, max_lat);
         }
+
+        // World content changed; refresh cached label anchors/layout.
+        s.labels_gen = s.labels_gen.wrapping_add(1);
     });
 
     rebuild_overlays_and_upload()?;
@@ -6820,6 +8463,10 @@ pub fn load_geojson_feed_layer(
             .unwrap_or(LayerStyle {
                 visible: true,
                 color: [0.38, 0.73, 1.0, 0.95],
+                stroke_color: [0.38, 0.73, 1.0, 0.95],
+                stroke_width_px: 0.0,
+                size_px: 0.0,
+                width_px: 0.0,
                 lift: 0.0,
             });
 
@@ -7109,6 +8756,7 @@ pub async fn load_geojson_file(
             None
         };
         s.uploaded_world = Some(world);
+        s.uploaded_chunk = Some(chunk.clone());
         s.uploaded_count_points = count_points;
         s.uploaded_count_lines = count_lines;
         s.uploaded_count_polys = count_polys;
@@ -7125,6 +8773,9 @@ pub async fn load_geojson_file(
             let h = s.canvas_height.max(1.0);
             fit_camera_2d_to_bounds(&mut s.camera_2d, w, h, min_lon, max_lon, min_lat, max_lat);
         }
+
+        // World content changed; refresh cached label anchors/layout.
+        s.labels_gen = s.labels_gen.wrapping_add(1);
     }) {
         Ok(()) => {}
         Err(_) => {
@@ -7277,6 +8928,7 @@ pub fn load_dataset(url: String) {
             s.uploaded_catalog_id = None;
 
             s.uploaded_world = Some(world);
+            s.uploaded_chunk = None;
             s.uploaded_count_points = count_points;
             s.uploaded_count_lines = count_lines;
             s.uploaded_count_polys = count_polys;
@@ -7289,6 +8941,9 @@ pub fn load_dataset(url: String) {
             s.frame_index = 0;
             s.time_s = 0.0;
             s.time_end_s = (manifest.chunks.len().max(1) as f64) * 1.5;
+
+            // World content changed; refresh cached label anchors/layout.
+            s.labels_gen = s.labels_gen.wrapping_add(1);
         });
 
         let _ = rebuild_overlays_and_upload();
@@ -7363,12 +9018,11 @@ pub fn advance_frame() -> Result<f64, JsValue> {
             s.globe_controller.update(dt);
 
             // Keep legacy camera state in sync.
-            // Only overwrite yaw/pitch when globe controller is driving motion
-            // (auto-rotate or inertia). Distance is always synced for smooth zoom.
-            if auto_rotating || s.globe_controller.is_inertia_active() {
-                s.camera.yaw_rad = s.globe_controller.yaw_rad();
-                s.camera.pitch_rad = s.globe_controller.pitch_rad();
-            }
+            // The renderer uses `CameraState` for view/projection. Syncing yaw/pitch every
+            // frame avoids discontinuities where the globe controller and legacy yaw/pitch
+            // diverge and only get reconciled later (which can read as a “snap back”).
+            s.camera.yaw_rad = s.globe_controller.yaw_rad();
+            s.camera.pitch_rad = s.globe_controller.pitch_rad();
             s.camera.distance = s.globe_controller.distance();
         }
     });
@@ -7701,7 +9355,7 @@ async fn fetch_vector_chunk(url: &str) -> Result<formats::VectorChunk, JsValue> 
 //  1. Default control config values are stable (no accidental regressions).
 //  2. Camera math produces correct directional results:
 //     - 3D orbit: drag left => yaw increases (surface moves left).
-//     - 3D pan:   drag right => target moves right in view space.
+//     - 3D pan:   drag right => globe moves right in screen space.
 //     - 2D pan:   drag right => center_lon_deg decreases (map moves right).
 //  3. Zoom contracts: scroll up => zoom in, scroll down => zoom out.
 //  4. Clamping: pitch stays within bounds, distance stays positive, etc.
@@ -7719,7 +9373,7 @@ mod camera_contract_tests {
         assert_eq!(cfg.orbit_sensitivity, 1.0);
         assert_eq!(cfg.pan_sensitivity_3d, 1.0);
         assert_eq!(cfg.zoom_speed_3d, 1.0);
-        assert!(!cfg.invert_orbit_y);
+        assert!(cfg.invert_orbit_y);
         assert!(!cfg.invert_pan_y_3d);
         assert_eq!(cfg.min_distance, 10.0);
         assert!((cfg.max_distance - 200.0 * WGS84_A).abs() < 1.0);
@@ -7746,6 +9400,8 @@ mod camera_contract_tests {
         assert!((cam.distance - 3.0 * WGS84_A).abs() < 1.0);
         // Target at origin.
         assert_eq!(cam.target, [0.0, 0.0, 0.0]);
+        // No pan offset.
+        assert_eq!(cam.pan_px, [0.0, 0.0]);
     }
 
     #[test]
@@ -7799,7 +9455,7 @@ mod camera_contract_tests {
     }
 
     #[test]
-    fn orbit_drag_up_increases_pitch() {
+    fn orbit_drag_up_decreases_pitch_with_default() {
         let mut cam = CameraState::default();
         let cfg = ControlConfig::default();
         let w = 1280.0_f64;
@@ -7814,18 +9470,17 @@ mod camera_contract_tests {
         let delta_y = -50.0;
         cam.pitch_rad += dy_sign * delta_y * speed;
 
-        // Drag up (negative dy) with default config => pitch increases
-        // (camera tilts up, surface appears to move up).
+        // Drag up (negative dy) with default config => pitch decreases.
         assert!(
-            cam.pitch_rad > initial_pitch,
-            "drag up with default config must increase pitch (from outside)"
+            cam.pitch_rad < initial_pitch,
+            "drag up with default config must decrease pitch (from outside)"
         );
     }
 
     #[test]
     fn orbit_invert_y_reverses_pitch_direction() {
         let cfg = ControlConfig {
-            invert_orbit_y: true,
+            invert_orbit_y: false,
             ..ControlConfig::default()
         };
         let w = 1280.0_f64;
@@ -7839,10 +9494,10 @@ mod camera_contract_tests {
         let delta_y = -50.0; // drag up
         cam.pitch_rad += dy_sign * delta_y * speed;
 
-        // With invert_orbit_y=true, drag up => pitch decreases.
+        // With invert_orbit_y=false, drag up => pitch increases.
         assert!(
-            cam.pitch_rad < initial_pitch,
-            "drag up with inverted Y must decrease pitch"
+            cam.pitch_rad > initial_pitch,
+            "drag up with inverted Y must increase pitch"
         );
     }
 
@@ -7857,67 +9512,56 @@ mod camera_contract_tests {
         assert!(cam.pitch_rad >= -cfg.pitch_clamp_rad);
     }
 
-    // ── 3D Pan (target translation) contract ──────────────────────
+    // ── 3D Pan (screen-space) contract ────────────────────────────
     //
     // "Right-click drag moves the entire globe in the viewport."
     // "Drag right => globe moves right on screen."
 
     #[test]
-    fn pan_3d_drag_right_moves_target_right() {
-        let cam = CameraState::default();
-        let cfg = ControlConfig::default();
-        let _w = 1280.0_f64;
+    fn pan_3d_drag_right_moves_globe_right_on_screen() {
+        let mut cam = CameraState::default();
+        let w = 1280.0_f64;
         let h = 720.0_f64;
 
-        // Compute camera right/up vectors.
-        let dir_cam = vec3_normalize([
-            cam.pitch_rad.cos() * cam.yaw_rad.cos(),
-            cam.pitch_rad.sin(),
-            -cam.pitch_rad.cos() * cam.yaw_rad.sin(),
-        ]);
-        let world_up = [0.0, 1.0, 0.0];
-        let right = vec3_normalize(vec3_cross(world_up, dir_cam));
+        let view_proj0 = camera_view_proj(cam, w, h);
+        let (sx0, _sy0) = project_viewer_to_screen(view_proj0, [0.0, 0.0, 0.0], w as f32, h as f32)
+            .expect("origin should project");
 
-        let fov_y_rad = 45f64.to_radians();
-        let px_to_world = cam.distance * (fov_y_rad / h) * cfg.pan_sensitivity_3d;
+        // Drag right by +100px.
+        cam.pan_px[0] += 100.0;
+        let view_proj1 = camera_view_proj(cam, w, h);
+        let (sx1, _sy1) = project_viewer_to_screen(view_proj1, [0.0, 0.0, 0.0], w as f32, h as f32)
+            .expect("origin should project");
 
-        // Drag right: dx = +100px
-        let delta_x = 100.0;
-        let offset_right = vec3_mul(right, -delta_x * px_to_world);
-        let new_target = vec3_add(cam.target, offset_right);
-
-        // The target should have moved in the right direction (non-zero displacement).
-        let displacement = vec3_dot(new_target, new_target).sqrt();
-        assert!(displacement > 0.0, "pan must move target");
-
-        // Verify the target moved along the right vector (dot product with right > 0 means leftward
-        // in camera space, since we negate delta_x for "follow cursor" behavior).
-        // Actually with -delta_x (delta_x positive), offset goes along -right.
-        // This moves the target opposite to the camera's right, which makes the globe
-        // appear to move right on screen (camera-relative).
-        let dot_right = vec3_dot(new_target, right);
-        // The target moves in -right direction (so globe appears to move rightward).
-        assert!(
-            dot_right < 0.0,
-            "target should move opposite to camera-right when dragging right"
-        );
+        assert!(sx1 > sx0 + 50.0, "pan right should move globe right");
     }
 
     #[test]
-    fn pan_3d_target_clamped() {
+    fn pan_3d_clamped_by_max_target_offset_m() {
         let cfg = ControlConfig::default();
-        // Manually set target beyond allowed offset.
-        let far_target = [cfg.max_target_offset_m * 2.0, 0.0, 0.0];
-        let r = vec3_dot(far_target, far_target).sqrt();
-        let clamped = if r <= cfg.max_target_offset_m {
-            far_target
-        } else {
-            vec3_mul(far_target, cfg.max_target_offset_m / r)
-        };
-        let clamped_r = vec3_dot(clamped, clamped).sqrt();
+        let cam = CameraState::default();
+        let h = 720.0_f64;
+
+        // Convert px→world using the same scale as camera_pan.
+        let fov_y_rad = 45f64.to_radians();
+        let px_to_world = cam.distance * (fov_y_rad / h);
+
+        // Exceed max pan by a lot.
+        let mut pan_px = [1.0e9, 0.0];
+        let pan_world_x = pan_px[0] * px_to_world;
+        let pan_world_y = pan_px[1] * px_to_world;
+        let pan_world_r = (pan_world_x * pan_world_x + pan_world_y * pan_world_y).sqrt();
+        if pan_world_r > cfg.max_target_offset_m {
+            let scale = cfg.max_target_offset_m / pan_world_r;
+            pan_px[0] *= scale;
+            pan_px[1] *= scale;
+        }
+
+        let clamped_world_r =
+            ((pan_px[0] * px_to_world).powi(2) + (pan_px[1] * px_to_world).powi(2)).sqrt();
         assert!(
-            (clamped_r - cfg.max_target_offset_m).abs() < 1.0,
-            "target offset must be clamped to max_target_offset_m"
+            (clamped_world_r - cfg.max_target_offset_m).abs() < 1.0,
+            "pan must be clamped to max_target_offset_m (in world units)"
         );
     }
 

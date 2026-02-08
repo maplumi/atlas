@@ -35,7 +35,6 @@ mod imp {
         pub stars_pipeline: ::wgpu::RenderPipeline,
         pub stars_count: u32,
         pub globe_pipeline_solid: ::wgpu::RenderPipeline,
-        pub globe_pipeline_transparent: ::wgpu::RenderPipeline,
         pub graticule_pipeline: ::wgpu::RenderPipeline,
         pub cities_pipeline: ::wgpu::RenderPipeline,
         pub corridors_pipeline: ::wgpu::RenderPipeline,
@@ -47,6 +46,16 @@ mod imp {
         pub map2d_polys_pipeline: ::wgpu::RenderPipeline,
         pub map2d_lines_pipeline: ::wgpu::RenderPipeline,
         pub map2d_points_pipeline: ::wgpu::RenderPipeline,
+
+        // Labels (SDF atlas) pipeline.
+        pub labels_pipeline: ::wgpu::RenderPipeline,
+        pub labels_bind_group_layout: ::wgpu::BindGroupLayout,
+        pub labels_bind_group: ::wgpu::BindGroup,
+        pub labels_texture: ::wgpu::Texture,
+        pub labels_texture_view: ::wgpu::TextureView,
+        pub labels_sampler: ::wgpu::Sampler,
+        pub labels_tex_width: u32,
+        pub labels_tex_height: u32,
 
         // 2D globals + bind group (shares the same bind group layout as 3D).
         pub uniform2d_buffer: ::wgpu::Buffer,
@@ -97,6 +106,11 @@ mod imp {
         pub grid2d_instance_buffer: ::wgpu::Buffer,
         pub grid2d_instance_capacity_bytes: u64,
         pub grid2d_instance_count: u32,
+
+        // Label instances.
+        pub labels_instance_buffer: ::wgpu::Buffer,
+        pub labels_instance_capacity_bytes: u64,
+        pub labels_instance_count: u32,
 
         // Lightweight per-frame perf counters (reset externally per frame).
         pub perf_upload_calls: Cell<u32>,
@@ -390,6 +404,79 @@ fn vs_line(
 @fragment
 fn fs_line(in: LineOut) -> @location(0) vec4<f32> {
     return styles[in.style_id].color;
+}
+"#;
+
+    const LABELS_SHADER: &str = r#"
+struct Globals {
+    view_proj: mat4x4<f32>,
+    light_dir: vec3<f32>,
+    _pad0: f32,
+    viewport: vec2<f32>,
+    globe_alpha: f32,
+    _pad1: f32,
+    globe_color: vec3<f32>,
+    stars_alpha: f32,
+};
+
+@group(0) @binding(0)
+var<uniform> globals: Globals;
+
+@group(1) @binding(0)
+var label_tex: texture_2d<f32>;
+
+@group(1) @binding(1)
+var label_samp: sampler;
+
+struct VsOut {
+    @builtin(position) pos: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) color: vec4<f32>,
+    @location(2) halo: vec4<f32>,
+    @location(3) sdf_range_px: f32,
+    @location(4) halo_width_px: f32,
+};
+
+@vertex
+fn vs_main(
+    @location(0) corner: vec2<f32>,
+    @location(1) pos_px: vec2<f32>,
+    @location(2) size_px: vec2<f32>,
+    @location(3) uv_min: vec2<f32>,
+    @location(4) uv_max: vec2<f32>,
+    @location(5) color: vec4<f32>,
+    @location(6) halo: vec4<f32>,
+    @location(7) sdf_range_px: f32,
+    @location(8) halo_width_px: f32,
+) -> VsOut {
+    let corner01 = corner * 0.5 + vec2<f32>(0.5, 0.5);
+    let pos = pos_px + corner01 * size_px;
+    let vp = max(globals.viewport, vec2<f32>(1.0, 1.0));
+    let ndc_x = (pos.x / vp.x) * 2.0 - 1.0;
+    let ndc_y = 1.0 - (pos.y / vp.y) * 2.0;
+
+    var out: VsOut;
+    out.pos = vec4<f32>(ndc_x, ndc_y, 0.0, 1.0);
+    out.uv = mix(uv_min, uv_max, corner01);
+    out.color = color;
+    out.halo = halo;
+    out.sdf_range_px = sdf_range_px;
+    out.halo_width_px = halo_width_px;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    let sdf = textureSample(label_tex, label_samp, in.uv).r;
+    let range_px = max(in.sdf_range_px, 0.5);
+    let d_px = (sdf - 0.5) * (2.0 * range_px);
+    let fill = smoothstep(-0.5, 0.5, d_px);
+    let halo = smoothstep(-(in.halo_width_px + 0.5), -0.5, d_px);
+    let halo_only = halo * (1.0 - fill);
+
+    let rgb = in.color.rgb * fill + in.halo.rgb * halo_only;
+    let a = in.color.a * fill + in.halo.a * halo_only;
+    return vec4<f32>(rgb, a);
 }
 "#;
 
@@ -737,6 +824,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         pub b_m: [f32; 2],
         pub style_id: u32,
         pub _pad0: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct LabelInstance {
+        pub pos_px: [f32; 2],
+        pub size_px: [f32; 2],
+        pub uv_min: [f32; 2],
+        pub uv_max: [f32; 2],
+        pub color: [f32; 4],
+        pub halo: [f32; 4],
+        pub sdf_range_px: f32,
+        pub halo_width_px: f32,
+        pub _pad0: [f32; 2],
     }
 
     #[repr(C)]
@@ -1214,6 +1315,11 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(MAP2D_SHADER)),
         });
 
+        let labels_shader = device.create_shader_module(::wgpu::ShaderModuleDescriptor {
+            label: Some("atlas-labels-shader"),
+            source: ::wgpu::ShaderSource::Wgsl(Cow::Borrowed(LABELS_SHADER)),
+        });
+
         let uniform_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
             label: Some("atlas-globals"),
             size: std::mem::size_of::<Globals>() as u64,
@@ -1294,6 +1400,73 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             ],
         });
 
+        let labels_bind_group_layout =
+            device.create_bind_group_layout(&::wgpu::BindGroupLayoutDescriptor {
+                label: Some("atlas-labels-bgl"),
+                entries: &[
+                    ::wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: ::wgpu::ShaderStages::FRAGMENT,
+                        ty: ::wgpu::BindingType::Texture {
+                            multisampled: false,
+                            view_dimension: ::wgpu::TextureViewDimension::D2,
+                            sample_type: ::wgpu::TextureSampleType::Float { filterable: true },
+                        },
+                        count: None,
+                    },
+                    ::wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: ::wgpu::ShaderStages::FRAGMENT,
+                        ty: ::wgpu::BindingType::Sampler(::wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let labels_sampler = device.create_sampler(&::wgpu::SamplerDescriptor {
+            label: Some("atlas-labels-sampler"),
+            address_mode_u: ::wgpu::AddressMode::ClampToEdge,
+            address_mode_v: ::wgpu::AddressMode::ClampToEdge,
+            address_mode_w: ::wgpu::AddressMode::ClampToEdge,
+            mag_filter: ::wgpu::FilterMode::Linear,
+            min_filter: ::wgpu::FilterMode::Linear,
+            mipmap_filter: ::wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let labels_tex_width = 1u32;
+        let labels_tex_height = 1u32;
+        let labels_texture = device.create_texture(&::wgpu::TextureDescriptor {
+            label: Some("atlas-labels-atlas"),
+            size: ::wgpu::Extent3d {
+                width: labels_tex_width,
+                height: labels_tex_height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: ::wgpu::TextureDimension::D2,
+            format: ::wgpu::TextureFormat::R8Unorm,
+            usage: ::wgpu::TextureUsages::TEXTURE_BINDING | ::wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let labels_texture_view =
+            labels_texture.create_view(&::wgpu::TextureViewDescriptor::default());
+        let labels_bind_group = device.create_bind_group(&::wgpu::BindGroupDescriptor {
+            label: Some("atlas-labels-bg"),
+            layout: &labels_bind_group_layout,
+            entries: &[
+                ::wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ::wgpu::BindingResource::TextureView(&labels_texture_view),
+                },
+                ::wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ::wgpu::BindingResource::Sampler(&labels_sampler),
+                },
+            ],
+        });
+
         let pipeline_layout = device.create_pipeline_layout(&::wgpu::PipelineLayoutDescriptor {
             label: Some("atlas-globe-pipeline-layout"),
             bind_group_layouts: &[&uniform_bind_group_layout],
@@ -1324,7 +1497,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 targets: &[Some(::wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: ::wgpu::ColorWrites::ALL,
+                    // Keep the swapchain alpha pinned to 1.0 so the canvas doesn't
+                    // composite with the page background.
+                    write_mask: ::wgpu::ColorWrites::COLOR,
                 })],
             }),
             primitive: ::wgpu::PrimitiveState {
@@ -1399,64 +1574,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 cache: None,
             });
 
-        // Transparent globe: alpha blend over the already-rendered background, but still
-        // write depth+stencil so overlays can be depth-tested and masked correctly.
-        let globe_pipeline_transparent =
-            device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
-                label: Some("atlas-globe-pipeline-transparent"),
-                layout: Some(&pipeline_layout),
-                vertex: ::wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &[::wgpu::VertexBufferLayout {
-                        array_stride: std::mem::size_of::<Vertex>() as ::wgpu::BufferAddress,
-                        step_mode: ::wgpu::VertexStepMode::Vertex,
-                        attributes: &[
-                            ::wgpu::VertexAttribute {
-                                format: ::wgpu::VertexFormat::Float32x3,
-                                offset: 0,
-                                shader_location: 0,
-                            },
-                            ::wgpu::VertexAttribute {
-                                format: ::wgpu::VertexFormat::Float32x3,
-                                offset: 12,
-                                shader_location: 1,
-                            },
-                        ],
-                    }],
-                },
-                fragment: Some(::wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(::wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: ::wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: ::wgpu::PrimitiveState {
-                    topology: ::wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: ::wgpu::FrontFace::Ccw,
-                    cull_mode: Some(::wgpu::Face::Back),
-                    polygon_mode: ::wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                depth_stencil: Some(::wgpu::DepthStencilState {
-                    format: ::wgpu::TextureFormat::Depth24PlusStencil8,
-                    depth_write_enabled: true,
-                    depth_compare: ::wgpu::CompareFunction::Less,
-                    stencil: stencil_write_1(),
-                    bias: ::wgpu::DepthBiasState::default(),
-                }),
-                multisample: ::wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-
         let graticule_pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
             label: Some("atlas-graticule-pipeline"),
             layout: Some(&pipeline_layout),
@@ -1481,7 +1598,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 targets: &[Some(::wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: ::wgpu::ColorWrites::ALL,
+                    write_mask: ::wgpu::ColorWrites::COLOR,
                 })],
             }),
             primitive: ::wgpu::PrimitiveState {
@@ -1547,7 +1664,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 targets: &[Some(::wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: ::wgpu::ColorWrites::ALL,
+                    write_mask: ::wgpu::ColorWrites::COLOR,
                 })],
             }),
             primitive: ::wgpu::PrimitiveState {
@@ -1626,7 +1743,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 targets: &[Some(::wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: ::wgpu::ColorWrites::ALL,
+                    write_mask: ::wgpu::ColorWrites::COLOR,
                 })],
             }),
             primitive: ::wgpu::PrimitiveState {
@@ -1681,7 +1798,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 targets: &[Some(::wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: ::wgpu::ColorWrites::ALL,
+                    write_mask: ::wgpu::ColorWrites::COLOR,
                 })],
             }),
             primitive: ::wgpu::PrimitiveState {
@@ -1741,7 +1858,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     targets: &[Some(::wgpu::ColorTargetState {
                         format: config.format,
                         blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: ::wgpu::ColorWrites::ALL,
+                        write_mask: ::wgpu::ColorWrites::COLOR,
                     })],
                 }),
                 primitive: ::wgpu::PrimitiveState {
@@ -1801,7 +1918,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 targets: &[Some(::wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: ::wgpu::ColorWrites::ALL,
+                    write_mask: ::wgpu::ColorWrites::COLOR,
                 })],
             }),
             primitive: ::wgpu::PrimitiveState {
@@ -1870,7 +1987,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     targets: &[Some(::wgpu::ColorTargetState {
                         format: config.format,
                         blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: ::wgpu::ColorWrites::ALL,
+                        write_mask: ::wgpu::ColorWrites::COLOR,
                     })],
                 }),
                 primitive: ::wgpu::PrimitiveState {
@@ -1933,7 +2050,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     targets: &[Some(::wgpu::ColorTargetState {
                         format: config.format,
                         blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: ::wgpu::ColorWrites::ALL,
+                        write_mask: ::wgpu::ColorWrites::COLOR,
                     })],
                 }),
                 primitive: ::wgpu::PrimitiveState {
@@ -2008,7 +2125,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                     targets: &[Some(::wgpu::ColorTargetState {
                         format: config.format,
                         blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
-                        write_mask: ::wgpu::ColorWrites::ALL,
+                        write_mask: ::wgpu::ColorWrites::COLOR,
                     })],
                 }),
                 primitive: ::wgpu::PrimitiveState {
@@ -2025,6 +2142,103 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 multiview_mask: None,
                 cache: None,
             });
+
+        let labels_pipeline_layout =
+            device.create_pipeline_layout(&::wgpu::PipelineLayoutDescriptor {
+                label: Some("atlas-labels-pipeline-layout"),
+                bind_group_layouts: &[&uniform_bind_group_layout, &labels_bind_group_layout],
+                immediate_size: 0,
+            });
+
+        let labels_pipeline = device.create_render_pipeline(&::wgpu::RenderPipelineDescriptor {
+            label: Some("atlas-labels-pipeline"),
+            layout: Some(&labels_pipeline_layout),
+            vertex: ::wgpu::VertexState {
+                module: &labels_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[
+                    ::wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<QuadVertex>() as ::wgpu::BufferAddress,
+                        step_mode: ::wgpu::VertexStepMode::Vertex,
+                        attributes: &[::wgpu::VertexAttribute {
+                            format: ::wgpu::VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        }],
+                    },
+                    ::wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<LabelInstance>() as ::wgpu::BufferAddress,
+                        step_mode: ::wgpu::VertexStepMode::Instance,
+                        attributes: &[
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x2,
+                                offset: 0,
+                                shader_location: 1,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x2,
+                                offset: 8,
+                                shader_location: 2,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x2,
+                                offset: 16,
+                                shader_location: 3,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x2,
+                                offset: 24,
+                                shader_location: 4,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x4,
+                                offset: 32,
+                                shader_location: 5,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32x4,
+                                offset: 48,
+                                shader_location: 6,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32,
+                                offset: 64,
+                                shader_location: 7,
+                            },
+                            ::wgpu::VertexAttribute {
+                                format: ::wgpu::VertexFormat::Float32,
+                                offset: 68,
+                                shader_location: 8,
+                            },
+                        ],
+                    },
+                ],
+            },
+            fragment: Some(::wgpu::FragmentState {
+                module: &labels_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(::wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(::wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: ::wgpu::ColorWrites::COLOR,
+                })],
+            }),
+            primitive: ::wgpu::PrimitiveState {
+                topology: ::wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: ::wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: ::wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: ::wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let radii = [WGS84_A as f32, WGS84_B as f32, WGS84_A as f32];
         let (vertices, indices) = generate_ellipsoid_mesh(64, 128, radii);
@@ -2163,6 +2377,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             mapped_at_creation: false,
         });
 
+        let labels_instance_capacity_bytes = (std::mem::size_of::<LabelInstance>().max(16)) as u64;
+        let labels_instance_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
+            label: Some("atlas-labels-instances"),
+            size: labels_instance_capacity_bytes,
+            usage: ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let overlay_vertex_capacity_bytes = (std::mem::size_of::<OverlayVertex>().max(16)) as u64;
         let regions_vertex_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
             label: Some("atlas-regions-vertices"),
@@ -2237,7 +2459,6 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             stars_pipeline,
             stars_count: 1200,
             globe_pipeline_solid,
-            globe_pipeline_transparent,
             graticule_pipeline,
             cities_pipeline,
             corridors_pipeline,
@@ -2247,6 +2468,14 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             map2d_polys_pipeline,
             map2d_lines_pipeline,
             map2d_points_pipeline,
+            labels_pipeline,
+            labels_bind_group_layout,
+            labels_bind_group,
+            labels_texture,
+            labels_texture_view,
+            labels_sampler,
+            labels_tex_width,
+            labels_tex_height,
             uniform_buffer,
             uniform2d_buffer,
             styles_buffer,
@@ -2293,6 +2522,9 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             grid2d_instance_buffer,
             grid2d_instance_capacity_bytes,
             grid2d_instance_count: 0,
+            labels_instance_buffer,
+            labels_instance_capacity_bytes,
+            labels_instance_count: 0,
 
             perf_upload_calls: Cell::new(0),
             perf_upload_bytes: Cell::new(0),
@@ -2553,6 +2785,109 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         ctx.grid2d_instance_count = inst.len() as u32;
     }
 
+    pub fn set_label_instances(ctx: &mut WgpuContext, inst: &[LabelInstance]) {
+        if inst.is_empty() {
+            ctx.labels_instance_count = 0;
+            return;
+        }
+
+        let required_bytes = (inst.len() * std::mem::size_of::<LabelInstance>()) as u64;
+        ensure_buffer_capacity(
+            &ctx.device,
+            &mut ctx.labels_instance_buffer,
+            &mut ctx.labels_instance_capacity_bytes,
+            required_bytes,
+            ::wgpu::BufferUsages::VERTEX | ::wgpu::BufferUsages::COPY_DST,
+            "atlas-labels-instances",
+        );
+        ctx.queue
+            .write_buffer(&ctx.labels_instance_buffer, 0, bytemuck::cast_slice(inst));
+        perf_on_write(
+            ctx,
+            (inst.len() * std::mem::size_of::<LabelInstance>()) as u64,
+        );
+        ctx.labels_instance_count = inst.len() as u32;
+    }
+
+    pub fn set_label_atlas(ctx: &mut WgpuContext, width: u32, height: u32, pixels: &[u8]) {
+        if width == 0 || height == 0 {
+            return;
+        }
+        let expected_len = (width as usize).saturating_mul(height as usize);
+        if pixels.len() < expected_len {
+            return;
+        }
+
+        if width != ctx.labels_tex_width || height != ctx.labels_tex_height {
+            ctx.labels_tex_width = width;
+            ctx.labels_tex_height = height;
+            ctx.labels_texture = ctx.device.create_texture(&::wgpu::TextureDescriptor {
+                label: Some("atlas-labels-atlas"),
+                size: ::wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: ::wgpu::TextureDimension::D2,
+                format: ::wgpu::TextureFormat::R8Unorm,
+                usage: ::wgpu::TextureUsages::TEXTURE_BINDING | ::wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            ctx.labels_texture_view = ctx
+                .labels_texture
+                .create_view(&::wgpu::TextureViewDescriptor::default());
+            ctx.labels_bind_group = ctx.device.create_bind_group(&::wgpu::BindGroupDescriptor {
+                label: Some("atlas-labels-bg"),
+                layout: &ctx.labels_bind_group_layout,
+                entries: &[
+                    ::wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: ::wgpu::BindingResource::TextureView(&ctx.labels_texture_view),
+                    },
+                    ::wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: ::wgpu::BindingResource::Sampler(&ctx.labels_sampler),
+                    },
+                ],
+            });
+        }
+
+        let align = 256u32;
+        let bytes_per_row = ((width + align - 1) / align) * align;
+        let padded_len = (bytes_per_row as usize).saturating_mul(height as usize);
+        let mut padded = vec![0u8; padded_len];
+        for y in 0..height as usize {
+            let src_start = y * width as usize;
+            let src_end = src_start + width as usize;
+            let dst_start = y * bytes_per_row as usize;
+            padded[dst_start..dst_start + width as usize]
+                .copy_from_slice(&pixels[src_start..src_end]);
+        }
+
+        ctx.queue.write_texture(
+            ::wgpu::TexelCopyTextureInfo {
+                texture: &ctx.labels_texture,
+                mip_level: 0,
+                origin: ::wgpu::Origin3d::ZERO,
+                aspect: ::wgpu::TextureAspect::All,
+            },
+            &padded,
+            ::wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+            ::wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        perf_on_write(ctx, padded_len as u64);
+    }
+
     pub fn resize_wgpu(ctx: &mut WgpuContext, width: u32, height: u32) {
         ctx.config.width = width.max(1);
         ctx.config.height = height.max(1);
@@ -2585,14 +2920,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             light_dir,
             _pad0: 0.0,
             viewport: [ctx.config.width as f32, ctx.config.height as f32],
-            // IMPORTANT: even when the globe pipeline uses BlendState::REPLACE (solid mode),
-            // the fragment alpha still lands in the surface and the browser composites the
-            // canvas using that alpha. Force alpha=1.0 whenever transparency is disabled.
-            globe_alpha: if ctx.globe_transparent {
-                ctx.globe_alpha
-            } else {
-                1.0
-            },
+            // IMPORTANT: always output alpha=1.0 for the globe.
+            // Some browser/canvas compositing paths can show the page background when the
+            // surface alpha is < 1.0, which reads as “see-through” oceans.
+            globe_alpha: 1.0,
             _pad1: 0.0,
             globe_color: ctx.globe_color,
             stars_alpha: ctx.stars_alpha,
@@ -2668,11 +2999,10 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             rpass.set_stencil_reference(1);
 
             // Globe
-            let globe_pipeline = if ctx.globe_transparent {
-                &ctx.globe_pipeline_transparent
-            } else {
-                &ctx.globe_pipeline_solid
-            };
+            // Always render the globe as opaque. The UI's "Transparent globe" toggle is
+            // intended to control whether the *surface layer* may be translucent; making the
+            // globe itself alpha-blend causes oceans to appear "see-through".
+            let globe_pipeline = &ctx.globe_pipeline_solid;
             rpass.set_pipeline(globe_pipeline);
             rpass.set_vertex_buffer(0, ctx.vertex_buffer.slice(..));
             rpass.set_index_buffer(ctx.index_buffer.slice(..), ::wgpu::IndexFormat::Uint16);
@@ -2730,6 +3060,35 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
             }
         }
 
+        // Pass 3: screen-space labels (SDF atlas), drawn on top with alpha blending.
+        if ctx.labels_instance_count > 0 {
+            perf_on_pass(ctx);
+            let mut rpass = encoder.begin_render_pass(&::wgpu::RenderPassDescriptor {
+                label: Some("atlas-labels-pass"),
+                color_attachments: &[Some(::wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: ::wgpu::Operations {
+                        load: ::wgpu::LoadOp::Load,
+                        store: ::wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+                multiview_mask: None,
+            });
+
+            rpass.set_pipeline(&ctx.labels_pipeline);
+            rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+            rpass.set_bind_group(1, &ctx.labels_bind_group, &[]);
+            rpass.set_vertex_buffer(0, ctx.cities_quad_vertex_buffer.slice(..));
+            rpass.set_vertex_buffer(1, ctx.labels_instance_buffer.slice(..));
+            rpass.draw(0..6, 0..ctx.labels_instance_count);
+            perf_on_draw(ctx, 6, 0, ctx.labels_instance_count as u64);
+        }
+
         ctx.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
         Ok(())
@@ -2756,6 +3115,20 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         ctx.queue
             .write_buffer(&ctx.uniform2d_buffer, 0, bytemuck::bytes_of(&globals2d));
         perf_on_write(ctx, std::mem::size_of::<Globals2D>() as u64);
+
+        let label_globals = Globals {
+            view_proj: [[0.0; 4]; 4],
+            light_dir: [0.0, 0.0, 0.0],
+            _pad0: 0.0,
+            viewport: [ctx.config.width as f32, ctx.config.height as f32],
+            globe_alpha: 1.0,
+            _pad1: 0.0,
+            globe_color: [0.0, 0.0, 0.0],
+            stars_alpha: 0.0,
+        };
+        ctx.queue
+            .write_buffer(&ctx.uniform_buffer, 0, bytemuck::bytes_of(&label_globals));
+        perf_on_write(ctx, std::mem::size_of::<Globals>() as u64);
 
         let mut encoder = ctx
             .device
@@ -2825,6 +3198,16 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
                 rpass.set_vertex_buffer(1, ctx.points2d_instance_buffer.slice(..));
                 rpass.draw(0..6, 0..ctx.points2d_instance_count);
                 perf_on_draw(ctx, 6, 0, ctx.points2d_instance_count as u64);
+            }
+
+            if ctx.labels_instance_count > 0 {
+                rpass.set_pipeline(&ctx.labels_pipeline);
+                rpass.set_bind_group(0, &ctx.uniform_bind_group, &[]);
+                rpass.set_bind_group(1, &ctx.labels_bind_group, &[]);
+                rpass.set_vertex_buffer(0, ctx.cities_quad_vertex_buffer.slice(..));
+                rpass.set_vertex_buffer(1, ctx.labels_instance_buffer.slice(..));
+                rpass.draw(0..6, 0..ctx.labels_instance_count);
+                perf_on_draw(ctx, 6, 0, ctx.labels_instance_count as u64);
             }
         }
 
@@ -2926,6 +3309,20 @@ mod imp {
         pub _pad0: u32,
     }
 
+    #[derive(Debug, Copy, Clone)]
+    #[allow(dead_code)]
+    pub struct LabelInstance {
+        pub pos_px: [f32; 2],
+        pub size_px: [f32; 2],
+        pub uv_min: [f32; 2],
+        pub uv_max: [f32; 2],
+        pub color: [f32; 4],
+        pub halo: [f32; 4],
+        pub sdf_range_px: f32,
+        pub halo_width_px: f32,
+        pub _pad0: [f32; 2],
+    }
+
     pub fn set_cities_points(_ctx: &mut WgpuContext, _points: &[CityVertex]) {}
 
     pub fn set_corridors_points(_ctx: &mut WgpuContext, _points: &[CorridorVertex]) {}
@@ -2945,6 +3342,10 @@ mod imp {
     pub fn set_lines2d_instances(_ctx: &mut WgpuContext, _inst: &[Segment2DInstance]) {}
 
     pub fn set_grid2d_instances(_ctx: &mut WgpuContext, _inst: &[Segment2DInstance]) {}
+
+    pub fn set_label_instances(_ctx: &mut WgpuContext, _inst: &[LabelInstance]) {}
+
+    pub fn set_label_atlas(_ctx: &mut WgpuContext, _width: u32, _height: u32, _pixels: &[u8]) {}
 
     pub fn set_styles(_ctx: &mut WgpuContext, _styles: &[Style]) {}
 
@@ -2998,10 +3399,11 @@ mod imp {
 }
 
 pub use imp::{
-    CityVertex, CorridorVertex, Globals2D, Overlay2DVertex, OverlayVertex, Point2DInstance,
-    Segment2DInstance, Style, TerrainVertex, WgpuContext, init_wgpu_from_canvas_id, perf_reset,
-    perf_snapshot, render_map2d, render_mesh, resize_wgpu, set_base_regions_points,
-    set_base_regions2d_vertices, set_cities_points, set_corridors_points, set_globe_transparent,
-    set_grid2d_instances, set_lines2d_instances, set_points2d_instances, set_regions_points,
-    set_regions2d_vertices, set_styles, set_terrain_points, set_theme,
+    CityVertex, CorridorVertex, Globals2D, LabelInstance, Overlay2DVertex, OverlayVertex,
+    Point2DInstance, Segment2DInstance, Style, TerrainVertex, WgpuContext,
+    init_wgpu_from_canvas_id, perf_reset, perf_snapshot, render_map2d, render_mesh, resize_wgpu,
+    set_base_regions_points, set_base_regions2d_vertices, set_cities_points, set_corridors_points,
+    set_globe_transparent, set_grid2d_instances, set_label_atlas, set_label_instances,
+    set_lines2d_instances, set_points2d_instances, set_regions_points, set_regions2d_vertices,
+    set_styles, set_terrain_points, set_theme,
 };

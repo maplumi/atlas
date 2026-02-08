@@ -353,6 +353,25 @@
         margin-top: 8px;
       }
       .layer-row .mini { font-size: 11px; color: var(--muted); }
+      .layer-subrow {
+        grid-column: 1 / -1;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+      .layer-subrow .mini { min-width: 90px; }
+
+      textarea {
+        width: 100%;
+        padding: 8px;
+        border-radius: 6px;
+        border: 1px solid var(--btn-border);
+        background: var(--btn-bg);
+        color: var(--btn-fg);
+        font-family: inherit;
+        font-size: 13px;
+        resize: vertical;
+      }
 
       .muted { color: var(--muted); }
       .sr-only {
@@ -875,7 +894,7 @@
               <span id="line-width-value" class="value">2.5</span>
             </div>
             <div class="muted" style="font-size:12px; line-height:1.35; margin-top:8px;">
-              Note: this viewer uses simple per-layer styles (color/opacity/lift/width), not rule-based GIS symbology.
+              Supports per-layer fill + optional strokes, plus rule-based styling for uploaded points/lines.
             </div>
           </div>
 
@@ -883,10 +902,16 @@
             <h3>Layers</h3>
 
             <div class="layer-row">
-              <label class="checkbox">
-                <input id="layer-world-base" type="checkbox" checked />
-                <span>World base (built-in)</span>
-              </label>
+              <div>
+                <label class="checkbox">
+                  <input id="layer-world-base" type="checkbox" checked />
+                  <span>World base (built-in)</span>
+                </label>
+                <label class="checkbox" style="margin-top:4px;">
+                  <input id="layer-world-base-labels" type="checkbox" checked />
+                  <span class="mini">Labels</span>
+                </label>
+              </div>
               <input id="layer-world-base-color" type="color" value="#33a85a" />
               <div>
                 <div class="mini">Opacity</div>
@@ -895,6 +920,24 @@
               <div>
                 <div class="mini">Lift</div>
                 <input id="layer-world-base-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
+              </div>
+              <div class="layer-subrow">
+                <div class="mini">Stroke</div>
+                <input id="layer-world-base-stroke-color" type="color" value="#33a85a" title="Stroke color" />
+                <div style="flex:1;">
+                  <div class="mini">Opacity</div>
+                  <div class="row">
+                    <input id="layer-world-base-stroke-opacity" type="range" min="0" max="1" step="0.01" value="0.00" />
+                    <span id="layer-world-base-stroke-opacity-value" class="value">0</span>
+                  </div>
+                </div>
+                <div style="flex:1;">
+                  <div class="mini">Width (px)</div>
+                  <div class="row">
+                    <input id="layer-world-base-stroke-width" type="range" min="0" max="16" step="0.5" value="0.0" />
+                    <span id="layer-world-base-stroke-width-value" class="value">auto</span>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -907,10 +950,16 @@
             </div>
 
             <div class="layer-row">
-              <label class="checkbox">
-                <input id="layer-cities" type="checkbox" />
-                <span>Cities (built-in)</span>
-              </label>
+              <div>
+                <label class="checkbox">
+                  <input id="layer-cities" type="checkbox" />
+                  <span>Cities (built-in)</span>
+                </label>
+                <label class="checkbox" style="margin-top:4px;">
+                  <input id="layer-cities-labels" type="checkbox" checked />
+                  <span class="mini">Labels</span>
+                </label>
+              </div>
               <input id="layer-cities-color" type="color" value="#ff4040" />
               <div>
                 <div class="mini">Opacity</div>
@@ -920,13 +969,24 @@
                 <div class="mini">Lift</div>
                 <input id="layer-cities-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
               </div>
+              <div class="layer-subrow">
+                <div class="mini">Size override</div>
+                <input id="layer-cities-size" type="range" min="0" max="24" step="1" value="0" />
+                <span id="layer-cities-size-value" class="value">auto</span>
+              </div>
             </div>
 
             <div class="layer-row">
-              <label class="checkbox">
-                <input id="layer-corridors" type="checkbox" />
-                <span>Air corridors (built-in)</span>
-              </label>
+              <div>
+                <label class="checkbox">
+                  <input id="layer-corridors" type="checkbox" />
+                  <span>Air corridors (built-in)</span>
+                </label>
+                <label class="checkbox" style="margin-top:4px;">
+                  <input id="layer-corridors-labels" type="checkbox" checked />
+                  <span class="mini">Labels</span>
+                </label>
+              </div>
               <input id="layer-corridors-color" type="color" value="#ffd640" />
               <div>
                 <div class="mini">Opacity</div>
@@ -936,13 +996,24 @@
                 <div class="mini">Lift</div>
                 <input id="layer-corridors-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
               </div>
+              <div class="layer-subrow">
+                <div class="mini">Width override</div>
+                <input id="layer-corridors-width" type="range" min="0" max="16" step="0.5" value="0" />
+                <span id="layer-corridors-width-value" class="value">auto</span>
+              </div>
             </div>
 
             <div class="layer-row">
-              <label class="checkbox">
-                <input id="layer-regions" type="checkbox" />
-                <span>Regions (built-in)</span>
-              </label>
+              <div>
+                <label class="checkbox">
+                  <input id="layer-regions" type="checkbox" />
+                  <span>Regions (built-in)</span>
+                </label>
+                <label class="checkbox" style="margin-top:4px;">
+                  <input id="layer-regions-labels" type="checkbox" checked />
+                  <span class="mini">Labels</span>
+                </label>
+              </div>
               <input id="layer-regions-color" type="color" value="#19e6bf" />
               <div>
                 <div class="mini">Opacity</div>
@@ -952,13 +1023,37 @@
                 <div class="mini">Lift</div>
                 <input id="layer-regions-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
               </div>
+              <div class="layer-subrow">
+                <div class="mini">Stroke</div>
+                <input id="layer-regions-stroke-color" type="color" value="#19e6bf" title="Stroke color" />
+                <div style="flex:1;">
+                  <div class="mini">Opacity</div>
+                  <div class="row">
+                    <input id="layer-regions-stroke-opacity" type="range" min="0" max="1" step="0.01" value="0.00" />
+                    <span id="layer-regions-stroke-opacity-value" class="value">0</span>
+                  </div>
+                </div>
+                <div style="flex:1;">
+                  <div class="mini">Width (px)</div>
+                  <div class="row">
+                    <input id="layer-regions-stroke-width" type="range" min="0" max="16" step="0.5" value="0.0" />
+                    <span id="layer-regions-stroke-width-value" class="value">auto</span>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <div class="layer-row">
-              <label class="checkbox">
-                <input id="layer-uploaded-points" type="checkbox" />
-                <span id="layer-uploaded-points-label">Uploaded points</span>
-              </label>
+              <div>
+                <label class="checkbox">
+                  <input id="layer-uploaded-points" type="checkbox" />
+                  <span id="layer-uploaded-points-label">Uploaded points</span>
+                </label>
+                <label class="checkbox" style="margin-top:4px;">
+                  <input id="layer-uploaded-labels" type="checkbox" checked />
+                  <span class="mini">Labels</span>
+                </label>
+              </div>
               <input id="layer-uploaded-points-color" type="color" value="#99f2ff" />
               <div>
                 <div class="mini">Opacity</div>
@@ -967,6 +1062,11 @@
               <div>
                 <div class="mini">Lift</div>
                 <input id="layer-uploaded-points-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
+              </div>
+              <div class="layer-subrow">
+                <div class="mini">Size override</div>
+                <input id="layer-uploaded-points-size" type="range" min="0" max="24" step="1" value="0" />
+                <span id="layer-uploaded-points-size-value" class="value">auto</span>
               </div>
             </div>
 
@@ -984,6 +1084,11 @@
                 <div class="mini">Lift</div>
                 <input id="layer-uploaded-corridors-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
               </div>
+              <div class="layer-subrow">
+                <div class="mini">Width override</div>
+                <input id="layer-uploaded-corridors-width" type="range" min="0" max="16" step="0.5" value="0" />
+                <span id="layer-uploaded-corridors-width-value" class="value">auto</span>
+              </div>
             </div>
 
             <div class="layer-row">
@@ -1000,6 +1105,24 @@
                 <div class="mini">Lift</div>
                 <input id="layer-uploaded-regions-lift" type="range" min="-0.02" max="0.05" step="0.001" value="0.00" />
               </div>
+              <div class="layer-subrow">
+                <div class="mini">Stroke</div>
+                <input id="layer-uploaded-regions-stroke-color" type="color" value="#73b7ff" title="Stroke color" />
+                <div style="flex:1;">
+                  <div class="mini">Opacity</div>
+                  <div class="row">
+                    <input id="layer-uploaded-regions-stroke-opacity" type="range" min="0" max="1" step="0.01" value="0.00" />
+                    <span id="layer-uploaded-regions-stroke-opacity-value" class="value">0</span>
+                  </div>
+                </div>
+                <div style="flex:1;">
+                  <div class="mini">Width (px)</div>
+                  <div class="row">
+                    <input id="layer-uploaded-regions-stroke-width" type="range" min="0" max="16" step="0.5" value="0.0" />
+                    <span id="layer-uploaded-regions-stroke-width-value" class="value">auto</span>
+                  </div>
+                </div>
+              </div>
             </div>
 
             <div style="margin-top:12px; padding-top:12px; border-top:1px solid rgba(148, 163, 184, 0.14);">
@@ -1015,6 +1138,31 @@
 
             <div class="muted" style="font-size:12px; line-height:1.35; margin-top:10px;">
               Tip: you can enable multiple layers at once. Click on a point layer to pick the nearest marker.
+            </div>
+          </div>
+
+          <div class="section">
+            <h3>Conditional styling</h3>
+            <label for="rules-layer">Layer</label>
+            <select id="rules-layer">
+              <option value="uploaded_points">Uploaded points</option>
+              <option value="uploaded_corridors">Uploaded lines</option>
+              <option value="uploaded_regions">Uploaded polygons</option>
+            </select>
+
+            <label for="rules-json" style="margin-top:10px;">Rules JSON</label>
+            <textarea id="rules-json" rows="8" spellcheck="false" placeholder='[
+  {"property":"type","equals":"hospital","style":{"marker-color":"#ff0000","marker-size":8}},
+  {"property":"status","equals":["closed","inactive"],"style":{"marker-opacity":0.25}}
+]'></textarea>
+
+            <div class="row" style="margin-top:10px;">
+              <button id="rules-load" type="button">Load</button>
+              <button id="rules-apply" type="button">Apply</button>
+              <button id="rules-clear" type="button">Clear</button>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.35; margin-top:8px;">
+              Rules are evaluated per feature using GeoJSON properties (currently points + lines only).
             </div>
           </div>
         </div>
@@ -1070,6 +1218,57 @@
             </label>
             <div class="muted" style="font-size:12px; line-height:1.35; margin-top:8px;">
               Affects UI and globe colors (base surface + ocean/space).
+            </div>
+          </div>
+
+          <div class="section">
+            <h3>Labels</h3>
+            <label class="checkbox">
+              <input id="toggle-labels" type="checkbox" checked />
+              <span>Show labels</span>
+            </label>
+
+            <label for="label-font-size" style="margin-top:8px;">Font size (px)</label>
+            <div class="row">
+              <input id="label-font-size" type="range" min="8" max="48" step="1" value="14" />
+              <span id="label-font-size-value" class="value">14</span>
+            </div>
+
+            <label for="label-font-family" style="margin-top:6px;">Font</label>
+            <select id="label-font-family">
+              <option value="system-ui, -apple-system, Segoe UI, Roboto, sans-serif">System UI</option>
+              <option value="ui-sans-serif, system-ui, sans-serif">Sans</option>
+              <option value="ui-serif, Georgia, serif">Serif</option>
+              <option value="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace">Monospace</option>
+            </select>
+
+            <label for="label-color" style="margin-top:6px;">Label color</label>
+            <div class="row" style="align-items:center;">
+              <input id="label-color" type="color" value="#ffffff" />
+              <input id="label-color-alpha" type="range" min="0" max="1" step="0.01" value="1" />
+              <span id="label-color-alpha-value" class="value">1.00</span>
+            </div>
+
+            <label for="label-halo-color" style="margin-top:6px;">Halo color</label>
+            <div class="row" style="align-items:center;">
+              <input id="label-halo-color" type="color" value="#000000" />
+              <input id="label-halo-alpha" type="range" min="0" max="1" step="0.01" value="0.85" />
+              <span id="label-halo-alpha-value" class="value">0.85</span>
+            </div>
+
+            <label for="label-halo-width" style="margin-top:6px;">Halo width (px)</label>
+            <div class="row">
+              <input id="label-halo-width" type="range" min="0" max="8" step="0.5" value="2" />
+              <span id="label-halo-width-value" class="value">2</span>
+            </div>
+
+            <label for="label-max" style="margin-top:6px;">Max labels</label>
+            <div class="row">
+              <input id="label-max" type="range" min="50" max="2000" step="50" value="600" />
+              <span id="label-max-value" class="value">600</span>
+            </div>
+            <div class="muted" style="font-size:12px; line-height:1.35; margin-top:6px;">
+              Labels use a GPU SDF atlas and are driven by feature attribute names.
             </div>
           </div>
 
@@ -1551,6 +1750,30 @@
         if (t === "deep-dark" || t === "deep" || t === "black") return "deep-dark";
         if (t === "light" || t === "day") return "light";
         return "dark";
+      }
+
+      function hexToRgb(hex) {
+        const h = String(hex || "").replace("#", "").trim();
+        if (h.length === 3) {
+          const r = parseInt(h[0] + h[0], 16);
+          const g = parseInt(h[1] + h[1], 16);
+          const b = parseInt(h[2] + h[2], 16);
+          return { r, g, b };
+        }
+        if (h.length === 6) {
+          const r = parseInt(h.slice(0, 2), 16);
+          const g = parseInt(h.slice(2, 4), 16);
+          const b = parseInt(h.slice(4, 6), 16);
+          return { r, g, b };
+        }
+        return { r: 255, g: 255, b: 255 };
+      }
+
+      function rgbToHex(r, g, b) {
+        const rr = Math.max(0, Math.min(255, Math.round(r)));
+        const gg = Math.max(0, Math.min(255, Math.round(g)));
+        const bb = Math.max(0, Math.min(255, Math.round(b)));
+        return "#" + rr.toString(16).padStart(2, "0") + gg.toString(16).padStart(2, "0") + bb.toString(16).padStart(2, "0");
       }
 
       function getInitialTheme() {
@@ -2587,6 +2810,26 @@
         const citySizeValue = document.getElementById("city-size-value");
         const lineWidth = document.getElementById("line-width");
         const lineWidthValue = document.getElementById("line-width-value");
+        const toggleLabels = document.getElementById("toggle-labels");
+        const labelFontSize = document.getElementById("label-font-size");
+        const labelFontSizeValue = document.getElementById("label-font-size-value");
+        const labelFontFamily = document.getElementById("label-font-family");
+        const labelColor = document.getElementById("label-color");
+        const labelColorAlpha = document.getElementById("label-color-alpha");
+        const labelColorAlphaValue = document.getElementById("label-color-alpha-value");
+        const labelHaloColor = document.getElementById("label-halo-color");
+        const labelHaloAlpha = document.getElementById("label-halo-alpha");
+        const labelHaloAlphaValue = document.getElementById("label-halo-alpha-value");
+        const labelHaloWidth = document.getElementById("label-halo-width");
+        const labelHaloWidthValue = document.getElementById("label-halo-width-value");
+        const labelMax = document.getElementById("label-max");
+        const labelMaxValue = document.getElementById("label-max-value");
+
+        const layerWorldBaseLabels = document.getElementById("layer-world-base-labels");
+        const layerCitiesLabels = document.getElementById("layer-cities-labels");
+        const layerCorridorsLabels = document.getElementById("layer-corridors-labels");
+        const layerRegionsLabels = document.getElementById("layer-regions-labels");
+        const layerUploadedLabels = document.getElementById("layer-uploaded-labels");
         const canvas2d = document.getElementById("atlas-canvas-2d");
         const canvas3d = document.getElementById("atlas-canvas-3d");
 
@@ -2641,6 +2884,261 @@
           });
         }
 
+        const labelDefaults = {
+          enabled: true,
+          fontSize: 14,
+          fontFamily: "system-ui, -apple-system, Segoe UI, Roboto, sans-serif",
+          color: "#ffffff",
+          colorAlpha: 1.0,
+          haloColor: "#000000",
+          haloAlpha: 0.85,
+          haloWidth: 2.0,
+          maxLabels: 600,
+        };
+
+        try {
+          if (wasm.get_label_settings) {
+            const s = JSON.parse(wasm.get_label_settings());
+            if (typeof s.enabled === "boolean") labelDefaults.enabled = s.enabled;
+            if (Number.isFinite(s.font_size_px)) labelDefaults.fontSize = s.font_size_px;
+            if (typeof s.font_family === "string" && s.font_family.trim()) labelDefaults.fontFamily = s.font_family;
+            if (Array.isArray(s.color) && s.color.length >= 4) {
+              labelDefaults.color = rgbToHex(s.color[0] * 255, s.color[1] * 255, s.color[2] * 255);
+              labelDefaults.colorAlpha = Number(s.color[3]);
+            }
+            if (Array.isArray(s.halo_color) && s.halo_color.length >= 4) {
+              labelDefaults.haloColor = rgbToHex(s.halo_color[0] * 255, s.halo_color[1] * 255, s.halo_color[2] * 255);
+              labelDefaults.haloAlpha = Number(s.halo_color[3]);
+            }
+            if (Number.isFinite(s.halo_width_px)) labelDefaults.haloWidth = s.halo_width_px;
+            if (Number.isFinite(s.max_labels)) labelDefaults.maxLabels = s.max_labels;
+          }
+        } catch (_) {}
+
+        try {
+          const saved = localStorage.getItem("atlas-labels-enabled");
+          if (saved === "true" || saved === "false") labelDefaults.enabled = saved === "true";
+        } catch (_) {}
+        try {
+          const saved = parseFloat(localStorage.getItem("atlas-label-font-size") || "");
+          if (Number.isFinite(saved)) labelDefaults.fontSize = saved;
+        } catch (_) {}
+        try {
+          const saved = localStorage.getItem("atlas-label-font-family");
+          if (saved) labelDefaults.fontFamily = saved;
+        } catch (_) {}
+        try {
+          const saved = localStorage.getItem("atlas-label-color");
+          if (saved) labelDefaults.color = saved;
+        } catch (_) {}
+        try {
+          const saved = parseFloat(localStorage.getItem("atlas-label-color-alpha") || "");
+          if (Number.isFinite(saved)) labelDefaults.colorAlpha = saved;
+        } catch (_) {}
+        try {
+          const saved = localStorage.getItem("atlas-label-halo-color");
+          if (saved) labelDefaults.haloColor = saved;
+        } catch (_) {}
+        try {
+          const saved = parseFloat(localStorage.getItem("atlas-label-halo-alpha") || "");
+          if (Number.isFinite(saved)) labelDefaults.haloAlpha = saved;
+        } catch (_) {}
+        try {
+          const saved = parseFloat(localStorage.getItem("atlas-label-halo-width") || "");
+          if (Number.isFinite(saved)) labelDefaults.haloWidth = saved;
+        } catch (_) {}
+        try {
+          const saved = parseInt(localStorage.getItem("atlas-label-max") || "", 10);
+          if (Number.isFinite(saved)) labelDefaults.maxLabels = saved;
+        } catch (_) {}
+
+        function applyLabelSettings() {
+          if (toggleLabels) toggleLabels.checked = !!labelDefaults.enabled;
+          if (labelFontSize) labelFontSize.value = String(labelDefaults.fontSize);
+          if (labelFontSizeValue) labelFontSizeValue.textContent = String(labelDefaults.fontSize);
+          if (labelFontFamily) labelFontFamily.value = String(labelDefaults.fontFamily || "");
+          if (labelColor) labelColor.value = labelDefaults.color;
+          if (labelColorAlpha) labelColorAlpha.value = String(labelDefaults.colorAlpha);
+          if (labelColorAlphaValue) labelColorAlphaValue.textContent = Number(labelDefaults.colorAlpha).toFixed(2);
+          if (labelHaloColor) labelHaloColor.value = labelDefaults.haloColor;
+          if (labelHaloAlpha) labelHaloAlpha.value = String(labelDefaults.haloAlpha);
+          if (labelHaloAlphaValue) labelHaloAlphaValue.textContent = Number(labelDefaults.haloAlpha).toFixed(2);
+          if (labelHaloWidth) labelHaloWidth.value = String(labelDefaults.haloWidth);
+          if (labelHaloWidthValue) labelHaloWidthValue.textContent = String(labelDefaults.haloWidth);
+          if (labelMax) labelMax.value = String(labelDefaults.maxLabels);
+          if (labelMaxValue) labelMaxValue.textContent = String(labelDefaults.maxLabels);
+
+          const c = hexToRgb(labelDefaults.color);
+          const h = hexToRgb(labelDefaults.haloColor);
+          try { wasm.set_labels_enabled?.(!!labelDefaults.enabled); } catch (_) {}
+          try { wasm.set_label_font_size_px?.(Number(labelDefaults.fontSize)); } catch (_) {}
+          try { wasm.set_label_font_family?.(String(labelDefaults.fontFamily || "")); } catch (_) {}
+          try { wasm.set_label_color_rgba?.(c.r / 255, c.g / 255, c.b / 255, Number(labelDefaults.colorAlpha)); } catch (_) {}
+          try { wasm.set_label_halo_color_rgba?.(h.r / 255, h.g / 255, h.b / 255, Number(labelDefaults.haloAlpha)); } catch (_) {}
+          try { wasm.set_label_halo_width_px?.(Number(labelDefaults.haloWidth)); } catch (_) {}
+          try { wasm.set_label_max_labels?.(Number(labelDefaults.maxLabels)); } catch (_) {}
+        }
+
+        applyLabelSettings();
+
+        // Layer-specific label toggles.
+        const layerLabelDefaults = {
+          world_base: true,
+          cities: true,
+          corridors: true,
+          regions: true,
+          uploaded: true,
+        };
+
+        try {
+          if (wasm.get_layer_label_settings) {
+            const s = JSON.parse(wasm.get_layer_label_settings());
+            if (typeof s.world_base === "boolean") layerLabelDefaults.world_base = s.world_base;
+            if (typeof s.cities === "boolean") layerLabelDefaults.cities = s.cities;
+            if (typeof s.corridors === "boolean") layerLabelDefaults.corridors = s.corridors;
+            if (typeof s.regions === "boolean") layerLabelDefaults.regions = s.regions;
+            if (typeof s.uploaded === "boolean") layerLabelDefaults.uploaded = s.uploaded;
+          }
+        } catch (_) {}
+
+        function loadLayerLabelPref(key, fallback) {
+          try {
+            const saved = localStorage.getItem(`atlas-layer-labels-${key}`);
+            if (saved === "true" || saved === "false") return saved === "true";
+          } catch (_) {}
+          return !!fallback;
+        }
+
+        layerLabelDefaults.world_base = loadLayerLabelPref("world_base", layerLabelDefaults.world_base);
+        layerLabelDefaults.cities = loadLayerLabelPref("cities", layerLabelDefaults.cities);
+        layerLabelDefaults.corridors = loadLayerLabelPref("corridors", layerLabelDefaults.corridors);
+        layerLabelDefaults.regions = loadLayerLabelPref("regions", layerLabelDefaults.regions);
+        layerLabelDefaults.uploaded = loadLayerLabelPref("uploaded", layerLabelDefaults.uploaded);
+
+        function applyLayerLabelSettings() {
+          if (layerWorldBaseLabels) layerWorldBaseLabels.checked = !!layerLabelDefaults.world_base;
+          if (layerCitiesLabels) layerCitiesLabels.checked = !!layerLabelDefaults.cities;
+          if (layerCorridorsLabels) layerCorridorsLabels.checked = !!layerLabelDefaults.corridors;
+          if (layerRegionsLabels) layerRegionsLabels.checked = !!layerLabelDefaults.regions;
+          if (layerUploadedLabels) layerUploadedLabels.checked = !!layerLabelDefaults.uploaded;
+
+          try { wasm.set_layer_labels_enabled?.("world_base", !!layerLabelDefaults.world_base); } catch (_) {}
+          try { wasm.set_layer_labels_enabled?.("cities", !!layerLabelDefaults.cities); } catch (_) {}
+          try { wasm.set_layer_labels_enabled?.("corridors", !!layerLabelDefaults.corridors); } catch (_) {}
+          try { wasm.set_layer_labels_enabled?.("regions", !!layerLabelDefaults.regions); } catch (_) {}
+          try { wasm.set_layer_labels_enabled?.("uploaded", !!layerLabelDefaults.uploaded); } catch (_) {}
+        }
+
+        applyLayerLabelSettings();
+
+        function wireLayerLabelToggle(el, key) {
+          if (!el) return;
+          el.addEventListener("change", (e) => {
+            const v = !!e.target.checked;
+            layerLabelDefaults[key] = v;
+            try { localStorage.setItem(`atlas-layer-labels-${key}`, v ? "true" : "false"); } catch (_) {}
+            try { wasm.set_layer_labels_enabled?.(key, v); } catch (err) { console.error(err); }
+          });
+        }
+
+        wireLayerLabelToggle(layerWorldBaseLabels, "world_base");
+        wireLayerLabelToggle(layerCitiesLabels, "cities");
+        wireLayerLabelToggle(layerCorridorsLabels, "corridors");
+        wireLayerLabelToggle(layerRegionsLabels, "regions");
+        wireLayerLabelToggle(layerUploadedLabels, "uploaded");
+
+        if (toggleLabels) {
+          toggleLabels.addEventListener("change", (e) => {
+            const v = !!e.target.checked;
+            labelDefaults.enabled = v;
+            try { localStorage.setItem("atlas-labels-enabled", v ? "true" : "false"); } catch (_) {}
+            try { wasm.set_labels_enabled?.(v); } catch (err) { console.error(err); }
+          });
+        }
+
+        function updateLabelColor() {
+          const c = hexToRgb(labelDefaults.color);
+          try { wasm.set_label_color_rgba?.(c.r / 255, c.g / 255, c.b / 255, Number(labelDefaults.colorAlpha)); } catch (err) { console.error(err); }
+        }
+
+        function updateLabelHalo() {
+          const h = hexToRgb(labelDefaults.haloColor);
+          try { wasm.set_label_halo_color_rgba?.(h.r / 255, h.g / 255, h.b / 255, Number(labelDefaults.haloAlpha)); } catch (err) { console.error(err); }
+        }
+
+        if (labelFontSize) {
+          labelFontSize.addEventListener("input", (e) => {
+            const v = Math.max(8, Math.min(48, Number(e.target.value)));
+            labelDefaults.fontSize = v;
+            if (labelFontSizeValue) labelFontSizeValue.textContent = String(v);
+            try { localStorage.setItem("atlas-label-font-size", String(v)); } catch (_) {}
+            try { wasm.set_label_font_size_px?.(v); } catch (err) { console.error(err); }
+          });
+        }
+
+        if (labelFontFamily) {
+          labelFontFamily.addEventListener("change", (e) => {
+            const v = String(e.target.value || "").trim();
+            labelDefaults.fontFamily = v;
+            try { localStorage.setItem("atlas-label-font-family", v); } catch (_) {}
+            try { wasm.set_label_font_family?.(v); } catch (err) { console.error(err); }
+          });
+        }
+
+        if (labelColor) {
+          labelColor.addEventListener("input", (e) => {
+            labelDefaults.color = String(e.target.value || "#ffffff");
+            try { localStorage.setItem("atlas-label-color", labelDefaults.color); } catch (_) {}
+            updateLabelColor();
+          });
+        }
+        if (labelColorAlpha) {
+          labelColorAlpha.addEventListener("input", (e) => {
+            const v = Math.max(0, Math.min(1, Number(e.target.value)));
+            labelDefaults.colorAlpha = v;
+            if (labelColorAlphaValue) labelColorAlphaValue.textContent = v.toFixed(2);
+            try { localStorage.setItem("atlas-label-color-alpha", String(v)); } catch (_) {}
+            updateLabelColor();
+          });
+        }
+
+        if (labelHaloColor) {
+          labelHaloColor.addEventListener("input", (e) => {
+            labelDefaults.haloColor = String(e.target.value || "#000000");
+            try { localStorage.setItem("atlas-label-halo-color", labelDefaults.haloColor); } catch (_) {}
+            updateLabelHalo();
+          });
+        }
+        if (labelHaloAlpha) {
+          labelHaloAlpha.addEventListener("input", (e) => {
+            const v = Math.max(0, Math.min(1, Number(e.target.value)));
+            labelDefaults.haloAlpha = v;
+            if (labelHaloAlphaValue) labelHaloAlphaValue.textContent = v.toFixed(2);
+            try { localStorage.setItem("atlas-label-halo-alpha", String(v)); } catch (_) {}
+            updateLabelHalo();
+          });
+        }
+
+        if (labelHaloWidth) {
+          labelHaloWidth.addEventListener("input", (e) => {
+            const v = Math.max(0, Math.min(12, Number(e.target.value)));
+            labelDefaults.haloWidth = v;
+            if (labelHaloWidthValue) labelHaloWidthValue.textContent = String(v);
+            try { localStorage.setItem("atlas-label-halo-width", String(v)); } catch (_) {}
+            try { wasm.set_label_halo_width_px?.(v); } catch (err) { console.error(err); }
+          });
+        }
+
+        if (labelMax) {
+          labelMax.addEventListener("input", (e) => {
+            const v = Math.max(50, Math.min(5000, Number(e.target.value)));
+            labelDefaults.maxLabels = v;
+            if (labelMaxValue) labelMaxValue.textContent = String(v);
+            try { localStorage.setItem("atlas-label-max", String(v)); } catch (_) {}
+            try { wasm.set_label_max_labels?.(v); } catch (err) { console.error(err); }
+          });
+        }
+
         const mode2dBtn = document.getElementById("mode-2d");
         const mode3dBtn = document.getElementById("mode-3d");
 
@@ -2662,6 +3160,11 @@
         const layerWorldBaseColor = document.getElementById("layer-world-base-color");
         const layerWorldBaseOpacity = document.getElementById("layer-world-base-opacity");
         const layerWorldBaseLift = document.getElementById("layer-world-base-lift");
+        const layerWorldBaseStrokeColor = document.getElementById("layer-world-base-stroke-color");
+        const layerWorldBaseStrokeOpacity = document.getElementById("layer-world-base-stroke-opacity");
+        const layerWorldBaseStrokeOpacityValue = document.getElementById("layer-world-base-stroke-opacity-value");
+        const layerWorldBaseStrokeWidth = document.getElementById("layer-world-base-stroke-width");
+        const layerWorldBaseStrokeWidthValue = document.getElementById("layer-world-base-stroke-width-value");
 
         const layerTerrain = document.getElementById("layer-terrain");
 
@@ -2669,34 +3172,58 @@
         const layerCitiesColor = document.getElementById("layer-cities-color");
         const layerCitiesOpacity = document.getElementById("layer-cities-opacity");
         const layerCitiesLift = document.getElementById("layer-cities-lift");
+        const layerCitiesSize = document.getElementById("layer-cities-size");
+        const layerCitiesSizeValue = document.getElementById("layer-cities-size-value");
 
         const layerCorridors = document.getElementById("layer-corridors");
         const layerCorridorsColor = document.getElementById("layer-corridors-color");
         const layerCorridorsOpacity = document.getElementById("layer-corridors-opacity");
         const layerCorridorsLift = document.getElementById("layer-corridors-lift");
+        const layerCorridorsWidth = document.getElementById("layer-corridors-width");
+        const layerCorridorsWidthValue = document.getElementById("layer-corridors-width-value");
 
         const layerRegions = document.getElementById("layer-regions");
         const layerRegionsColor = document.getElementById("layer-regions-color");
         const layerRegionsOpacity = document.getElementById("layer-regions-opacity");
         const layerRegionsLift = document.getElementById("layer-regions-lift");
+        const layerRegionsStrokeColor = document.getElementById("layer-regions-stroke-color");
+        const layerRegionsStrokeOpacity = document.getElementById("layer-regions-stroke-opacity");
+        const layerRegionsStrokeOpacityValue = document.getElementById("layer-regions-stroke-opacity-value");
+        const layerRegionsStrokeWidth = document.getElementById("layer-regions-stroke-width");
+        const layerRegionsStrokeWidthValue = document.getElementById("layer-regions-stroke-width-value");
 
         const layerUploadedPoints = document.getElementById("layer-uploaded-points");
         const layerUploadedPointsLabel = document.getElementById("layer-uploaded-points-label");
         const layerUploadedPointsColor = document.getElementById("layer-uploaded-points-color");
         const layerUploadedPointsOpacity = document.getElementById("layer-uploaded-points-opacity");
         const layerUploadedPointsLift = document.getElementById("layer-uploaded-points-lift");
+        const layerUploadedPointsSize = document.getElementById("layer-uploaded-points-size");
+        const layerUploadedPointsSizeValue = document.getElementById("layer-uploaded-points-size-value");
 
         const layerUploadedCorridors = document.getElementById("layer-uploaded-corridors");
         const layerUploadedCorridorsLabel = document.getElementById("layer-uploaded-corridors-label");
         const layerUploadedCorridorsColor = document.getElementById("layer-uploaded-corridors-color");
         const layerUploadedCorridorsOpacity = document.getElementById("layer-uploaded-corridors-opacity");
         const layerUploadedCorridorsLift = document.getElementById("layer-uploaded-corridors-lift");
+        const layerUploadedCorridorsWidth = document.getElementById("layer-uploaded-corridors-width");
+        const layerUploadedCorridorsWidthValue = document.getElementById("layer-uploaded-corridors-width-value");
 
         const layerUploadedRegions = document.getElementById("layer-uploaded-regions");
         const layerUploadedRegionsLabel = document.getElementById("layer-uploaded-regions-label");
         const layerUploadedRegionsColor = document.getElementById("layer-uploaded-regions-color");
         const layerUploadedRegionsOpacity = document.getElementById("layer-uploaded-regions-opacity");
         const layerUploadedRegionsLift = document.getElementById("layer-uploaded-regions-lift");
+        const layerUploadedRegionsStrokeColor = document.getElementById("layer-uploaded-regions-stroke-color");
+        const layerUploadedRegionsStrokeOpacity = document.getElementById("layer-uploaded-regions-stroke-opacity");
+        const layerUploadedRegionsStrokeOpacityValue = document.getElementById("layer-uploaded-regions-stroke-opacity-value");
+        const layerUploadedRegionsStrokeWidth = document.getElementById("layer-uploaded-regions-stroke-width");
+        const layerUploadedRegionsStrokeWidthValue = document.getElementById("layer-uploaded-regions-stroke-width-value");
+
+        const rulesLayer = document.getElementById("rules-layer");
+        const rulesJson = document.getElementById("rules-json");
+        const rulesLoad = document.getElementById("rules-load");
+        const rulesApply = document.getElementById("rules-apply");
+        const rulesClear = document.getElementById("rules-clear");
 
         function formatGeometrySummary(points, lines, polygons) {
           const p = Number(points ?? 0);
@@ -2737,7 +3264,17 @@
         }
 
         function wireLayerControls() {
-          function bind(id, checkbox, color, opacity, lift) {
+          function bind(id, checkbox, color, opacity, lift, opts = {}) {
+            const strokeColor = opts.strokeColor;
+            const strokeOpacity = opts.strokeOpacity;
+            const strokeOpacityValue = opts.strokeOpacityValue;
+            const strokeWidth = opts.strokeWidth;
+            const strokeWidthValue = opts.strokeWidthValue;
+            const size = opts.size;
+            const sizeValue = opts.sizeValue;
+            const width = opts.width;
+            const widthValue = opts.widthValue;
+
             if (checkbox) {
               checkbox.addEventListener("change", (e) => {
                 try { wasm.set_layer_visible(id, !!e.target.checked); } catch (err) { console.error(err); }
@@ -2758,15 +3295,80 @@
                 try { wasm.set_layer_lift(id, Number(e.target.value)); } catch (err) { console.error(err); }
               });
             }
+
+            if (strokeColor) {
+              strokeColor.addEventListener("input", (e) => {
+                try { wasm.set_layer_stroke_color_hex?.(id, e.target.value); } catch (err) { console.error(err); }
+              });
+            }
+            if (strokeOpacity) {
+              strokeOpacity.addEventListener("input", (e) => {
+                const v = Math.max(0, Math.min(1, Number(e.target.value)));
+                if (strokeOpacityValue) strokeOpacityValue.textContent = String(v);
+                try { wasm.set_layer_stroke_opacity?.(id, v); } catch (err) { console.error(err); }
+              });
+            }
+            if (strokeWidth) {
+              strokeWidth.addEventListener("input", (e) => {
+                const v = Math.max(0, Math.min(16, Number(e.target.value)));
+                if (strokeWidthValue) strokeWidthValue.textContent = v > 0 ? String(v) : "auto";
+                try { wasm.set_layer_stroke_width_px?.(id, v); } catch (err) { console.error(err); }
+              });
+            }
+            if (size) {
+              size.addEventListener("input", (e) => {
+                const v = Math.max(0, Math.min(24, Number(e.target.value)));
+                if (sizeValue) sizeValue.textContent = v > 0 ? String(v) : "auto";
+                try { wasm.set_layer_size_px?.(id, v); } catch (err) { console.error(err); }
+              });
+            }
+            if (width) {
+              width.addEventListener("input", (e) => {
+                const v = Math.max(0, Math.min(16, Number(e.target.value)));
+                if (widthValue) widthValue.textContent = v > 0 ? String(v) : "auto";
+                try { wasm.set_layer_width_px?.(id, v); } catch (err) { console.error(err); }
+              });
+            }
           }
-          bind("world_base", layerWorldBase, layerWorldBaseColor, layerWorldBaseOpacity, layerWorldBaseLift);
+
+          bind("world_base", layerWorldBase, layerWorldBaseColor, layerWorldBaseOpacity, layerWorldBaseLift, {
+            strokeColor: layerWorldBaseStrokeColor,
+            strokeOpacity: layerWorldBaseStrokeOpacity,
+            strokeOpacityValue: layerWorldBaseStrokeOpacityValue,
+            strokeWidth: layerWorldBaseStrokeWidth,
+            strokeWidthValue: layerWorldBaseStrokeWidthValue,
+          });
           bind("terrain", layerTerrain, null, null, null);
-          bind("cities", layerCities, layerCitiesColor, layerCitiesOpacity, layerCitiesLift);
-          bind("air_corridors", layerCorridors, layerCorridorsColor, layerCorridorsOpacity, layerCorridorsLift);
-          bind("regions", layerRegions, layerRegionsColor, layerRegionsOpacity, layerRegionsLift);
-          bind("uploaded_points", layerUploadedPoints, layerUploadedPointsColor, layerUploadedPointsOpacity, layerUploadedPointsLift);
-          bind("uploaded_corridors", layerUploadedCorridors, layerUploadedCorridorsColor, layerUploadedCorridorsOpacity, layerUploadedCorridorsLift);
-          bind("uploaded_regions", layerUploadedRegions, layerUploadedRegionsColor, layerUploadedRegionsOpacity, layerUploadedRegionsLift);
+          bind("cities", layerCities, layerCitiesColor, layerCitiesOpacity, layerCitiesLift, {
+            size: layerCitiesSize,
+            sizeValue: layerCitiesSizeValue,
+          });
+          bind("air_corridors", layerCorridors, layerCorridorsColor, layerCorridorsOpacity, layerCorridorsLift, {
+            width: layerCorridorsWidth,
+            widthValue: layerCorridorsWidthValue,
+          });
+          bind("regions", layerRegions, layerRegionsColor, layerRegionsOpacity, layerRegionsLift, {
+            strokeColor: layerRegionsStrokeColor,
+            strokeOpacity: layerRegionsStrokeOpacity,
+            strokeOpacityValue: layerRegionsStrokeOpacityValue,
+            strokeWidth: layerRegionsStrokeWidth,
+            strokeWidthValue: layerRegionsStrokeWidthValue,
+          });
+          bind("uploaded_points", layerUploadedPoints, layerUploadedPointsColor, layerUploadedPointsOpacity, layerUploadedPointsLift, {
+            size: layerUploadedPointsSize,
+            sizeValue: layerUploadedPointsSizeValue,
+          });
+          bind("uploaded_corridors", layerUploadedCorridors, layerUploadedCorridorsColor, layerUploadedCorridorsOpacity, layerUploadedCorridorsLift, {
+            width: layerUploadedCorridorsWidth,
+            widthValue: layerUploadedCorridorsWidthValue,
+          });
+          bind("uploaded_regions", layerUploadedRegions, layerUploadedRegionsColor, layerUploadedRegionsOpacity, layerUploadedRegionsLift, {
+            strokeColor: layerUploadedRegionsStrokeColor,
+            strokeOpacity: layerUploadedRegionsStrokeOpacity,
+            strokeOpacityValue: layerUploadedRegionsStrokeOpacityValue,
+            strokeWidth: layerUploadedRegionsStrokeWidth,
+            strokeWidthValue: layerUploadedRegionsStrokeWidthValue,
+          });
         }
 
         wireLayerControls();
@@ -2780,7 +3382,16 @@
         syncSymbologyControls();
 
         function syncSymbologyControls() {
-          function syncLayer(id, checkbox, color, opacity, lift) {
+          function syncLayer(id, checkbox, color, opacity, lift, opts = {}) {
+            const strokeColor = opts.strokeColor;
+            const strokeOpacity = opts.strokeOpacity;
+            const strokeOpacityValue = opts.strokeOpacityValue;
+            const strokeWidth = opts.strokeWidth;
+            const strokeWidthValue = opts.strokeWidthValue;
+            const size = opts.size;
+            const sizeValue = opts.sizeValue;
+            const width = opts.width;
+            const widthValue = opts.widthValue;
             if (!wasm.get_layer_style) return;
             try {
               const style = wasm.get_layer_style(id);
@@ -2789,19 +3400,67 @@
               if (color && style.color_hex) color.value = style.color_hex;
               if (opacity && style.opacity !== undefined) opacity.value = String(style.opacity);
               if (lift && style.lift !== undefined) lift.value = String(style.lift);
+
+              if (strokeColor && style.stroke_color_hex) strokeColor.value = style.stroke_color_hex;
+              if (strokeOpacity && style.stroke_opacity !== undefined) {
+                strokeOpacity.value = String(style.stroke_opacity);
+                if (strokeOpacityValue) strokeOpacityValue.textContent = String(style.stroke_opacity);
+              }
+              if (strokeWidth && style.stroke_width_px !== undefined) {
+                strokeWidth.value = String(style.stroke_width_px);
+                if (strokeWidthValue) strokeWidthValue.textContent = Number(style.stroke_width_px) > 0 ? String(style.stroke_width_px) : "auto";
+              }
+              if (size && style.size_px !== undefined) {
+                size.value = String(style.size_px);
+                if (sizeValue) sizeValue.textContent = Number(style.size_px) > 0 ? String(style.size_px) : "auto";
+              }
+              if (width && style.width_px !== undefined) {
+                width.value = String(style.width_px);
+                if (widthValue) widthValue.textContent = Number(style.width_px) > 0 ? String(style.width_px) : "auto";
+              }
             } catch (err) {
               console.error("get_layer_style failed", err);
             }
           }
 
-          syncLayer("world_base", layerWorldBase, layerWorldBaseColor, layerWorldBaseOpacity, layerWorldBaseLift);
+          syncLayer("world_base", layerWorldBase, layerWorldBaseColor, layerWorldBaseOpacity, layerWorldBaseLift, {
+            strokeColor: layerWorldBaseStrokeColor,
+            strokeOpacity: layerWorldBaseStrokeOpacity,
+            strokeOpacityValue: layerWorldBaseStrokeOpacityValue,
+            strokeWidth: layerWorldBaseStrokeWidth,
+            strokeWidthValue: layerWorldBaseStrokeWidthValue,
+          });
           syncLayer("terrain", layerTerrain, null, null, null);
-          syncLayer("cities", layerCities, layerCitiesColor, layerCitiesOpacity, layerCitiesLift);
-          syncLayer("air_corridors", layerCorridors, layerCorridorsColor, layerCorridorsOpacity, layerCorridorsLift);
-          syncLayer("regions", layerRegions, layerRegionsColor, layerRegionsOpacity, layerRegionsLift);
-          syncLayer("uploaded_points", layerUploadedPoints, layerUploadedPointsColor, layerUploadedPointsOpacity, layerUploadedPointsLift);
-          syncLayer("uploaded_corridors", layerUploadedCorridors, layerUploadedCorridorsColor, layerUploadedCorridorsOpacity, layerUploadedCorridorsLift);
-          syncLayer("uploaded_regions", layerUploadedRegions, layerUploadedRegionsColor, layerUploadedRegionsOpacity, layerUploadedRegionsLift);
+          syncLayer("cities", layerCities, layerCitiesColor, layerCitiesOpacity, layerCitiesLift, {
+            size: layerCitiesSize,
+            sizeValue: layerCitiesSizeValue,
+          });
+          syncLayer("air_corridors", layerCorridors, layerCorridorsColor, layerCorridorsOpacity, layerCorridorsLift, {
+            width: layerCorridorsWidth,
+            widthValue: layerCorridorsWidthValue,
+          });
+          syncLayer("regions", layerRegions, layerRegionsColor, layerRegionsOpacity, layerRegionsLift, {
+            strokeColor: layerRegionsStrokeColor,
+            strokeOpacity: layerRegionsStrokeOpacity,
+            strokeOpacityValue: layerRegionsStrokeOpacityValue,
+            strokeWidth: layerRegionsStrokeWidth,
+            strokeWidthValue: layerRegionsStrokeWidthValue,
+          });
+          syncLayer("uploaded_points", layerUploadedPoints, layerUploadedPointsColor, layerUploadedPointsOpacity, layerUploadedPointsLift, {
+            size: layerUploadedPointsSize,
+            sizeValue: layerUploadedPointsSizeValue,
+          });
+          syncLayer("uploaded_corridors", layerUploadedCorridors, layerUploadedCorridorsColor, layerUploadedCorridorsOpacity, layerUploadedCorridorsLift, {
+            width: layerUploadedCorridorsWidth,
+            widthValue: layerUploadedCorridorsWidthValue,
+          });
+          syncLayer("uploaded_regions", layerUploadedRegions, layerUploadedRegionsColor, layerUploadedRegionsOpacity, layerUploadedRegionsLift, {
+            strokeColor: layerUploadedRegionsStrokeColor,
+            strokeOpacity: layerUploadedRegionsStrokeOpacity,
+            strokeOpacityValue: layerUploadedRegionsStrokeOpacityValue,
+            strokeWidth: layerUploadedRegionsStrokeWidth,
+            strokeWidthValue: layerUploadedRegionsStrokeWidthValue,
+          });
 
           renderFeedLayerControls();
 
@@ -2820,6 +3479,38 @@
             } catch (err) { console.error("get_line_width_px failed", err); }
           }
         }
+
+        function syncRulesEditor() {
+          if (!rulesLayer || !rulesJson) return;
+          if (!wasm.get_layer_rules_json) return;
+          try {
+            const id = String(rulesLayer.value || "").trim();
+            const txt = wasm.get_layer_rules_json(id);
+            if (typeof txt === "string") rulesJson.value = txt;
+          } catch (err) {
+            console.error("get_layer_rules_json failed", err);
+          }
+        }
+
+        rulesLayer?.addEventListener("change", () => syncRulesEditor());
+        rulesLoad?.addEventListener("click", () => syncRulesEditor());
+        rulesApply?.addEventListener("click", () => {
+          if (!rulesLayer || !rulesJson) return;
+          try {
+            const id = String(rulesLayer.value || "").trim();
+            wasm.set_layer_rules_json?.(id, String(rulesJson.value || "[]"));
+            setStatus(`Rules applied: ${id}`);
+          } catch (err) {
+            console.error("set_layer_rules_json failed", err);
+          }
+        });
+        rulesClear?.addEventListener("click", () => {
+          if (!rulesJson) return;
+          rulesJson.value = "[]";
+        });
+
+        // Initial load for rules editor.
+        syncRulesEditor();
 
         function setTab(which) {
           const isGeneral = which === "general";

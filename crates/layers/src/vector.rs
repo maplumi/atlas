@@ -16,6 +16,8 @@ pub struct VectorLayerSnapshot {
     pub lines: Vec<Vec<Vec3>>,
     // Flat triangle list (3 vertices per triangle) in world coordinates.
     pub area_triangles: Vec<Vec3>,
+    /// Outline segments (A,B) for area rings, in world coordinates.
+    pub area_outline_segments: Vec<[Vec3; 2]>,
 }
 
 impl VectorLayer {
@@ -35,12 +37,63 @@ impl VectorLayer {
                 VectorGeometry::Line { vertices } => out.lines.push(vertices.clone()),
                 VectorGeometry::Area { rings } => {
                     out.area_triangles.extend(triangulate_area_rings(rings));
+                    out.area_outline_segments
+                        .extend(outline_segments_from_area_rings(rings));
                 }
             }
         }
 
         out
     }
+}
+
+fn outline_segments_from_area_rings(rings: &[Vec<Vec3>]) -> Vec<[Vec3; 2]> {
+    const MAX_RING_VERTICES: usize = 200_000;
+    const MAX_TOTAL_SEGMENTS: usize = 2_000_000;
+
+    fn is_finite_vec3(v: Vec3) -> bool {
+        v.x.is_finite() && v.y.is_finite() && v.z.is_finite()
+    }
+
+    fn drop_consecutive_duplicates(points: &mut Vec<Vec3>) {
+        points.dedup_by(|a, b| {
+            (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9 && (a.z - b.z).abs() < 1e-9
+        });
+    }
+
+    let mut out: Vec<[Vec3; 2]> = Vec::new();
+
+    for ring in rings {
+        if ring.len() > MAX_RING_VERTICES {
+            continue;
+        }
+
+        let mut ring_pts: Vec<Vec3> = ring
+            .iter()
+            .copied()
+            .filter(|p| is_finite_vec3(*p))
+            .collect();
+        drop_closing_duplicate(&mut ring_pts);
+        drop_consecutive_duplicates(&mut ring_pts);
+        if ring_pts.len() < 2 {
+            continue;
+        }
+
+        for seg in ring_pts.windows(2) {
+            if out.len() >= MAX_TOTAL_SEGMENTS {
+                return out;
+            }
+            out.push([seg[0], seg[1]]);
+        }
+        // Close ring.
+        if out.len() < MAX_TOTAL_SEGMENTS {
+            out.push([*ring_pts.last().unwrap(), ring_pts[0]]);
+        } else {
+            return out;
+        }
+    }
+
+    out
 }
 
 fn triangulate_area_rings(rings: &[Vec<Vec3>]) -> Vec<Vec3> {
